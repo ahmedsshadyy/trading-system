@@ -144,6 +144,149 @@ def add_swings(df: pd.DataFrame, window: int = 3) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Swing High / Low Detector — Causal (no look-ahead)
+# ---------------------------------------------------------------------------
+
+
+def add_swings_causal(
+    df: pd.DataFrame,
+    window: int = 6,
+    *,
+    atr_length: int = 14,
+    min_prominence_atr: float = 0.0,
+    min_separation: int = 1,
+    require_rejection: bool = False,
+    min_wick_frac: float = 0.0,
+    max_body_frac: float = 1.0,
+) -> pd.DataFrame:
+    """Causal swing detector — uses only past data, no look-ahead.
+
+    A swing high at bar i means ``high[i]`` is the max of the last
+    ``window`` bars. Suitable for both backtesting and live deployment.
+    Produces the same output columns as ``add_swings()`` so downstream
+    code (BOS, CHoCH, OB, sweeps) works identically.
+
+    Parameters
+    ----------
+    window : int
+        Lookback window (past bars only, no look-ahead).
+    min_prominence_atr : float
+        Minimum prominence above recent window, normalised by ATR.
+    min_separation : int
+        Minimum bars between consecutive same-side swings.
+    require_rejection : bool
+        If True, require wick/body geometry consistent with rejection.
+    min_wick_frac : float
+        Minimum wick fraction when require_rejection is True.
+    max_body_frac : float
+        Maximum body fraction when require_rejection is True.
+
+    Columns (identical to add_swings for downstream compatibility)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    * ``swing_high / swing_low``
+    * ``swing_high_price / swing_low_price``
+    * ``last_swing_high / last_swing_low``
+    * ``swing_high_age / swing_low_age``
+    """
+    from src.indicators.ta_core import ensure_atr
+
+    out = df.copy()
+    n = len(out)
+    o = out["open"].values.astype(float)
+    h = out["high"].values.astype(float)
+    lo = out["low"].values.astype(float)
+    c = out["close"].values.astype(float)
+
+    atr = ensure_atr(out, atr_length)
+
+    rng = h - lo
+    body = np.abs(c - o)
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - lo
+    with np.errstate(invalid="ignore", divide="ignore"):
+        upper_wick_frac = np.where(rng > 0, upper_wick / rng, 0.0)
+        lower_wick_frac = np.where(rng > 0, lower_wick / rng, 0.0)
+        body_frac = np.where(rng > 0, body / rng, 0.0)
+
+    sh = np.zeros(n, dtype=np.int8)
+    sl = np.zeros(n, dtype=np.int8)
+
+    last_sh_bar = -(10**9)
+    last_sl_bar = -(10**9)
+
+    for i in range(1, n):
+        start = max(0, i - window + 1)
+        if i - start < 1:
+            continue
+
+        hist_high = h[start:i]  # past only, excluding current
+        hist_low = lo[start:i]
+        prev_max = np.max(hist_high)
+        prev_min = np.min(hist_low)
+        atr_i = atr[i]
+        atr_ok = np.isfinite(atr_i) and atr_i > 0
+
+        # Swing high candidate
+        if h[i] >= prev_max:
+            prom = h[i] - prev_max
+            prom_atr = prom / atr_i if atr_ok else 0.0
+            prom_ok = min_prominence_atr <= 0 or prom_atr >= min_prominence_atr
+            sep_ok = (i - last_sh_bar) > min_separation
+            geom_ok = (not require_rejection) or (
+                upper_wick_frac[i] >= min_wick_frac and body_frac[i] <= max_body_frac
+            )
+            if prom_ok and sep_ok and geom_ok:
+                sh[i] = 1
+                last_sh_bar = i
+
+        # Swing low candidate
+        if lo[i] <= prev_min:
+            prom = prev_min - lo[i]
+            prom_atr = prom / atr_i if atr_ok else 0.0
+            prom_ok = min_prominence_atr <= 0 or prom_atr >= min_prominence_atr
+            sep_ok = (i - last_sl_bar) > min_separation
+            geom_ok = (not require_rejection) or (
+                lower_wick_frac[i] >= min_wick_frac and body_frac[i] <= max_body_frac
+            )
+            if prom_ok and sep_ok and geom_ok:
+                sl[i] = 1
+                last_sl_bar = i
+
+    # Build output columns — same names as add_swings()
+    highs = h
+    lows = lo
+    out["swing_high"] = sh
+    out["swing_low"] = sl
+    out["swing_high_price"] = np.where(sh == 1, highs, np.nan)
+    out["swing_low_price"] = np.where(sl == 1, lows, np.nan)
+
+    # Causal forward-fill of last swing levels
+    last_swing_high = np.full(n, np.nan)
+    last_swing_low = np.full(n, np.nan)
+    cur_h = np.nan
+    cur_l = np.nan
+
+    for i in range(n):
+        if sh[i] == 1:
+            cur_h = highs[i]
+        if sl[i] == 1:
+            cur_l = lows[i]
+        last_swing_high[i] = cur_h
+        last_swing_low[i] = cur_l
+
+    out["last_swing_high"] = last_swing_high
+    out["last_swing_low"] = last_swing_low
+
+    idx = np.arange(n, dtype=float)
+    sh_idx_arr = np.where(sh == 1, idx, np.nan)
+    sl_idx_arr = np.where(sl == 1, idx, np.nan)
+    out["swing_high_age"] = idx - pd.Series(sh_idx_arr).ffill().values
+    out["swing_low_age"] = idx - pd.Series(sl_idx_arr).ffill().values
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Trend State Machine  (HH / HL / LH / LL)
 # ---------------------------------------------------------------------------
 

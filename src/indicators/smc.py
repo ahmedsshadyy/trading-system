@@ -13,38 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-
-# ============================================================================
-# Shared Internal Helpers
-# ============================================================================
-
-
-def _true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
-    prev_close = np.roll(close, 1)
-    prev_close[0] = close[0]
-    return np.maximum(
-        high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close))
-    )
-
-
-def _atr_rma(
-    high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int = 14
-) -> np.ndarray:
-    """Wilder-style ATR (self-reliant, no external deps)."""
-    tr = _true_range(high, low, close).astype(float)
-    out = np.full(len(tr), np.nan, dtype=float)
-    if len(tr) < length:
-        csum = np.cumsum(tr)
-        out[:] = csum / np.arange(1, len(tr) + 1)
-        return out
-    out[length - 1] = np.nanmean(tr[:length])
-    alpha = 1.0 / length
-    for i in range(length, len(tr)):
-        out[i] = out[i - 1] + alpha * (tr[i] - out[i - 1])
-    if length > 1:
-        csum = np.cumsum(tr[: length - 1])
-        out[: length - 1] = csum / np.arange(1, length)
-    return out
+from src.indicators.ta_core import ensure_atr as _ensure_atr
 
 
 def _pivot_high(high: np.ndarray, left: int = 2, right: int = 2) -> np.ndarray:
@@ -90,18 +59,6 @@ def _last_confirmed_swing_levels(
         last_ph[i] = cur_ph
         last_pl[i] = cur_pl
     return last_ph, last_pl
-
-
-def _ensure_atr(out: pd.DataFrame, length: int = 14) -> np.ndarray:
-    """Return ATR array, computing if not present."""
-    if "atr_14" in out.columns:
-        return out["atr_14"].to_numpy(dtype=float)
-    h = out["high"].to_numpy(dtype=float)
-    lo = out["low"].to_numpy(dtype=float)
-    c = out["close"].to_numpy(dtype=float)
-    atr = _atr_rma(h, lo, c, length=length)
-    out["atr_14"] = atr
-    return atr
 
 
 def _body_high(open_: np.ndarray, close: np.ndarray) -> np.ndarray:
@@ -1093,13 +1050,13 @@ def add_liquidity_sweep(
         last_sl = out["last_swing_low"].to_numpy(dtype=float)
 
         # optional age columns if already present
-        if "last_swing_high_age" in out.columns:
-            sh_age = out["last_swing_high_age"].to_numpy(dtype=float)
+        if "swing_high_age" in out.columns:
+            sh_age = out["swing_high_age"].to_numpy(dtype=float)
         else:
             sh_age = np.full(n, np.nan)
 
-        if "last_swing_low_age" in out.columns:
-            sl_age = out["last_swing_low_age"].to_numpy(dtype=float)
+        if "swing_low_age" in out.columns:
+            sl_age = out["swing_low_age"].to_numpy(dtype=float)
         else:
             sl_age = np.full(n, np.nan)
 
@@ -1141,9 +1098,10 @@ def add_liquidity_sweep(
     upper_wick = h - np.maximum(o, c)
     lower_wick = np.minimum(o, c) - lo
 
-    upper_wick_frac = np.where(rng > 0, upper_wick / rng, 0.0)
-    lower_wick_frac = np.where(rng > 0, lower_wick / rng, 0.0)
-    body_frac = np.where(rng > 0, body / rng, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        upper_wick_frac = np.where(rng > 0, upper_wick / rng, 0.0)
+        lower_wick_frac = np.where(rng > 0, lower_wick / rng, 0.0)
+        body_frac = np.where(rng > 0, body / rng, 0.0)
 
     # ---------------------------------------------------------------------
     # Output arrays
@@ -1330,59 +1288,440 @@ def add_liquidity_sweep(
 
 
 # ============================================================================
-# Equal Highs / Lows Detector
+# Enhanced Equal Highs / Lows Detector
 # ============================================================================
 
 
-def add_equal_hl(df: pd.DataFrame, atr_tolerance: float = 0.1) -> pd.DataFrame:
-    """Detect clusters of equal highs or equal lows (liquidity pools).
-
-    Columns: ``equal_highs``, ``equal_lows``, ``equal_highs_count``, ``equal_lows_count``.
+def add_equal_hl(
+    df: pd.DataFrame,
+    atr_tolerance: float = 0.1,
+    *,
+    atr_length: int = 14,
+    swing_left: int = 2,
+    swing_right: int = 2,
+    use_provided_swings: bool = True,
+    lookback_swings: int = 50,
+    min_touches: int = 2,
+    level_mode: str = "median",  # "median", "mean", "first", "last"
+    max_cluster_width_atr: float | None = None,
+    max_cluster_span: int | None = None,
+    invalidate_on_sweep: bool = False,
+    sweep_tolerance_atr: float = 0.0,
+    keep_last_n_clusters: int = 20,
+) -> pd.DataFrame:
     """
+    Enhanced Equal Highs / Equal Lows detector.
+
+    Backward-compatible columns
+    ---------------------------
+    * equal_highs
+    * equal_lows
+    * equal_highs_count
+    * equal_lows_count
+
+    Added columns
+    -------------
+    * equal_highs_level / equal_lows_level
+    * equal_highs_width / equal_lows_width
+    * equal_highs_width_atr / equal_lows_width_atr
+    * equal_highs_age / equal_lows_age
+    * equal_highs_span / equal_lows_span
+    * equal_highs_active / equal_lows_active
+    * equal_highs_score / equal_lows_score
+    * equal_highs_cluster_id / equal_lows_cluster_id
+    """
+
     out = df.copy()
     n = len(out)
-    sh_price = out.get("swing_high_price", pd.Series(np.full(n, np.nan))).values.astype(
-        float
-    )
-    sl_price = out.get("swing_low_price", pd.Series(np.full(n, np.nan))).values.astype(
-        float
-    )
 
-    atr = _ensure_atr(out)
+    req = {"high", "low", "close"}
+    missing = req - set(out.columns)
+    if missing:
+        raise ValueError(f"add_equal_hl: missing required columns: {sorted(missing)}")
 
+    h = out["high"].to_numpy(dtype=float)
+    lo = out["low"].to_numpy(dtype=float)
+    atr = _ensure_atr(out, atr_length)
+
+    # ---------------------------------------------------------------------
+    # Swing source
+    # ---------------------------------------------------------------------
+    if (
+        use_provided_swings
+        and "swing_high_price" in out.columns
+        and "swing_low_price" in out.columns
+    ):
+        sh_price = out["swing_high_price"].to_numpy(dtype=float)
+        sl_price = out["swing_low_price"].to_numpy(dtype=float)
+
+        if "swing_high" in out.columns:
+            sh_flag = out["swing_high"].to_numpy(dtype=np.int8)
+        else:
+            sh_flag = np.where(np.isfinite(sh_price), 1, 0).astype(np.int8)
+
+        if "swing_low" in out.columns:
+            sl_flag = out["swing_low"].to_numpy(dtype=np.int8)
+        else:
+            sl_flag = np.where(np.isfinite(sl_price), 1, 0).astype(np.int8)
+
+    else:
+        # causal fallback pivots
+        ph = _pivot_high(h, left=swing_left, right=swing_right)
+        pl = _pivot_low(lo, left=swing_left, right=swing_right)
+
+        sh_flag = ph.astype(np.int8)
+        sl_flag = pl.astype(np.int8)
+
+        sh_price = np.where(sh_flag == 1, h, np.nan)
+        sl_price = np.where(sl_flag == 1, lo, np.nan)
+
+    # ---------------------------------------------------------------------
+    # Outputs
+    # ---------------------------------------------------------------------
     eq_h = np.zeros(n, dtype=np.int8)
     eq_l = np.zeros(n, dtype=np.int8)
     eq_h_cnt = np.zeros(n, dtype=np.int16)
     eq_l_cnt = np.zeros(n, dtype=np.int16)
 
-    recent_sh = []
-    recent_sl = []
+    eq_h_level = np.full(n, np.nan)
+    eq_l_level = np.full(n, np.nan)
 
+    eq_h_width = np.full(n, np.nan)
+    eq_l_width = np.full(n, np.nan)
+    eq_h_width_atr = np.full(n, np.nan)
+    eq_l_width_atr = np.full(n, np.nan)
+
+    eq_h_age = np.full(n, np.nan)
+    eq_l_age = np.full(n, np.nan)
+    eq_h_span = np.full(n, np.nan)
+    eq_l_span = np.full(n, np.nan)
+
+    eq_h_active = np.zeros(n, dtype=np.int8)
+    eq_l_active = np.zeros(n, dtype=np.int8)
+
+    eq_h_score = np.full(n, np.nan)
+    eq_l_score = np.full(n, np.nan)
+
+    eq_h_cluster_id = np.full(n, -1, dtype=int)
+    eq_l_cluster_id = np.full(n, -1, dtype=int)
+
+    # ---------------------------------------------------------------------
+    # Cluster helpers
+    # ---------------------------------------------------------------------
+    next_cluster_id_h = 0
+    next_cluster_id_l = 0
+
+    high_clusters = []
+    low_clusters = []
+
+    def _cluster_level(values):
+        arr = np.asarray(values, dtype=float)
+        if len(arr) == 0:
+            return np.nan
+        if level_mode == "mean":
+            return float(np.mean(arr))
+        if level_mode == "first":
+            return float(arr[0])
+        if level_mode == "last":
+            return float(arr[-1])
+        return float(np.median(arr))  # default median
+
+    def _cluster_width(values):
+        arr = np.asarray(values, dtype=float)
+        if len(arr) == 0:
+            return np.nan
+        return float(np.max(arr) - np.min(arr))
+
+    def _cluster_score(count, width_atr, span):
+        # higher count = better
+        # tighter cluster = better
+        # some span is useful, but too huge span should not dominate
+        width_term = 1.0 / (1.0 + max(width_atr, 0.0))
+        span_term = np.log1p(max(span, 0.0))
+        return float(count * width_term * (1.0 + 0.1 * span_term))
+
+    def _match_cluster(price, atr_i, clusters, side):
+        tol = atr_tolerance * atr_i if np.isfinite(atr_i) and atr_i > 0 else 0.0
+        candidates = []
+
+        for idx, cl in enumerate(clusters):
+            if not cl["active"]:
+                continue
+            level = cl["level"]
+            if np.isfinite(level) and abs(price - level) <= tol:
+                candidates.append((idx, abs(price - level)))
+
+        if not candidates:
+            return None
+        # nearest cluster
+        candidates.sort(key=lambda x: x[1])
+        return candidates[0][0]
+
+    def _register_touch(cl, price, idx, atr_i):
+        cl["prices"].append(float(price))
+        cl["indices"].append(int(idx))
+        cl["last_idx"] = int(idx)
+        cl["count"] = len(cl["prices"])
+        cl["level"] = _cluster_level(cl["prices"])
+        cl["width"] = _cluster_width(cl["prices"])
+        cl["width_atr"] = (
+            cl["width"] / atr_i if np.isfinite(atr_i) and atr_i > 0 else np.nan
+        )
+        cl["span"] = cl["indices"][-1] - cl["indices"][0]
+        cl["age"] = idx - cl["indices"][-1]  # usually 0 at update bar
+        cl["score"] = _cluster_score(
+            cl["count"],
+            0.0 if np.isnan(cl["width_atr"]) else cl["width_atr"],
+            cl["span"],
+        )
+
+    def _prune_clusters(clusters):
+        # keep only recent active/relevant clusters
+        if len(clusters) <= keep_last_n_clusters:
+            return clusters
+        # prefer active and recent
+        clusters = sorted(
+            clusters,
+            key=lambda z: (z["active"], z["last_idx"]),
+            reverse=True,
+        )
+        kept = clusters[:keep_last_n_clusters]
+        # restore chronological-ish order
+        kept = sorted(kept, key=lambda z: z["id"])
+        return kept
+
+    # ---------------------------------------------------------------------
+    # Main loop
+    # ---------------------------------------------------------------------
     for i in range(n):
-        tol = atr_tolerance * atr[i] if not np.isnan(atr[i]) else 0
+        atr_i = atr[i] if np.isfinite(atr[i]) else np.nan
+        sweep_tol = (
+            sweep_tolerance_atr * atr_i if np.isfinite(atr_i) and atr_i > 0 else 0.0
+        )
 
-        if not np.isnan(sh_price[i]):
-            cnt = sum(1 for p, _ in recent_sh if abs(p - sh_price[i]) <= tol)
-            if cnt > 0:
+        # -------------------------------------------------------------
+        # Invalidate active EQH/EQL clusters if swept
+        # -------------------------------------------------------------
+        if invalidate_on_sweep:
+            for cl in high_clusters:
+                if not cl["active"] or not np.isfinite(cl["level"]):
+                    continue
+                # high-side liquidity pool swept if current high takes it
+                if h[i] > cl["level"] + sweep_tol:
+                    cl["active"] = False
+                    cl["swept_idx"] = i
+
+            for cl in low_clusters:
+                if not cl["active"] or not np.isfinite(cl["level"]):
+                    continue
+                # low-side liquidity pool swept if current low takes it
+                if lo[i] < cl["level"] - sweep_tol:
+                    cl["active"] = False
+                    cl["swept_idx"] = i
+
+        # -------------------------------------------------------------
+        # Process new swing high
+        # -------------------------------------------------------------
+        if sh_flag[i] == 1 and np.isfinite(sh_price[i]):
+            price = sh_price[i]
+
+            # prune clusters by recency/lookback
+            high_clusters = [
+                cl for cl in high_clusters if (i - cl["last_idx"] <= lookback_swings)
+            ]
+
+            match_idx = _match_cluster(price, atr_i, high_clusters, side="high")
+
+            if match_idx is None:
+                # start new cluster
+                cl = {
+                    "id": next_cluster_id_h,
+                    "prices": [float(price)],
+                    "indices": [int(i)],
+                    "first_idx": int(i),
+                    "last_idx": int(i),
+                    "count": 1,
+                    "level": float(price),
+                    "width": 0.0,
+                    "width_atr": 0.0,
+                    "span": 0,
+                    "age": 0,
+                    "score": 1.0,
+                    "active": True,
+                    "swept_idx": -1,
+                }
+                high_clusters.append(cl)
+                next_cluster_id_h += 1
+            else:
+                cl = high_clusters[match_idx]
+                _register_touch(cl, price, i, atr_i)
+
+            # optional filters on the updated cluster
+            width_ok = True
+            if max_cluster_width_atr is not None and np.isfinite(cl["width_atr"]):
+                width_ok = cl["width_atr"] <= max_cluster_width_atr
+
+            span_ok = True
+            if max_cluster_span is not None:
+                span_ok = cl["span"] <= max_cluster_span
+
+            if cl["count"] >= min_touches and width_ok and span_ok:
                 eq_h[i] = 1
-                eq_h_cnt[i] = cnt + 1
-            recent_sh.append((sh_price[i], i))
-            if len(recent_sh) > 20:
-                recent_sh.pop(0)
+                eq_h_cnt[i] = cl["count"]
+                eq_h_level[i] = cl["level"]
+                eq_h_width[i] = cl["width"]
+                eq_h_width_atr[i] = cl["width_atr"]
+                eq_h_age[i] = i - cl["last_idx"]
+                eq_h_span[i] = cl["span"]
+                eq_h_active[i] = 1 if cl["active"] else 0
+                eq_h_score[i] = cl["score"]
+                eq_h_cluster_id[i] = cl["id"]
 
-        if not np.isnan(sl_price[i]):
-            cnt = sum(1 for p, _ in recent_sl if abs(p - sl_price[i]) <= tol)
-            if cnt > 0:
+        # -------------------------------------------------------------
+        # Process new swing low
+        # -------------------------------------------------------------
+        if sl_flag[i] == 1 and np.isfinite(sl_price[i]):
+            price = sl_price[i]
+
+            low_clusters = [
+                cl for cl in low_clusters if (i - cl["last_idx"] <= lookback_swings)
+            ]
+
+            match_idx = _match_cluster(price, atr_i, low_clusters, side="low")
+
+            if match_idx is None:
+                cl = {
+                    "id": next_cluster_id_l,
+                    "prices": [float(price)],
+                    "indices": [int(i)],
+                    "first_idx": int(i),
+                    "last_idx": int(i),
+                    "count": 1,
+                    "level": float(price),
+                    "width": 0.0,
+                    "width_atr": 0.0,
+                    "span": 0,
+                    "age": 0,
+                    "score": 1.0,
+                    "active": True,
+                    "swept_idx": -1,
+                }
+                low_clusters.append(cl)
+                next_cluster_id_l += 1
+            else:
+                cl = low_clusters[match_idx]
+                _register_touch(cl, price, i, atr_i)
+
+            width_ok = True
+            if max_cluster_width_atr is not None and np.isfinite(cl["width_atr"]):
+                width_ok = cl["width_atr"] <= max_cluster_width_atr
+
+            span_ok = True
+            if max_cluster_span is not None:
+                span_ok = cl["span"] <= max_cluster_span
+
+            if cl["count"] >= min_touches and width_ok and span_ok:
                 eq_l[i] = 1
-                eq_l_cnt[i] = cnt + 1
-            recent_sl.append((sl_price[i], i))
-            if len(recent_sl) > 20:
-                recent_sl.pop(0)
+                eq_l_cnt[i] = cl["count"]
+                eq_l_level[i] = cl["level"]
+                eq_l_width[i] = cl["width"]
+                eq_l_width_atr[i] = cl["width_atr"]
+                eq_l_age[i] = i - cl["last_idx"]
+                eq_l_span[i] = cl["span"]
+                eq_l_active[i] = 1 if cl["active"] else 0
+                eq_l_score[i] = cl["score"]
+                eq_l_cluster_id[i] = cl["id"]
+
+        high_clusters = _prune_clusters(high_clusters)
+        low_clusters = _prune_clusters(low_clusters)
+
+    # ---------------------------------------------------------------------
+    # Backfill current active cluster state onto non-swing bars
+    # This makes downstream use easier.
+    # ---------------------------------------------------------------------
+    latest_active_high = None
+    latest_active_low = None
+
+    # also include clusters that may have been pruned out of current lists but had outputs already;
+    # non-critical, so we keep this part simple and only carry latest seen outputs forward.
+    for i in range(n):
+        if eq_h_cluster_id[i] >= 0:
+            latest_active_high = (
+                eq_h_cluster_id[i],
+                eq_h_level[i],
+                eq_h_cnt[i],
+                eq_h_width[i],
+                eq_h_width_atr[i],
+                eq_h_span[i],
+                eq_h_score[i],
+                eq_h_active[i],
+            )
+
+        if latest_active_high is not None and eq_h_cluster_id[i] < 0:
+            cid, lvl, cnt, wid, wid_atr, span, score, active = latest_active_high
+            if active == 1:
+                eq_h_level[i] = lvl if np.isnan(eq_h_level[i]) else eq_h_level[i]
+                eq_h_cnt[i] = cnt if eq_h_cnt[i] == 0 else eq_h_cnt[i]
+                eq_h_width[i] = wid if np.isnan(eq_h_width[i]) else eq_h_width[i]
+                eq_h_width_atr[i] = (
+                    wid_atr if np.isnan(eq_h_width_atr[i]) else eq_h_width_atr[i]
+                )
+                eq_h_span[i] = span if np.isnan(eq_h_span[i]) else eq_h_span[i]
+                eq_h_score[i] = score if np.isnan(eq_h_score[i]) else eq_h_score[i]
+                eq_h_active[i] = 1 if eq_h_active[i] == 0 else eq_h_active[i]
+
+        if eq_l_cluster_id[i] >= 0:
+            latest_active_low = (
+                eq_l_cluster_id[i],
+                eq_l_level[i],
+                eq_l_cnt[i],
+                eq_l_width[i],
+                eq_l_width_atr[i],
+                eq_l_span[i],
+                eq_l_score[i],
+                eq_l_active[i],
+            )
+
+        if latest_active_low is not None and eq_l_cluster_id[i] < 0:
+            cid, lvl, cnt, wid, wid_atr, span, score, active = latest_active_low
+            if active == 1:
+                eq_l_level[i] = lvl if np.isnan(eq_l_level[i]) else eq_l_level[i]
+                eq_l_cnt[i] = cnt if eq_l_cnt[i] == 0 else eq_l_cnt[i]
+                eq_l_width[i] = wid if np.isnan(eq_l_width[i]) else eq_l_width[i]
+                eq_l_width_atr[i] = (
+                    wid_atr if np.isnan(eq_l_width_atr[i]) else eq_l_width_atr[i]
+                )
+                eq_l_span[i] = span if np.isnan(eq_l_span[i]) else eq_l_span[i]
+                eq_l_score[i] = score if np.isnan(eq_l_score[i]) else eq_l_score[i]
+                eq_l_active[i] = 1 if eq_l_active[i] == 0 else eq_l_active[i]
 
     out["equal_highs"] = eq_h
     out["equal_lows"] = eq_l
     out["equal_highs_count"] = eq_h_cnt
     out["equal_lows_count"] = eq_l_cnt
+
+    out["equal_highs_level"] = eq_h_level
+    out["equal_lows_level"] = eq_l_level
+
+    out["equal_highs_width"] = eq_h_width
+    out["equal_lows_width"] = eq_l_width
+    out["equal_highs_width_atr"] = eq_h_width_atr
+    out["equal_lows_width_atr"] = eq_l_width_atr
+
+    out["equal_highs_age"] = eq_h_age
+    out["equal_lows_age"] = eq_l_age
+    out["equal_highs_span"] = eq_h_span
+    out["equal_lows_span"] = eq_l_span
+
+    out["equal_highs_active"] = eq_h_active
+    out["equal_lows_active"] = eq_l_active
+
+    out["equal_highs_score"] = eq_h_score
+    out["equal_lows_score"] = eq_l_score
+
+    out["equal_highs_cluster_id"] = eq_h_cluster_id
+    out["equal_lows_cluster_id"] = eq_l_cluster_id
+
     return out
 
 

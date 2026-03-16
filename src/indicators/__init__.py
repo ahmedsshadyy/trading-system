@@ -17,6 +17,7 @@ from src.indicators.trend import (
     add_emas,
     add_adx,
     add_swings,
+    add_swings_causal,
     add_trend_state,
     add_bos,
     add_choch,
@@ -80,6 +81,7 @@ def build_all_indicators(
     df: pd.DataFrame,
     instrument: str = "XAU_USD",
     swing_window: int = 3,
+    swing_mode: str = "symmetric",
     include_vp: bool = True,
     include_avwap: bool = False,
 ) -> pd.DataFrame:
@@ -92,7 +94,11 @@ def build_all_indicators(
     instrument : str
         For round-number detection (XAU_USD or USOIL).
     swing_window : int
-        Window for swing detection (default 3 = 6-candle lookback/forward).
+        Window for swing detection (default 3 for symmetric = 6-candle span,
+        default 6 for causal = 6-bar lookback).
+    swing_mode : str
+        'symmetric' — look-ahead swing detection (cleaner pivots, standard for backtesting).
+        'causal' — no look-ahead (same detector for training and live deployment).
     include_vp : bool
         Whether to compute Volume Profile (slower — disable for quick tests).
     include_avwap : bool
@@ -120,7 +126,10 @@ def build_all_indicators(
     out = add_body_ratio(out)
 
     # === Layer 2: Structure (depends on Layer 1) ===
-    out = add_swings(out, window=swing_window)
+    if swing_mode == "causal":
+        out = add_swings_causal(out, window=swing_window if swing_window != 3 else 6)
+    else:
+        out = add_swings(out, window=swing_window)
     out = add_trend_state(out)
     out = add_bos(out)
     out = add_choch(out)
