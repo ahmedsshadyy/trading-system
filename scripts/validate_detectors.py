@@ -216,8 +216,8 @@ def chart_choch(seg):
 
 
 def chart_fvg(seg):
-    """Chart 4: FVG zones only."""
-    fig = base_candle_chart(seg, "Detector: Fair Value Gaps (FVG)")
+    """Chart 4: FVG zones + IFVG markers."""
+    fig = base_candle_chart(seg, "Detector: FVG Zones + IFVG Confirmations")
 
     for _, row in seg[seg["fvg_bull"] == 1].iterrows():
         if not np.isnan(row.get("fvg_bull_low", np.nan)):
@@ -233,10 +233,10 @@ def chart_fvg(seg):
             fig.add_annotation(
                 x=row["timestamp"],
                 y=row["fvg_bull_high"],
-                text=f"B {row['fvg_bull_low']:.0f}-{row['fvg_bull_high']:.0f}",
+                text=f"B {row['fvg_size_atr']:.1f}x",
                 showarrow=False,
                 font=dict(size=8, color="lime"),
-                yshift=10,
+                yshift=8,
             )
 
     for _, row in seg[seg["fvg_bear"] == 1].iterrows():
@@ -253,11 +253,45 @@ def chart_fvg(seg):
             fig.add_annotation(
                 x=row["timestamp"],
                 y=row["fvg_bear_low"],
-                text=f"S {row['fvg_bear_low']:.0f}-{row['fvg_bear_high']:.0f}",
+                text=f"S {row['fvg_size_atr']:.1f}x",
                 showarrow=False,
                 font=dict(size=8, color="red"),
-                yshift=-10,
+                yshift=-8,
             )
+
+    # IFVG markers
+    if "ifvg_bull" in seg.columns:
+        ib = seg[seg["ifvg_bull"] == 1]
+        if len(ib):
+            fig.add_trace(
+                go.Scatter(
+                    x=ib["timestamp"],
+                    y=ib["close"],
+                    mode="markers+text",
+                    marker=dict(symbol="diamond", size=14, color="cyan"),
+                    text=["IFVG↑"] * len(ib),
+                    textposition="top center",
+                    textfont=dict(size=10, color="cyan"),
+                    name="IFVG Bull",
+                )
+            )
+
+    if "ifvg_bear" in seg.columns:
+        ir = seg[seg["ifvg_bear"] == 1]
+        if len(ir):
+            fig.add_trace(
+                go.Scatter(
+                    x=ir["timestamp"],
+                    y=ir["close"],
+                    mode="markers+text",
+                    marker=dict(symbol="diamond", size=14, color="yellow"),
+                    text=["IFVG↓"] * len(ir),
+                    textposition="bottom center",
+                    textfont=dict(size=10, color="yellow"),
+                    name="IFVG Bear",
+                )
+            )
+
     return fig
 
 
@@ -567,7 +601,7 @@ def main():
         ("01_swings", chart_swings),
         ("02_bos", chart_bos),
         ("03_choch", chart_choch),
-        ("04_fvg", chart_fvg),
+        ("04_fvg_ifvg", chart_fvg),
         ("05_ob", chart_ob),
         ("06_sweeps", chart_sweeps),
         ("07_displacement", chart_displacement),

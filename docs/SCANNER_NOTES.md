@@ -190,3 +190,10 @@ These apply across multiple strategies:
 ---
 
 *Last updated: Phase 2 indicator validation, March 2026*
+## Sweep + FVG/OB Confluence (cross-strategy)
+
+When a sweep occurs at a level that also has an active FVG or unmitigated OB:
+- Check: does `sweep_level_high` or `sweep_level_low` overlap with an active FVG zone or OB zone?
+- This is the highest-conviction sweep setup — institutional level + imbalance zone + stop hunt
+- Feature: `sweep_at_fvg` (binary), `sweep_at_ob` (binary)
+- Applies to Strategy 5 primarily, but also S3 and S11
