@@ -970,6 +970,11 @@ def add_ob_mitigation(df: pd.DataFrame, *, keep_last_n: int = 3) -> pd.DataFrame
     return out
 
 
+# ============================================================================
+# Enhanced Liquidity Sweep
+# ============================================================================
+
+
 def add_liquidity_sweep(
     df: pd.DataFrame,
     atr_threshold: float = 0.2,

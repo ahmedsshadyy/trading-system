@@ -12,6 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from src.indicators import ta_core as ta
+from src.indicators.ta_core import ensure_atr as _ensure_atr
 
 # ---------------------------------------------------------------------------
 # EMA
@@ -83,62 +84,231 @@ def add_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def add_swings(df: pd.DataFrame, window: int = 3) -> pd.DataFrame:
-    """Detect swing highs and lows using a symmetric rolling window.
+def add_swings(
+    df: pd.DataFrame,
+    window: int = 3,
+    *,
+    causal: bool = True,
+    atr_length: int = 14,
+    min_prominence_atr: float = 0.0,
+    min_separation: int = 0,
+    tie_mode: str = "strict",  # "strict" or "allow"
+) -> pd.DataFrame:
+    """
+    Enhanced swing high/low detector using a symmetric rolling window.
 
-    A swing high at *i* means ``high[i]`` is the max in ``[i−window, i+window]``.
-    Uses look-ahead — suitable for historical backtesting only.
+    A swing high at i means high[i] is a local maximum in [i-window, i+window].
+    A swing low at i means low[i] is a local minimum in [i-window, i+window].
 
-    Columns
-    ~~~~~~~
-    * ``swing_high / swing_low``       – binary flags
-    * ``swing_high_price / swing_low_price`` – price (NaN elsewhere)
-    * ``last_swing_high / last_swing_low``   – forward-filled
-    * ``swing_high_age / swing_low_age``     – candles since last swing
+    Parameters
+    ----------
+    causal : bool
+        If True, `last_swing_high/low` become available only at confirmation time
+        (i + window). This avoids look-ahead leakage in downstream features.
+        If False, behaves more like historical plotting mode.
+    min_prominence_atr : float
+        Minimum required prominence of a swing relative to neighboring window,
+        normalized by ATR. Set 0 to disable.
+    min_separation : int
+        Minimum number of bars between consecutive same-side swings.
+    tie_mode : str
+        "strict" => must be strictly greater/less than at least one side.
+        "allow"  => local max/min with ties allowed.
+
+    Backward-compatible columns
+    ---------------------------
+    * swing_high / swing_low
+    * swing_high_price / swing_low_price
+    * last_swing_high / last_swing_low
+    * swing_high_age / swing_low_age
+
+    Added columns
+    -------------
+    * swing_high_confirmed / swing_low_confirmed
+    * swing_high_confirm_idx / swing_low_confirm_idx
+    * swing_high_idx / swing_low_idx
+    * last_swing_high_idx / last_swing_low_idx
+    * swing_high_prominence / swing_low_prominence
+    * swing_high_prominence_atr / swing_low_prominence_atr
+    * swing_high_strength / swing_low_strength
     """
     out = df.copy()
     n = len(out)
-    highs = out["high"].values.astype(float)
-    lows = out["low"].values.astype(float)
+
+    req = {"high", "low", "close"}
+    missing = req - set(out.columns)
+    if missing:
+        raise ValueError(f"add_swings: missing required columns: {sorted(missing)}")
+
+    highs = out["high"].to_numpy(dtype=float)
+    lows = out["low"].to_numpy(dtype=float)
+
+    # ATR for normalization
+    atr = _ensure_atr(out, atr_length)
 
     sh = np.zeros(n, dtype=np.int8)
     sl = np.zeros(n, dtype=np.int8)
 
-    for i in range(window, n - window):
-        if (
-            highs[i] >= highs[i - window : i].max()
-            and highs[i] >= highs[i + 1 : i + window + 1].max()
-        ):
-            # Strict: must be strictly greater than at least one side
-            if (
-                highs[i] > highs[i - window : i].max()
-                or highs[i] > highs[i + 1 : i + window + 1].max()
-            ):
-                sh[i] = 1
+    sh_price = np.full(n, np.nan)
+    sl_price = np.full(n, np.nan)
 
-        if (
-            lows[i] <= lows[i - window : i].min()
-            and lows[i] <= lows[i + 1 : i + window + 1].min()
-        ):
-            if (
-                lows[i] < lows[i - window : i].min()
-                or lows[i] < lows[i + 1 : i + window + 1].min()
-            ):
+    sh_confirmed = np.zeros(n, dtype=np.int8)
+    sl_confirmed = np.zeros(n, dtype=np.int8)
+
+    sh_confirm_idx = np.full(n, -1, dtype=int)
+    sl_confirm_idx = np.full(n, -1, dtype=int)
+
+    sh_idx_arr = np.full(n, -1, dtype=int)
+    sl_idx_arr = np.full(n, -1, dtype=int)
+
+    sh_prom = np.full(n, np.nan)
+    sl_prom = np.full(n, np.nan)
+
+    sh_prom_atr = np.full(n, np.nan)
+    sl_prom_atr = np.full(n, np.nan)
+
+    sh_strength = np.full(n, np.nan)
+    sl_strength = np.full(n, np.nan)
+
+    last_sh_i = -(10**9)
+    last_sl_i = -(10**9)
+
+    for i in range(window, n - window):
+        left_highs = highs[i - window : i]
+        right_highs = highs[i + 1 : i + window + 1]
+        left_lows = lows[i - window : i]
+        right_lows = lows[i + 1 : i + window + 1]
+
+        left_h_max = left_highs.max()
+        right_h_max = right_highs.max()
+        left_l_min = left_lows.min()
+        right_l_min = right_lows.min()
+
+        # Candidate swing high
+        high_is_local_max = highs[i] >= left_h_max and highs[i] >= right_h_max
+        if tie_mode == "strict":
+            high_tie_ok = highs[i] > left_h_max or highs[i] > right_h_max
+        else:
+            high_tie_ok = True
+
+        if high_is_local_max and high_tie_ok:
+            prominence = highs[i] - max(left_h_max, right_h_max)
+            prominence_atr = (
+                prominence / atr[i] if np.isfinite(atr[i]) and atr[i] > 0 else np.nan
+            )
+            sep_ok = (i - last_sh_i) > min_separation
+            prom_ok = (min_prominence_atr <= 0) or (
+                np.isfinite(prominence_atr) and prominence_atr >= min_prominence_atr
+            )
+
+            if sep_ok and prom_ok:
+                sh[i] = 1
+                sh_price[i] = highs[i]
+                sh_idx_arr[i] = i
+                sh_prom[i] = prominence
+                sh_prom_atr[i] = prominence_atr
+                sh_strength[i] = prominence_atr
+                if i + window < n:
+                    sh_confirm_idx[i] = i + window
+                    sh_confirmed[i + window] = 1
+                last_sh_i = i
+
+        # Candidate swing low
+        low_is_local_min = lows[i] <= left_l_min and lows[i] <= right_l_min
+        if tie_mode == "strict":
+            low_tie_ok = lows[i] < left_l_min or lows[i] < right_l_min
+        else:
+            low_tie_ok = True
+
+        if low_is_local_min and low_tie_ok:
+            prominence = min(left_l_min, right_l_min) - lows[i]
+            prominence_atr = (
+                prominence / atr[i] if np.isfinite(atr[i]) and atr[i] > 0 else np.nan
+            )
+            sep_ok = (i - last_sl_i) > min_separation
+            prom_ok = (min_prominence_atr <= 0) or (
+                np.isfinite(prominence_atr) and prominence_atr >= min_prominence_atr
+            )
+
+            if sep_ok and prom_ok:
                 sl[i] = 1
+                sl_price[i] = lows[i]
+                sl_idx_arr[i] = i
+                sl_prom[i] = prominence
+                sl_prom_atr[i] = prominence_atr
+                sl_strength[i] = prominence_atr
+                if i + window < n:
+                    sl_confirm_idx[i] = i + window
+                    sl_confirmed[i + window] = 1
+                last_sl_i = i
 
     out["swing_high"] = sh
     out["swing_low"] = sl
-    out["swing_high_price"] = np.where(sh == 1, highs, np.nan)
-    out["swing_low_price"] = np.where(sl == 1, lows, np.nan)
-    out["last_swing_high"] = pd.Series(out["swing_high_price"].values).ffill().values
-    out["last_swing_low"] = pd.Series(out["swing_low_price"].values).ffill().values
+    out["swing_high_price"] = sh_price
+    out["swing_low_price"] = sl_price
 
-    # Age: candles since last swing
+    out["swing_high_confirmed"] = sh_confirmed
+    out["swing_low_confirmed"] = sl_confirmed
+    out["swing_high_confirm_idx"] = sh_confirm_idx
+    out["swing_low_confirm_idx"] = sl_confirm_idx
+
+    out["swing_high_idx"] = sh_idx_arr
+    out["swing_low_idx"] = sl_idx_arr
+
+    out["swing_high_prominence"] = sh_prom
+    out["swing_low_prominence"] = sl_prom
+    out["swing_high_prominence_atr"] = sh_prom_atr
+    out["swing_low_prominence_atr"] = sl_prom_atr
+    out["swing_high_strength"] = sh_strength
+    out["swing_low_strength"] = sl_strength
+
+    # Build last confirmed swing levels causally
+    last_swing_high = np.full(n, np.nan)
+    last_swing_low = np.full(n, np.nan)
+    last_swing_high_idx = np.full(n, np.nan)
+    last_swing_low_idx = np.full(n, np.nan)
+
+    cur_h = np.nan
+    cur_l = np.nan
+    cur_h_idx = np.nan
+    cur_l_idx = np.nan
+
+    for i in range(n):
+        if causal:
+            # at bar i, only swings whose confirmation time == i become known
+            confirmed_h_sources = np.where(sh_confirm_idx == i)[0]
+            confirmed_l_sources = np.where(sl_confirm_idx == i)[0]
+
+            if len(confirmed_h_sources) > 0:
+                src = confirmed_h_sources[-1]
+                cur_h = sh_price[src]
+                cur_h_idx = float(src)
+
+            if len(confirmed_l_sources) > 0:
+                src = confirmed_l_sources[-1]
+                cur_l = sl_price[src]
+                cur_l_idx = float(src)
+        else:
+            if sh[i] == 1:
+                cur_h = sh_price[i]
+                cur_h_idx = float(i)
+            if sl[i] == 1:
+                cur_l = sl_price[i]
+                cur_l_idx = float(i)
+
+        last_swing_high[i] = cur_h
+        last_swing_low[i] = cur_l
+        last_swing_high_idx[i] = cur_h_idx
+        last_swing_low_idx[i] = cur_l_idx
+
+    out["last_swing_high"] = last_swing_high
+    out["last_swing_low"] = last_swing_low
+    out["last_swing_high_idx"] = last_swing_high_idx
+    out["last_swing_low_idx"] = last_swing_low_idx
+
     idx = np.arange(n, dtype=float)
-    sh_idx = np.where(sh == 1, idx, np.nan)
-    sl_idx = np.where(sl == 1, idx, np.nan)
-    out["swing_high_age"] = idx - pd.Series(sh_idx).ffill().values
-    out["swing_low_age"] = idx - pd.Series(sl_idx).ffill().values
+    out["swing_high_age"] = idx - last_swing_high_idx
+    out["swing_low_age"] = idx - last_swing_low_idx
 
     return out
 

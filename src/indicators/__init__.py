@@ -81,7 +81,7 @@ def build_all_indicators(
     df: pd.DataFrame,
     instrument: str = "XAU_USD",
     swing_window: int = 3,
-    swing_mode: str = "symmetric",
+    swing_mode: str = "symmetric_causal",
     include_vp: bool = True,
     include_avwap: bool = False,
 ) -> pd.DataFrame:
@@ -128,8 +128,10 @@ def build_all_indicators(
     # === Layer 2: Structure (depends on Layer 1) ===
     if swing_mode == "causal":
         out = add_swings_causal(out, window=swing_window if swing_window != 3 else 6)
-    else:
-        out = add_swings(out, window=swing_window)
+    elif swing_mode == "symmetric_causal":
+        out = add_swings(out, window=swing_window, causal=True)
+    else:  # "symmetric"
+        out = add_swings(out, window=swing_window, causal=False)
     out = add_trend_state(out)
     out = add_bos(out)
     out = add_choch(out)
