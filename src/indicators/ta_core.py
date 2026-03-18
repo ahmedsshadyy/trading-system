@@ -1,4 +1,7 @@
 """
+
+ta_core.py
+
 Standard technical indicators — pure numpy/pandas implementations.
 
 Zero external dependencies beyond numpy + pandas.
