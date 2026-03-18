@@ -1,4 +1,7 @@
 """
+
+validate_indicators.py
+
 Indicator validation script.
 
 Loads real XAU_USD H4 data from PostgreSQL, runs the full indicator

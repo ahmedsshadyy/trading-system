@@ -13,73 +13,20 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from src.indicators.ta_core import ensure_atr as _ensure_atr
 
-# ============================================================================
-# Shared Internal Helpers (structure-specific, not in ta_core)
-# ============================================================================
-
-
-def _pivot_high(high: np.ndarray, left: int = 2, right: int = 2) -> np.ndarray:
-    n = len(high)
-    out = np.zeros(n, dtype=np.int8)
-    for i in range(left, n - right):
-        if np.all(high[i] > high[i - left : i]) and np.all(
-            high[i] >= high[i + 1 : i + right + 1]
-        ):
-            out[i] = 1
-    return out
-
-
-def _pivot_low(low: np.ndarray, left: int = 2, right: int = 2) -> np.ndarray:
-    n = len(low)
-    out = np.zeros(n, dtype=np.int8)
-    for i in range(left, n - right):
-        if np.all(low[i] < low[i - left : i]) and np.all(
-            low[i] <= low[i + 1 : i + right + 1]
-        ):
-            out[i] = 1
-    return out
-
-
-def _last_confirmed_swing_levels(
-    high: np.ndarray, low: np.ndarray, left: int = 2, right: int = 2
-):
-    """For each bar i, most recent confirmed pivot (knowable by bar i)."""
-    n = len(high)
-    ph = _pivot_high(high, left, right)
-    pl = _pivot_low(low, left, right)
-    last_ph = np.full(n, np.nan)
-    last_pl = np.full(n, np.nan)
-    cur_ph = np.nan
-    cur_pl = np.nan
-    for i in range(n):
-        j = i - right
-        if j >= 0:
-            if ph[j] == 1:
-                cur_ph = high[j]
-            if pl[j] == 1:
-                cur_pl = low[j]
-        last_ph[i] = cur_ph
-        last_pl[i] = cur_pl
-    return last_ph, last_pl
-
-
-def _body_high(open_: np.ndarray, close: np.ndarray) -> np.ndarray:
-    return np.maximum(open_, close)
-
-
-def _body_low(open_: np.ndarray, close: np.ndarray) -> np.ndarray:
-    return np.minimum(open_, close)
-
-
-def _zones_overlap(a_lo: float, a_hi: float, b_lo: float, b_hi: float) -> bool:
-    return not (a_hi < b_lo or b_hi < a_lo)
-
-
-def _merge_zone_bounds(a_lo: float, a_hi: float, b_lo: float, b_hi: float):
-    return min(a_lo, b_lo), max(a_hi, b_hi)
-
+# Shared helpers — centralized in _helpers/ (no more local copies)
+from src.indicators._helpers.arrays import get_atr_array
+from src.indicators._helpers.pivots import (
+    pivot_high,
+    pivot_low,
+    last_confirmed_swing_levels,
+)
+from src.indicators._helpers.zones import (
+    zones_overlap,
+    merge_zone_bounds,
+    body_high,
+    body_low,
+)
 
 # ============================================================================
 # FVG Detector (Enhanced)
@@ -124,12 +71,12 @@ def add_fvg(
     lo = out["low"].to_numpy(dtype=float)
     c = out["close"].to_numpy(dtype=float)
 
-    atr = _ensure_atr(out, atr_length)
-    bh = _body_high(o, c)
-    bl = _body_low(o, c)
+    atr = get_atr_array(out, atr_length)
+    bh = body_high(o, c)
+    bl = body_low(o, c)
     mid_body = np.abs(c - o)
 
-    last_ph, last_pl = _last_confirmed_swing_levels(
+    last_ph, last_pl = last_confirmed_swing_levels(
         h, lo, left=swing_left, right=swing_right
     )
 
@@ -241,10 +188,10 @@ def add_fvg(
         merged = [cands[0].copy()]
         for cand in cands[1:]:
             prev = merged[-1]
-            if cand["idx"] - prev["idx"] <= merge_max_gap_bars and _zones_overlap(
+            if cand["idx"] - prev["idx"] <= merge_max_gap_bars and zones_overlap(
                 prev["lo"], prev["hi"], cand["lo"], cand["hi"]
             ):
-                prev["lo"], prev["hi"] = _merge_zone_bounds(
+                prev["lo"], prev["hi"] = merge_zone_bounds(
                     prev["lo"], prev["hi"], cand["lo"], cand["hi"]
                 )
                 prev["size_atr"] = max(prev["size_atr"], cand["size_atr"])
@@ -571,7 +518,7 @@ def add_ifvg(
     lo = out["low"].to_numpy(dtype=float)
     c = out["close"].to_numpy(dtype=float)
 
-    atr = _ensure_atr(out, atr_length)
+    atr = get_atr_array(out, atr_length)
 
     fb = out.get("fvg_bull", pd.Series(np.zeros(n, dtype=np.int8))).to_numpy(
         dtype=np.int8
@@ -798,8 +745,8 @@ def add_ob(
     lo = out["low"].values.astype(float)
     c = out["close"].values.astype(float)
 
-    atr = _ensure_atr(out, atr_length)
-    last_ph, last_pl = _last_confirmed_swing_levels(h, lo, swing_left, swing_right)
+    atr = get_atr_array(out, atr_length)
+    last_ph, last_pl = last_confirmed_swing_levels(h, lo, swing_left, swing_right)
 
     ob_bull = np.zeros(n, dtype=np.int8)
     ob_bear = np.zeros(n, dtype=np.int8)
@@ -995,37 +942,15 @@ def add_liquidity_sweep(
     confirmation_mode: str = "close",
     use_provided_swings: bool = True,
 ) -> pd.DataFrame:
-    """
-    Enhanced liquidity sweep detector.
+    """Enhanced liquidity sweep detector.
 
     A sweep is defined as:
     - price trades beyond a reference liquidity level (swing high/low)
     - then closes back inside the level on the same candle
     - optionally, the next bar confirms reversal
 
-    Backward-compatible columns
-    ---------------------------
-    * sweep_high
-    * sweep_low
-    * sweep_magnitude
-
-    Added columns
-    -------------
-    * sweep_high_magnitude
-    * sweep_low_magnitude
-    * sweep_high_reclaim_atr
-    * sweep_low_reclaim_atr
-    * sweep_high_wick_frac
-    * sweep_low_wick_frac
-    * sweep_high_body_frac
-    * sweep_low_body_frac
-    * sweep_level_high
-    * sweep_level_low
-    * sweep_level_high_age
-    * sweep_level_low_age
-    * sweep_confirmed_high
-    * sweep_confirmed_low
-    * sweep_side
+    Backward-compatible columns: sweep_high, sweep_low, sweep_magnitude
+    Added columns: sweep_high_magnitude, sweep_low_magnitude, etc.
     """
     out = df.copy()
     n = len(out)
@@ -1042,14 +967,9 @@ def add_liquidity_sweep(
     lo = out["low"].to_numpy(dtype=float)
     c = out["close"].to_numpy(dtype=float)
 
-    # ---------------------------------------------------------------------
-    # ATR
-    # ---------------------------------------------------------------------
-    atr = _ensure_atr(out, atr_length)
+    atr = get_atr_array(out, atr_length)
 
-    # ---------------------------------------------------------------------
     # Reference swing levels
-    # ---------------------------------------------------------------------
     if (
         use_provided_swings
         and "last_swing_high" in out.columns
@@ -1058,7 +978,6 @@ def add_liquidity_sweep(
         last_sh = out["last_swing_high"].to_numpy(dtype=float)
         last_sl = out["last_swing_low"].to_numpy(dtype=float)
 
-        # optional age columns if already present
         if "swing_high_age" in out.columns:
             sh_age = out["swing_high_age"].to_numpy(dtype=float)
         else:
@@ -1070,9 +989,8 @@ def add_liquidity_sweep(
             sl_age = np.full(n, np.nan)
 
     else:
-        # causal fallback from confirmed pivots
-        ph = _pivot_high(h, left=swing_left, right=swing_right)
-        pl = _pivot_low(lo, left=swing_left, right=swing_right)
+        ph = pivot_high(h, left=swing_left, right=swing_right)
+        pl = pivot_low(lo, left=swing_left, right=swing_right)
 
         last_sh = np.full(n, np.nan)
         last_sl = np.full(n, np.nan)
@@ -1099,9 +1017,7 @@ def add_liquidity_sweep(
             sh_age[i] = (i - cur_sh_idx) if cur_sh_idx >= 0 else np.nan
             sl_age[i] = (i - cur_sl_idx) if cur_sl_idx >= 0 else np.nan
 
-    # ---------------------------------------------------------------------
     # Candle geometry
-    # ---------------------------------------------------------------------
     rng = h - lo
     body = np.abs(c - o)
     upper_wick = h - np.maximum(o, c)
@@ -1112,40 +1028,26 @@ def add_liquidity_sweep(
         lower_wick_frac = np.where(rng > 0, lower_wick / rng, 0.0)
         body_frac = np.where(rng > 0, body / rng, 0.0)
 
-    # ---------------------------------------------------------------------
     # Output arrays
-    # ---------------------------------------------------------------------
     sw_h = np.zeros(n, dtype=np.int8)
     sw_l = np.zeros(n, dtype=np.int8)
     sw_mag = np.full(n, np.nan)
-
     sw_h_mag = np.full(n, np.nan)
     sw_l_mag = np.full(n, np.nan)
-
     sw_h_reclaim = np.full(n, np.nan)
     sw_l_reclaim = np.full(n, np.nan)
-
     sw_h_wick_frac = np.full(n, np.nan)
     sw_l_wick_frac = np.full(n, np.nan)
-
     sw_h_body_frac = np.full(n, np.nan)
     sw_l_body_frac = np.full(n, np.nan)
-
     sw_level_high = np.full(n, np.nan)
     sw_level_low = np.full(n, np.nan)
-
     sw_level_high_age = np.full(n, np.nan)
     sw_level_low_age = np.full(n, np.nan)
-
     sw_conf_h = np.zeros(n, dtype=np.int8)
     sw_conf_l = np.zeros(n, dtype=np.int8)
-
-    #  1 = high sweep, -1 = low sweep, 0 = none
     sw_side = np.zeros(n, dtype=np.int8)
 
-    # ---------------------------------------------------------------------
-    # Main detection
-    # ---------------------------------------------------------------------
     for i in range(1, n):
         atr_i = atr[i]
         if not np.isfinite(atr_i) or atr_i <= 0:
@@ -1153,9 +1055,7 @@ def add_liquidity_sweep(
 
         tol = level_tolerance_atr * atr_i
 
-        # ================================================================
         # High sweep
-        # ================================================================
         if np.isfinite(last_sh[i]):
             level = last_sh[i]
             age_ok = (
@@ -1189,7 +1089,7 @@ def add_liquidity_sweep(
                         confirmed = c[i + 1] < (o[i] + c[i]) / 2.0
                     elif confirmation_mode == "low":
                         confirmed = c[i + 1] < lo[i]
-                    else:  # close
+                    else:
                         confirmed = c[i + 1] < c[i]
                 elif require_next_bar_confirmation and i + 1 >= n:
                     confirmed = False
@@ -1205,9 +1105,7 @@ def add_liquidity_sweep(
                     sw_conf_h[i] = 1
                     sw_side[i] = 1
 
-        # ================================================================
         # Low sweep
-        # ================================================================
         if np.isfinite(last_sl[i]):
             level = last_sl[i]
             age_ok = (
@@ -1241,7 +1139,7 @@ def add_liquidity_sweep(
                         confirmed = c[i + 1] > (o[i] + c[i]) / 2.0
                     elif confirmation_mode == "high":
                         confirmed = c[i + 1] > h[i]
-                    else:  # close
+                    else:
                         confirmed = c[i + 1] > c[i]
                 elif require_next_bar_confirmation and i + 1 >= n:
                     confirmed = False
@@ -1255,10 +1153,8 @@ def add_liquidity_sweep(
                     sw_level_low[i] = level
                     sw_level_low_age[i] = sl_age[i]
                     sw_conf_l[i] = 1
-                    # if both happen on same bar, keep 0 as ambiguous
                     sw_side[i] = -1 if sw_side[i] == 0 else 0
 
-        # backward-compatible shared magnitude
         mags = []
         if np.isfinite(sw_h_mag[i]):
             mags.append(sw_h_mag[i])
@@ -1270,25 +1166,18 @@ def add_liquidity_sweep(
     out["sweep_high"] = sw_h
     out["sweep_low"] = sw_l
     out["sweep_magnitude"] = sw_mag
-
     out["sweep_high_magnitude"] = sw_h_mag
     out["sweep_low_magnitude"] = sw_l_mag
-
     out["sweep_high_reclaim_atr"] = sw_h_reclaim
     out["sweep_low_reclaim_atr"] = sw_l_reclaim
-
     out["sweep_high_wick_frac"] = sw_h_wick_frac
     out["sweep_low_wick_frac"] = sw_l_wick_frac
-
     out["sweep_high_body_frac"] = sw_h_body_frac
     out["sweep_low_body_frac"] = sw_l_body_frac
-
     out["sweep_level_high"] = sw_level_high
     out["sweep_level_low"] = sw_level_low
-
     out["sweep_level_high_age"] = sw_level_high_age
     out["sweep_level_low_age"] = sw_level_low_age
-
     out["sweep_confirmed_high"] = sw_conf_h
     out["sweep_confirmed_low"] = sw_conf_l
     out["sweep_side"] = sw_side
@@ -1311,33 +1200,17 @@ def add_equal_hl(
     use_provided_swings: bool = True,
     lookback_swings: int = 50,
     min_touches: int = 2,
-    level_mode: str = "median",  # "median", "mean", "first", "last"
+    level_mode: str = "median",
     max_cluster_width_atr: float | None = None,
     max_cluster_span: int | None = None,
     invalidate_on_sweep: bool = False,
     sweep_tolerance_atr: float = 0.0,
     keep_last_n_clusters: int = 20,
 ) -> pd.DataFrame:
-    """
-    Enhanced Equal Highs / Equal Lows detector.
+    """Enhanced Equal Highs / Equal Lows detector.
 
-    Backward-compatible columns
-    ---------------------------
-    * equal_highs
-    * equal_lows
-    * equal_highs_count
-    * equal_lows_count
-
-    Added columns
-    -------------
-    * equal_highs_level / equal_lows_level
-    * equal_highs_width / equal_lows_width
-    * equal_highs_width_atr / equal_lows_width_atr
-    * equal_highs_age / equal_lows_age
-    * equal_highs_span / equal_lows_span
-    * equal_highs_active / equal_lows_active
-    * equal_highs_score / equal_lows_score
-    * equal_highs_cluster_id / equal_lows_cluster_id
+    Backward-compatible columns: equal_highs, equal_lows, equal_highs_count, equal_lows_count
+    Added columns: equal_highs_level, equal_lows_level, etc.
     """
 
     out = df.copy()
@@ -1350,11 +1223,9 @@ def add_equal_hl(
 
     h = out["high"].to_numpy(dtype=float)
     lo = out["low"].to_numpy(dtype=float)
-    atr = _ensure_atr(out, atr_length)
+    atr = get_atr_array(out, atr_length)
 
-    # ---------------------------------------------------------------------
     # Swing source
-    # ---------------------------------------------------------------------
     if (
         use_provided_swings
         and "swing_high_price" in out.columns
@@ -1374,9 +1245,8 @@ def add_equal_hl(
             sl_flag = np.where(np.isfinite(sl_price), 1, 0).astype(np.int8)
 
     else:
-        # causal fallback pivots
-        ph = _pivot_high(h, left=swing_left, right=swing_right)
-        pl = _pivot_low(lo, left=swing_left, right=swing_right)
+        ph = pivot_high(h, left=swing_left, right=swing_right)
+        pl = pivot_low(lo, left=swing_left, right=swing_right)
 
         sh_flag = ph.astype(np.int8)
         sl_flag = pl.astype(np.int8)
@@ -1384,42 +1254,30 @@ def add_equal_hl(
         sh_price = np.where(sh_flag == 1, h, np.nan)
         sl_price = np.where(sl_flag == 1, lo, np.nan)
 
-    # ---------------------------------------------------------------------
     # Outputs
-    # ---------------------------------------------------------------------
     eq_h = np.zeros(n, dtype=np.int8)
     eq_l = np.zeros(n, dtype=np.int8)
     eq_h_cnt = np.zeros(n, dtype=np.int16)
     eq_l_cnt = np.zeros(n, dtype=np.int16)
-
     eq_h_level = np.full(n, np.nan)
     eq_l_level = np.full(n, np.nan)
-
     eq_h_width = np.full(n, np.nan)
     eq_l_width = np.full(n, np.nan)
     eq_h_width_atr = np.full(n, np.nan)
     eq_l_width_atr = np.full(n, np.nan)
-
     eq_h_age = np.full(n, np.nan)
     eq_l_age = np.full(n, np.nan)
     eq_h_span = np.full(n, np.nan)
     eq_l_span = np.full(n, np.nan)
-
     eq_h_active = np.zeros(n, dtype=np.int8)
     eq_l_active = np.zeros(n, dtype=np.int8)
-
     eq_h_score = np.full(n, np.nan)
     eq_l_score = np.full(n, np.nan)
-
     eq_h_cluster_id = np.full(n, -1, dtype=int)
     eq_l_cluster_id = np.full(n, -1, dtype=int)
 
-    # ---------------------------------------------------------------------
-    # Cluster helpers
-    # ---------------------------------------------------------------------
     next_cluster_id_h = 0
     next_cluster_id_l = 0
-
     high_clusters = []
     low_clusters = []
 
@@ -1433,7 +1291,7 @@ def add_equal_hl(
             return float(arr[0])
         if level_mode == "last":
             return float(arr[-1])
-        return float(np.median(arr))  # default median
+        return float(np.median(arr))
 
     def _cluster_width(values):
         arr = np.asarray(values, dtype=float)
@@ -1442,9 +1300,6 @@ def add_equal_hl(
         return float(np.max(arr) - np.min(arr))
 
     def _cluster_score(count, width_atr, span):
-        # higher count = better
-        # tighter cluster = better
-        # some span is useful, but too huge span should not dominate
         width_term = 1.0 / (1.0 + max(width_atr, 0.0))
         span_term = np.log1p(max(span, 0.0))
         return float(count * width_term * (1.0 + 0.1 * span_term))
@@ -1452,17 +1307,14 @@ def add_equal_hl(
     def _match_cluster(price, atr_i, clusters, side):
         tol = atr_tolerance * atr_i if np.isfinite(atr_i) and atr_i > 0 else 0.0
         candidates = []
-
         for idx, cl in enumerate(clusters):
             if not cl["active"]:
                 continue
             level = cl["level"]
             if np.isfinite(level) and abs(price - level) <= tol:
                 candidates.append((idx, abs(price - level)))
-
         if not candidates:
             return None
-        # nearest cluster
         candidates.sort(key=lambda x: x[1])
         return candidates[0][0]
 
@@ -1477,7 +1329,7 @@ def add_equal_hl(
             cl["width"] / atr_i if np.isfinite(atr_i) and atr_i > 0 else np.nan
         )
         cl["span"] = cl["indices"][-1] - cl["indices"][0]
-        cl["age"] = idx - cl["indices"][-1]  # usually 0 at update bar
+        cl["age"] = idx - cl["indices"][-1]
         cl["score"] = _cluster_score(
             cl["count"],
             0.0 if np.isnan(cl["width_atr"]) else cl["width_atr"],
@@ -1485,37 +1337,27 @@ def add_equal_hl(
         )
 
     def _prune_clusters(clusters):
-        # keep only recent active/relevant clusters
         if len(clusters) <= keep_last_n_clusters:
             return clusters
-        # prefer active and recent
         clusters = sorted(
             clusters,
             key=lambda z: (z["active"], z["last_idx"]),
             reverse=True,
         )
         kept = clusters[:keep_last_n_clusters]
-        # restore chronological-ish order
         kept = sorted(kept, key=lambda z: z["id"])
         return kept
 
-    # ---------------------------------------------------------------------
-    # Main loop
-    # ---------------------------------------------------------------------
     for i in range(n):
         atr_i = atr[i] if np.isfinite(atr[i]) else np.nan
         sweep_tol = (
             sweep_tolerance_atr * atr_i if np.isfinite(atr_i) and atr_i > 0 else 0.0
         )
 
-        # -------------------------------------------------------------
-        # Invalidate active EQH/EQL clusters if swept
-        # -------------------------------------------------------------
         if invalidate_on_sweep:
             for cl in high_clusters:
                 if not cl["active"] or not np.isfinite(cl["level"]):
                     continue
-                # high-side liquidity pool swept if current high takes it
                 if h[i] > cl["level"] + sweep_tol:
                     cl["active"] = False
                     cl["swept_idx"] = i
@@ -1523,26 +1365,19 @@ def add_equal_hl(
             for cl in low_clusters:
                 if not cl["active"] or not np.isfinite(cl["level"]):
                     continue
-                # low-side liquidity pool swept if current low takes it
                 if lo[i] < cl["level"] - sweep_tol:
                     cl["active"] = False
                     cl["swept_idx"] = i
 
-        # -------------------------------------------------------------
         # Process new swing high
-        # -------------------------------------------------------------
         if sh_flag[i] == 1 and np.isfinite(sh_price[i]):
             price = sh_price[i]
-
-            # prune clusters by recency/lookback
             high_clusters = [
                 cl for cl in high_clusters if (i - cl["last_idx"] <= lookback_swings)
             ]
-
             match_idx = _match_cluster(price, atr_i, high_clusters, side="high")
 
             if match_idx is None:
-                # start new cluster
                 cl = {
                     "id": next_cluster_id_h,
                     "prices": [float(price)],
@@ -1565,7 +1400,6 @@ def add_equal_hl(
                 cl = high_clusters[match_idx]
                 _register_touch(cl, price, i, atr_i)
 
-            # optional filters on the updated cluster
             width_ok = True
             if max_cluster_width_atr is not None and np.isfinite(cl["width_atr"]):
                 width_ok = cl["width_atr"] <= max_cluster_width_atr
@@ -1586,16 +1420,12 @@ def add_equal_hl(
                 eq_h_score[i] = cl["score"]
                 eq_h_cluster_id[i] = cl["id"]
 
-        # -------------------------------------------------------------
         # Process new swing low
-        # -------------------------------------------------------------
         if sl_flag[i] == 1 and np.isfinite(sl_price[i]):
             price = sl_price[i]
-
             low_clusters = [
                 cl for cl in low_clusters if (i - cl["last_idx"] <= lookback_swings)
             ]
-
             match_idx = _match_cluster(price, atr_i, low_clusters, side="low")
 
             if match_idx is None:
@@ -1644,15 +1474,10 @@ def add_equal_hl(
         high_clusters = _prune_clusters(high_clusters)
         low_clusters = _prune_clusters(low_clusters)
 
-    # ---------------------------------------------------------------------
     # Backfill current active cluster state onto non-swing bars
-    # This makes downstream use easier.
-    # ---------------------------------------------------------------------
     latest_active_high = None
     latest_active_low = None
 
-    # also include clusters that may have been pruned out of current lists but had outputs already;
-    # non-critical, so we keep this part simple and only carry latest seen outputs forward.
     for i in range(n):
         if eq_h_cluster_id[i] >= 0:
             latest_active_high = (
@@ -1708,26 +1533,20 @@ def add_equal_hl(
     out["equal_lows"] = eq_l
     out["equal_highs_count"] = eq_h_cnt
     out["equal_lows_count"] = eq_l_cnt
-
     out["equal_highs_level"] = eq_h_level
     out["equal_lows_level"] = eq_l_level
-
     out["equal_highs_width"] = eq_h_width
     out["equal_lows_width"] = eq_l_width
     out["equal_highs_width_atr"] = eq_h_width_atr
     out["equal_lows_width_atr"] = eq_l_width_atr
-
     out["equal_highs_age"] = eq_h_age
     out["equal_lows_age"] = eq_l_age
     out["equal_highs_span"] = eq_h_span
     out["equal_lows_span"] = eq_l_span
-
     out["equal_highs_active"] = eq_h_active
     out["equal_lows_active"] = eq_l_active
-
     out["equal_highs_score"] = eq_h_score
     out["equal_lows_score"] = eq_l_score
-
     out["equal_highs_cluster_id"] = eq_h_cluster_id
     out["equal_lows_cluster_id"] = eq_l_cluster_id
 
@@ -1736,7 +1555,7 @@ def add_equal_hl(
 
 # ============================================================================
 # Enhanced Displacement Candle Detector
-# ===========================================================================
+# ============================================================================
 
 
 def add_displacement_candle(
@@ -1747,33 +1566,9 @@ def add_displacement_candle(
     min_body_frac: float = 0.60,
     max_opposite_wick_frac: float = 0.20,
 ) -> pd.DataFrame:
-    """Enhanced displacement candle detector.
-
-    A displacement candle has a large body relative to ATR, closes near its
-    directional extreme, and has controlled wick structure.
-
-    Parameters
-    ----------
-    body_atr_mult : float
-        Minimum body / ATR ratio.
-    close_extreme_frac : float
-        Maximum distance from close to directional extreme as fraction of range.
-    min_body_frac : float
-        Minimum body / range ratio (body dominance).
-    max_opposite_wick_frac : float
-        Maximum opposite-side wick / range (bull: lower wick, bear: upper wick).
-
-    Columns
-    ~~~~~~~
-    * ``displacement_candle``        – 1 if all conditions met
-    * ``displacement_body_atr``      – body / ATR (continuous)
-    * ``displacement_close_extreme`` – 1 if close near extreme
-    * ``displacement_direction``     – +1 bull, -1 bear, 0 doji
-    * ``displacement_bull_candle``   – 1 if bullish displacement
-    * ``displacement_bear_candle``   – 1 if bearish displacement
-    """
+    """Enhanced displacement candle detector."""
     out = df.copy()
-    atr = _ensure_atr(out)
+    atr = get_atr_array(out)
     atr_s = pd.Series(atr, index=out.index)
 
     o = out["open"].astype(float)
@@ -1784,17 +1579,14 @@ def add_displacement_candle(
     body = (c - o).abs()
     rng = h - lo
 
-    # Direction
     direction = np.where(c > o, 1, np.where(c < o, -1, 0)).astype(np.int8)
     bull = direction == 1
     bear = direction == -1
 
-    # Body / ATR ratio
     with np.errstate(invalid="ignore", divide="ignore"):
         body_atr = np.where(atr_s > 0, body / atr_s, 0.0)
-        body_frac = np.where(rng > 0, body / rng, 0.0)
+        body_frac_arr = np.where(rng > 0, body / rng, 0.0)
 
-    # Close extreme: distance from close to directional extreme / range
     dist_to_extreme = np.where(bull, h - c, np.where(bear, c - lo, np.nan)).astype(
         float
     )
@@ -1804,7 +1596,6 @@ def add_displacement_candle(
         np.isfinite(close_ext_frac), close_ext_frac <= close_extreme_frac, False
     )
 
-    # Opposite wick: bull → lower wick, bear → upper wick
     upper_wick = h - np.maximum(o, c)
     lower_wick = np.minimum(o, c) - lo
     opp_wick = np.where(bull, lower_wick, np.where(bear, upper_wick, 0.0)).astype(float)
@@ -1812,10 +1603,8 @@ def add_displacement_candle(
         opp_wick_frac = np.where(rng > 0, opp_wick / rng, 0.0)
     opp_wick_ok = opp_wick_frac <= max_opposite_wick_frac
 
-    # Body dominance
-    body_dom_ok = body_frac >= min_body_frac
+    body_dom_ok = body_frac_arr >= min_body_frac
 
-    # Final flag: all conditions
     valid_dir = direction != 0
     final = (
         valid_dir
@@ -1839,7 +1628,6 @@ def add_displacement_candle(
 # Enhanced AMD Engine (Accumulation → Manipulation → Distribution)
 # ============================================================================
 
-# AMD state constants
 AMD_UNKNOWN = -1
 AMD_ACCUMULATION = 0
 AMD_MANIPULATION = 1
@@ -1847,7 +1635,6 @@ AMD_DISTRIBUTION = 2
 
 
 def _amd_rolling_rank_pct(arr: np.ndarray) -> float:
-    """Percentile rank of last element in trailing window, [0, 100]."""
     if arr.size == 0 or np.isnan(arr[-1]):
         return np.nan
     valid = arr[~np.isnan(arr)]
@@ -1857,7 +1644,6 @@ def _amd_rolling_rank_pct(arr: np.ndarray) -> float:
 
 
 def _amd_safe_div(numer: pd.Series, denom: pd.Series) -> pd.Series:
-    """Element-wise division, NaN where denom is 0 or NaN."""
     out = pd.Series(np.nan, index=numer.index, dtype=float)
     valid = denom.notna() & (denom != 0)
     out.loc[valid] = numer.loc[valid] / denom.loc[valid]
@@ -1865,7 +1651,6 @@ def _amd_safe_div(numer: pd.Series, denom: pd.Series) -> pd.Series:
 
 
 def _amd_rolling_overlap(high: pd.Series, low: pd.Series, window: int) -> pd.Series:
-    """Average consecutive-candle overlap fraction over trailing window."""
     prev_h = high.shift(1)
     prev_l = low.shift(1)
     overlap = (np.minimum(high, prev_h) - np.maximum(low, prev_l)).clip(lower=0.0)
@@ -1876,81 +1661,56 @@ def _amd_rolling_overlap(high: pd.Series, low: pd.Series, window: int) -> pd.Ser
 
 
 def _amd_rolling_efficiency(close: pd.Series, window: int) -> pd.Series:
-    """Directional efficiency: net move / gross path. Higher = trendier."""
     net = (close - close.shift(window - 1)).abs()
     gross = close.diff().abs().rolling(window=window, min_periods=window).sum()
     return _amd_safe_div(net, gross)
 
 
-def add_amd_features(
-    df: pd.DataFrame,
-    *,
-    atr_pct_window: int = 50,
-    accumulation_window: int = 20,
-    overlap_window: int = 10,
-    accumulation_min_streak: int = 8,
-    atr_pct_low_threshold: float = 45.0,
-    box_width_atr_max: float = 12.0,
-    box_width_pct_max: float = 0.040,
-    overlap_min: float = 0.40,
-    efficiency_max: float = 0.35,
-    min_touch_count_each_side: int = 1,
-    sweep_tolerance_atr: float = 0.15,
-    reclaim_min_frac_of_box: float = 0.10,
-    displacement_mode: str = "break_only",
-    min_distribution_followthrough_bars: int = 2,
-    min_distribution_move_atr: float = 0.35,
-    min_distribution_move_box_frac: float = 0.30,
-    max_reentry_frac_of_box: float = 0.20,
-) -> pd.DataFrame:
-    """
-    Compute causal AMD feature columns. Live-safe (trailing-only windows).
+def add_amd_features(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """Compute causal AMD feature columns. Live-safe (trailing-only windows)."""
+    # Extract kwargs with defaults
+    atr_pct_window = kwargs.get("atr_pct_window", 50)
+    accumulation_window = kwargs.get("accumulation_window", 20)
+    overlap_window = kwargs.get("overlap_window", 10)
+    accumulation_min_streak = kwargs.get("accumulation_min_streak", 8)
+    atr_pct_low_threshold = kwargs.get("atr_pct_low_threshold", 45.0)
+    box_width_atr_max = kwargs.get("box_width_atr_max", 12.0)
+    box_width_pct_max = kwargs.get("box_width_pct_max", 0.040)
+    overlap_min = kwargs.get("overlap_min", 0.40)
+    efficiency_max = kwargs.get("efficiency_max", 0.35)
+    min_touch_count_each_side = kwargs.get("min_touch_count_each_side", 1)
+    sweep_tolerance_atr = kwargs.get("sweep_tolerance_atr", 0.15)
+    reclaim_min_frac_of_box = kwargs.get("reclaim_min_frac_of_box", 0.10)
+    displacement_mode = kwargs.get("displacement_mode", "break_only")
+    min_distribution_followthrough_bars = kwargs.get(
+        "min_distribution_followthrough_bars", 2
+    )
+    min_distribution_move_atr = kwargs.get("min_distribution_move_atr", 0.35)
+    min_distribution_move_box_frac = kwargs.get("min_distribution_move_box_frac", 0.30)
+    max_reentry_frac_of_box = kwargs.get("max_reentry_frac_of_box", 0.20)
 
-    Parameters
-    ----------
-    displacement_mode : str
-        'all' — require displacement for both reclaim and break manipulation
-        'break_only' — require displacement only for break-style, not reclaim
-        'none' — never require displacement
-          Columns
-    ~~~~~~~
-    * ``amd_box_high / amd_box_low / amd_box_mid / amd_box_width``
-    * ``amd_compression_score``       – 0–5, quality of accumulation
-    * ``amd_overlap_score``           – candle overlap in range
-    * ``amd_efficiency``              – directional efficiency (low = choppy)
-    * ``amd_accumulation_active``     – 1 when compression streak met
-    * ``amd_manipulation_candidate``  – 1 on manipulation trigger bar
-    * ``amd_manipulation_direction``  – +1 bull / -1 bear / 0 none
-    * ``amd_distribution_bull_candidate / amd_distribution_bear_candidate``
-    * ``amd_reentry_strict``          – 1 when close is inside box
-    * ``amd_reentry_buffered``        – 1 when close is near box (with tolerance)
-    """
     out = df.copy()
     h = out["high"].astype(float)
     lo = out["low"].astype(float)
     c = out["close"].astype(float)
     o = out["open"].astype(float)
 
-    atr = pd.Series(_ensure_atr(out), index=out.index, dtype=float)
+    atr = pd.Series(get_atr_array(out), index=out.index, dtype=float)
 
-    # ATR percentile (causal)
     atr_pct = atr.rolling(atr_pct_window, min_periods=atr_pct_window).apply(
         _amd_rolling_rank_pct, raw=True
     )
 
-    # Accumulation box
     box_high = h.rolling(accumulation_window, min_periods=accumulation_window).max()
     box_low = lo.rolling(accumulation_window, min_periods=accumulation_window).min()
     box_mid = (box_high + box_low) / 2.0
     box_width = (box_high - box_low).astype(float)
-    box_width_atr = _amd_safe_div(box_width, atr)
+    box_width_atr_val = _amd_safe_div(box_width, atr)
     box_width_pct = _amd_safe_div(box_width, c.abs())
 
-    # Compression metrics
     overlap_score = _amd_rolling_overlap(h, lo, overlap_window)
     efficiency = _amd_rolling_efficiency(c, accumulation_window)
 
-    # Box touch counts
     tol = box_width * 0.10
     touch_high = (
         ((box_high - h).abs() <= tol)
@@ -1963,9 +1723,8 @@ def add_amd_features(
         .sum()
     )
 
-    # Compression flags
     low_atr_flag = atr_pct <= atr_pct_low_threshold
-    narrow_box_flag = (box_width_atr <= box_width_atr_max) & (
+    narrow_box_flag = (box_width_atr_val <= box_width_atr_max) & (
         box_width_pct <= box_width_pct_max
     )
     overlap_flag = overlap_score >= overlap_min
@@ -1991,7 +1750,6 @@ def add_amd_features(
     streak = streak.groupby((streak == 0).cumsum()).cumsum()
     accumulation_active = streak >= accumulation_min_streak
 
-    # Displacement integration
     disp_flag = pd.Series(False, index=out.index)
     disp_dir = pd.Series(0, index=out.index, dtype="int8")
     if "displacement_candle" in out.columns:
@@ -2005,22 +1763,20 @@ def add_amd_features(
             dtype="int8",
         )
 
-    # Box breaks and sweeps
     prior_bh = box_high.shift(1)
     prior_bl = box_low.shift(1)
     prior_bw = (prior_bh - prior_bl).astype(float)
-    sweep_tol = atr * sweep_tolerance_atr
+    sweep_tol_val = atr * sweep_tolerance_atr
 
     break_up = h > prior_bh
     break_down = lo < prior_bl
-    sweep_up = break_up & (h <= (prior_bh + sweep_tol))
-    sweep_down = break_down & (lo >= (prior_bl - sweep_tol))
+    sweep_up = break_up & (h <= (prior_bh + sweep_tol_val))
+    sweep_down = break_down & (lo >= (prior_bl - sweep_tol_val))
 
     reclaim_thresh = prior_bw * reclaim_min_frac_of_box
     reclaim_bull = sweep_down & (c >= (prior_bl + reclaim_thresh))
     reclaim_bear = sweep_up & (c <= (prior_bh - reclaim_thresh))
 
-    # Manipulation candidates — two styles, gated by displacement_mode
     acc_prev = accumulation_active.shift(1).fillna(False)
 
     if displacement_mode == "all":
@@ -2054,7 +1810,6 @@ def add_amd_features(
         dtype="int8",
     )
 
-    # Rolling-box distribution candidates kept as diagnostics only
     prior_box_mid = box_mid.shift(1)
     move_from_mid = (c - prior_box_mid).abs()
     move_from_mid_atr = _amd_safe_div(move_from_mid, atr)
@@ -2092,7 +1847,6 @@ def add_amd_features(
     dist_bull = (bull_follow >= min_distribution_followthrough_bars) & (~reentry_strict)
     dist_bear = (bear_follow >= min_distribution_followthrough_bars) & (~reentry_strict)
 
-    # Output columns
     out["amd_box_high"] = box_high
     out["amd_box_low"] = box_low
     out["amd_box_mid"] = box_mid
@@ -2111,25 +1865,22 @@ def add_amd_features(
     return out
 
 
-def add_amd_state(
-    df: pd.DataFrame,
-    *,
-    manipulation_timeout_bars: int = 8,
-    allow_unknown_state: bool = True,
-    reset_to_accumulation_on_new_box: bool = True,
-    accumulation_grace_bars: int = 2,
-    max_distribution_stall: int = 4,
-    min_distribution_move_atr: float = 0.75,
-    min_distribution_move_box_frac: float = 0.60,
-    min_distribution_followthrough_bars: int = 4,
-    min_distribution_extension_atr: float = 0.10,
-) -> pd.DataFrame:
-    """
-    Causal AMD state machine. Assigns phase per bar.
+def add_amd_state(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """Causal AMD state machine. Assigns phase per bar."""
+    manipulation_timeout_bars = kwargs.get("manipulation_timeout_bars", 8)
+    allow_unknown_state = kwargs.get("allow_unknown_state", True)
+    reset_to_accumulation_on_new_box = kwargs.get(
+        "reset_to_accumulation_on_new_box", True
+    )
+    accumulation_grace_bars = kwargs.get("accumulation_grace_bars", 2)
+    max_distribution_stall = kwargs.get("max_distribution_stall", 4)
+    min_distribution_move_atr = kwargs.get("min_distribution_move_atr", 0.75)
+    min_distribution_move_box_frac = kwargs.get("min_distribution_move_box_frac", 0.60)
+    min_distribution_followthrough_bars = kwargs.get(
+        "min_distribution_followthrough_bars", 4
+    )
+    min_distribution_extension_atr = kwargs.get("min_distribution_extension_atr", 0.10)
 
-    Distribution confirmation and stall logic are based on the FROZEN
-    originating accumulation box, not the rolling box.
-    """
     needed = [
         "amd_box_high",
         "amd_box_low",
@@ -2154,7 +1905,7 @@ def add_amd_state(
     bx_h = out["amd_box_high"].values.astype(float)
     bx_l = out["amd_box_low"].values.astype(float)
     bx_m = out["amd_box_mid"].values.astype(float)
-    atr_v = np.asarray(_ensure_atr(out), dtype=float)
+    atr_v = np.asarray(get_atr_array(out), dtype=float)
 
     phase = np.full(n, AMD_UNKNOWN, dtype=np.int8)
     direction = np.zeros(n, dtype=np.int8)
@@ -2174,8 +1925,6 @@ def add_amd_state(
     dist_follow = 0
     dist_best_high = np.nan
     dist_best_low = np.nan
-
-    # Frozen box from the accumulation that spawned the current cycle
     frozen_bh = np.nan
     frozen_bl = np.nan
     frozen_bm = np.nan
@@ -2185,14 +1934,12 @@ def add_amd_state(
         mb = manip_bull[i] == 1
         ms = manip_bear[i] == 1
 
-        # Reentry against frozen box
         re = (
             np.isfinite(frozen_bl)
             and np.isfinite(frozen_bh)
             and frozen_bl <= close_v[i] <= frozen_bh
         )
 
-        # Distribution conditions based on frozen box
         bull_dist_entry = False
         bear_dist_entry = False
         bull_dist_active = False
@@ -2211,7 +1958,6 @@ def add_amd_state(
                 move_from_frozen_mid_atr = move_from_frozen_mid / atr_v[i]
                 move_from_frozen_mid_box = move_from_frozen_mid / frozen_bw
 
-                # Entry into distribution: confirmed escape + delivery away from frozen box
                 bull_dist_entry = (
                     (close_v[i] > frozen_bh)
                     and (move_from_frozen_mid_atr >= min_distribution_move_atr)
@@ -2223,9 +1969,7 @@ def add_amd_state(
                     and (move_from_frozen_mid_box >= min_distribution_move_box_frac)
                 )
 
-                # Active distribution: must make fresh extreme beyond best seen in distribution
                 ext_thresh = min_distribution_extension_atr * atr_v[i]
-
                 if cur_phase == AMD_DISTRIBUTION:
                     if cur_dir == 1 and np.isfinite(dist_best_high):
                         bull_dist_active = (close_v[i] > frozen_bh) and (
@@ -2256,13 +2000,11 @@ def add_amd_state(
 
         elif cur_phase == AMD_ACCUMULATION:
             if acc:
-                # Update frozen box while still accumulating
                 frozen_bh = bx_h[i]
                 frozen_bl = bx_l[i]
                 frozen_bm = bx_m[i]
                 phase_age += 1
                 grace_count = 0
-
             elif mb:
                 cur_phase = AMD_MANIPULATION
                 cur_dir = 1
@@ -2273,7 +2015,6 @@ def add_amd_state(
                 dist_follow = 0
                 dist_best_high = np.nan
                 dist_best_low = np.nan
-
             elif ms:
                 cur_phase = AMD_MANIPULATION
                 cur_dir = -1
@@ -2284,7 +2025,6 @@ def add_amd_state(
                 dist_follow = 0
                 dist_best_high = np.nan
                 dist_best_low = np.nan
-
             else:
                 grace_count += 1
                 phase_age += 1
@@ -2365,7 +2105,7 @@ def add_amd_state(
             else:
                 dist_stall += 1
 
-            if re:
+            if re or dist_stall > max_distribution_stall or acc:
                 if acc and reset_to_accumulation_on_new_box:
                     cur_phase = AMD_ACCUMULATION
                     cur_dir = 0
@@ -2392,49 +2132,6 @@ def add_amd_state(
                     frozen_bh = np.nan
                     frozen_bl = np.nan
                     frozen_bm = np.nan
-
-            elif dist_stall > max_distribution_stall:
-                if acc and reset_to_accumulation_on_new_box:
-                    cur_phase = AMD_ACCUMULATION
-                    cur_dir = 0
-                    cur_seq += 1
-                    frozen_bh = bx_h[i]
-                    frozen_bl = bx_l[i]
-                    frozen_bm = bx_m[i]
-                    phase_age = 1
-                    grace_count = 0
-                    manip_age = 0
-                    dist_stall = 0
-                    dist_follow = 0
-                    dist_best_high = np.nan
-                    dist_best_low = np.nan
-                elif allow_unknown_state:
-                    cur_phase = AMD_UNKNOWN
-                    cur_dir = 0
-                    phase_age = 0
-                    manip_age = 0
-                    dist_stall = 0
-                    dist_follow = 0
-                    dist_best_high = np.nan
-                    dist_best_low = np.nan
-                    frozen_bh = np.nan
-                    frozen_bl = np.nan
-                    frozen_bm = np.nan
-
-            elif acc and reset_to_accumulation_on_new_box:
-                cur_phase = AMD_ACCUMULATION
-                cur_dir = 0
-                cur_seq += 1
-                frozen_bh = bx_h[i]
-                frozen_bl = bx_l[i]
-                frozen_bm = bx_m[i]
-                phase_age = 1
-                grace_count = 0
-                manip_age = 0
-                dist_stall = 0
-                dist_follow = 0
-                dist_best_high = np.nan
-                dist_best_low = np.nan
 
         phase[i] = cur_phase
         direction[i] = cur_dir
@@ -2458,25 +2155,13 @@ def add_amd_state(
     return out
 
 
-def add_amd_labels(
-    df: pd.DataFrame,
-    *,
-    label_lookahead: int = 10,
-    label_target_atr: float = 1.5,
-    label_stop_box_frac: float = 0.50,
-) -> pd.DataFrame:
-    """
-    Retrospective AMD outcome labels for supervised learning.
+def add_amd_labels(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """Retrospective AMD outcome labels. NOT live-safe — uses future bars."""
+    label_lookahead = kwargs.get("label_lookahead", 10)
+    label_target_atr = kwargs.get("label_target_atr", 1.5)
+    label_stop_box_frac = kwargs.get("label_stop_box_frac", 0.50)
 
-    NOT live-safe — uses future bars. For offline labeling only.
-    Uses the frozen active box for stop sizing.
-    """
-    needed = [
-        "amd_phase",
-        "amd_direction",
-        "amd_active_box_high",
-        "amd_active_box_low",
-    ]
+    needed = ["amd_phase", "amd_direction", "amd_active_box_high", "amd_active_box_low"]
     missing = [c for c in needed if c not in df.columns]
     if missing:
         raise KeyError(
@@ -2485,7 +2170,7 @@ def add_amd_labels(
 
     out = df.copy()
     n = len(out)
-    atr = np.asarray(_ensure_atr(out), dtype=float)
+    atr = np.asarray(get_atr_array(out), dtype=float)
 
     phase_v = out["amd_phase"].values.astype(np.int8)
     dir_v = out["amd_direction"].values.astype(np.int8)
@@ -2544,10 +2229,7 @@ def add_amd_labels(
 
 
 def add_amd_engine(
-    df: pd.DataFrame,
-    *,
-    add_labels: bool = False,
-    **kwargs,
+    df: pd.DataFrame, *, add_labels: bool = False, **kwargs
 ) -> pd.DataFrame:
     """Full AMD pipeline: features → state machine → optional labels."""
     feature_keys = {
