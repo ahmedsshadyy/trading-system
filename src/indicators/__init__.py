@@ -1,4 +1,5 @@
 """
+src/indicators/init.py
 Indicator Library — Phase 2.
 
 Exports all indicator functions and provides ``build_all_indicators()``

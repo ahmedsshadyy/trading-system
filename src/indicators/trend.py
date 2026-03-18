@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from src.indicators import ta_core as ta
-from src.indicators.ta_core import ensure_atr as _ensure_atr
+from src.indicators._helpers.arrays import get_atr_array
 
 # ---------------------------------------------------------------------------
 # EMA
@@ -92,46 +92,9 @@ def add_swings(
     atr_length: int = 14,
     min_prominence_atr: float = 0.0,
     min_separation: int = 0,
-    tie_mode: str = "strict",  # "strict" or "allow"
+    tie_mode: str = "strict",
 ) -> pd.DataFrame:
-    """
-    Enhanced swing high/low detector using a symmetric rolling window.
-
-    A swing high at i means high[i] is a local maximum in [i-window, i+window].
-    A swing low at i means low[i] is a local minimum in [i-window, i+window].
-
-    Parameters
-    ----------
-    causal : bool
-        If True, `last_swing_high/low` become available only at confirmation time
-        (i + window). This avoids look-ahead leakage in downstream features.
-        If False, behaves more like historical plotting mode.
-    min_prominence_atr : float
-        Minimum required prominence of a swing relative to neighboring window,
-        normalized by ATR. Set 0 to disable.
-    min_separation : int
-        Minimum number of bars between consecutive same-side swings.
-    tie_mode : str
-        "strict" => must be strictly greater/less than at least one side.
-        "allow"  => local max/min with ties allowed.
-
-    Backward-compatible columns
-    ---------------------------
-    * swing_high / swing_low
-    * swing_high_price / swing_low_price
-    * last_swing_high / last_swing_low
-    * swing_high_age / swing_low_age
-
-    Added columns
-    -------------
-    * swing_high_confirmed / swing_low_confirmed
-    * swing_high_confirm_idx / swing_low_confirm_idx
-    * swing_high_idx / swing_low_idx
-    * last_swing_high_idx / last_swing_low_idx
-    * swing_high_prominence / swing_low_prominence
-    * swing_high_prominence_atr / swing_low_prominence_atr
-    * swing_high_strength / swing_low_strength
-    """
+    """Enhanced swing high/low detector using a symmetric rolling window."""
     out = df.copy()
     n = len(out)
 
@@ -143,30 +106,22 @@ def add_swings(
     highs = out["high"].to_numpy(dtype=float)
     lows = out["low"].to_numpy(dtype=float)
 
-    # ATR for normalization
-    atr = _ensure_atr(out, atr_length)
+    atr = get_atr_array(out, atr_length)
 
     sh = np.zeros(n, dtype=np.int8)
     sl = np.zeros(n, dtype=np.int8)
-
     sh_price = np.full(n, np.nan)
     sl_price = np.full(n, np.nan)
-
     sh_confirmed = np.zeros(n, dtype=np.int8)
     sl_confirmed = np.zeros(n, dtype=np.int8)
-
     sh_confirm_idx = np.full(n, -1, dtype=int)
     sl_confirm_idx = np.full(n, -1, dtype=int)
-
     sh_idx_arr = np.full(n, -1, dtype=int)
     sl_idx_arr = np.full(n, -1, dtype=int)
-
     sh_prom = np.full(n, np.nan)
     sl_prom = np.full(n, np.nan)
-
     sh_prom_atr = np.full(n, np.nan)
     sl_prom_atr = np.full(n, np.nan)
-
     sh_strength = np.full(n, np.nan)
     sl_strength = np.full(n, np.nan)
 
@@ -184,7 +139,6 @@ def add_swings(
         left_l_min = left_lows.min()
         right_l_min = right_lows.min()
 
-        # Candidate swing high
         high_is_local_max = highs[i] >= left_h_max and highs[i] >= right_h_max
         if tie_mode == "strict":
             high_tie_ok = highs[i] > left_h_max or highs[i] > right_h_max
@@ -213,7 +167,6 @@ def add_swings(
                     sh_confirmed[i + window] = 1
                 last_sh_i = i
 
-        # Candidate swing low
         low_is_local_min = lows[i] <= left_l_min and lows[i] <= right_l_min
         if tie_mode == "strict":
             low_tie_ok = lows[i] < left_l_min or lows[i] < right_l_min
@@ -246,15 +199,12 @@ def add_swings(
     out["swing_low"] = sl
     out["swing_high_price"] = sh_price
     out["swing_low_price"] = sl_price
-
     out["swing_high_confirmed"] = sh_confirmed
     out["swing_low_confirmed"] = sl_confirmed
     out["swing_high_confirm_idx"] = sh_confirm_idx
     out["swing_low_confirm_idx"] = sl_confirm_idx
-
     out["swing_high_idx"] = sh_idx_arr
     out["swing_low_idx"] = sl_idx_arr
-
     out["swing_high_prominence"] = sh_prom
     out["swing_low_prominence"] = sl_prom
     out["swing_high_prominence_atr"] = sh_prom_atr
@@ -267,7 +217,6 @@ def add_swings(
     last_swing_low = np.full(n, np.nan)
     last_swing_high_idx = np.full(n, np.nan)
     last_swing_low_idx = np.full(n, np.nan)
-
     cur_h = np.nan
     cur_l = np.nan
     cur_h_idx = np.nan
@@ -275,7 +224,6 @@ def add_swings(
 
     for i in range(n):
         if causal:
-            # at bar i, only swings whose confirmation time == i become known
             confirmed_h_sources = np.where(sh_confirm_idx == i)[0]
             confirmed_l_sources = np.where(sl_confirm_idx == i)[0]
 
@@ -329,37 +277,7 @@ def add_swings_causal(
     min_wick_frac: float = 0.0,
     max_body_frac: float = 1.0,
 ) -> pd.DataFrame:
-    """Causal swing detector — uses only past data, no look-ahead.
-
-    A swing high at bar i means ``high[i]`` is the max of the last
-    ``window`` bars. Suitable for both backtesting and live deployment.
-    Produces the same output columns as ``add_swings()`` so downstream
-    code (BOS, CHoCH, OB, sweeps) works identically.
-
-    Parameters
-    ----------
-    window : int
-        Lookback window (past bars only, no look-ahead).
-    min_prominence_atr : float
-        Minimum prominence above recent window, normalised by ATR.
-    min_separation : int
-        Minimum bars between consecutive same-side swings.
-    require_rejection : bool
-        If True, require wick/body geometry consistent with rejection.
-    min_wick_frac : float
-        Minimum wick fraction when require_rejection is True.
-    max_body_frac : float
-        Maximum body fraction when require_rejection is True.
-
-    Columns (identical to add_swings for downstream compatibility)
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    * ``swing_high / swing_low``
-    * ``swing_high_price / swing_low_price``
-    * ``last_swing_high / last_swing_low``
-    * ``swing_high_age / swing_low_age``
-    """
-    from src.indicators.ta_core import ensure_atr
-
+    """Causal swing detector — uses only past data, no look-ahead."""
     out = df.copy()
     n = len(out)
     o = out["open"].values.astype(float)
@@ -367,7 +285,7 @@ def add_swings_causal(
     lo = out["low"].values.astype(float)
     c = out["close"].values.astype(float)
 
-    atr = ensure_atr(out, atr_length)
+    atr = get_atr_array(out, atr_length)
 
     rng = h - lo
     body = np.abs(c - o)
@@ -389,14 +307,13 @@ def add_swings_causal(
         if i - start < 1:
             continue
 
-        hist_high = h[start:i]  # past only, excluding current
+        hist_high = h[start:i]
         hist_low = lo[start:i]
         prev_max = np.max(hist_high)
         prev_min = np.min(hist_low)
         atr_i = atr[i]
         atr_ok = np.isfinite(atr_i) and atr_i > 0
 
-        # Swing high candidate
         if h[i] >= prev_max:
             prom = h[i] - prev_max
             prom_atr = prom / atr_i if atr_ok else 0.0
@@ -409,7 +326,6 @@ def add_swings_causal(
                 sh[i] = 1
                 last_sh_bar = i
 
-        # Swing low candidate
         if lo[i] <= prev_min:
             prom = prev_min - lo[i]
             prom_atr = prom / atr_i if atr_ok else 0.0
@@ -422,7 +338,6 @@ def add_swings_causal(
                 sl[i] = 1
                 last_sl_bar = i
 
-    # Build output columns — same names as add_swings()
     highs = h
     lows = lo
     out["swing_high"] = sh
@@ -430,7 +345,6 @@ def add_swings_causal(
     out["swing_high_price"] = np.where(sh == 1, highs, np.nan)
     out["swing_low_price"] = np.where(sl == 1, lows, np.nan)
 
-    # Causal forward-fill of last swing levels
     last_swing_high = np.full(n, np.nan)
     last_swing_low = np.full(n, np.nan)
     cur_h = np.nan
@@ -457,7 +371,7 @@ def add_swings_causal(
 
 
 # ---------------------------------------------------------------------------
-# Trend State Machine  (HH / HL / LH / LL).  need to enhance
+# Trend State Machine
 # ---------------------------------------------------------------------------
 
 
@@ -465,9 +379,7 @@ def add_trend_state(df: pd.DataFrame) -> pd.DataFrame:
     """Track consecutive HH/HL (bullish) and LH/LL (bearish).
 
     Requires ``add_swings()`` first.
-
-    Columns: ``trend_state`` (1 bull / −1 bear / 0 undefined),
-    ``hh_count``, ``ll_count``.
+    Columns: ``trend_state`` (1 bull / −1 bear / 0 undefined), ``hh_count``, ``ll_count``.
     """
     out = df.copy()
     n = len(out)
@@ -520,7 +432,7 @@ def add_trend_state(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# BOS Detector. need to enhance
+# BOS Detector
 # ---------------------------------------------------------------------------
 
 
@@ -528,13 +440,6 @@ def add_bos(df: pd.DataFrame) -> pd.DataFrame:
     """Detect Break of Structure (full candle close beyond swing).
 
     Requires ``add_swings()`` first.
-
-    Columns
-    ~~~~~~~
-    * ``bos_bull / bos_bear``        – binary (fires once per broken level)
-    * ``bos_direction``              – forward-filled: 1 / −1 / 0
-    * ``bos_candle_body_atr``        – body / ATR on BOS candle (NaN elsewhere)
-    * ``bos_swing_age``              – age of the broken swing (NaN elsewhere)
     """
     out = df.copy()
 
@@ -592,7 +497,7 @@ def add_bos(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# CHoCH Detector. need to enhance
+# CHoCH Detector
 # ---------------------------------------------------------------------------
 
 
@@ -600,8 +505,6 @@ def add_choch(df: pd.DataFrame) -> pd.DataFrame:
     """Detect Change of Character — first BOS against the prevailing trend.
 
     Requires ``add_swings()``, ``add_trend_state()``, ``add_bos()``.
-
-    Columns: ``choch_bull``, ``choch_bear``, ``choch_candle_body_atr``.
     """
     out = df.copy()
 

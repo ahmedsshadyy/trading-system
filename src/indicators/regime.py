@@ -1,4 +1,5 @@
 """
+src/indicators/regime.py
 Market Regime Classifier.
 
 Classifies 4H market state as TRENDING / RANGING / TRANSITIONAL
