@@ -58,7 +58,10 @@ from src.indicators.smc import (
     add_liquidity_sweep,
     add_equal_hl,
     add_displacement_candle,
-    add_amd_phase,
+    add_amd_engine,
+    add_amd_features as add_amd_features,
+    add_amd_state as add_amd_state,
+    add_amd_labels as add_amd_labels,
 )
 from src.indicators.volume_profile import (
     compute_volume_profile as compute_volume_profile,
@@ -156,7 +159,7 @@ def build_all_indicators(
     out = add_ob_mitigation(out)
     out = add_liquidity_sweep(out)
     out = add_equal_hl(out)
-    out = add_amd_phase(out)
+    out = add_amd_engine(out, add_labels=False)
 
     # === Layer 6: Value / Reference Levels ===
     out = add_prev_day_hl(out)

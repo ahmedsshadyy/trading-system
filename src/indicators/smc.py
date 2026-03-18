@@ -15,6 +15,10 @@ import numpy as np
 import pandas as pd
 from src.indicators.ta_core import ensure_atr as _ensure_atr
 
+# ============================================================================
+# Shared Internal Helpers (structure-specific, not in ta_core)
+# ============================================================================
+
 
 def _pivot_high(high: np.ndarray, left: int = 2, right: int = 2) -> np.ndarray:
     n = len(high)
@@ -1731,83 +1735,859 @@ def add_equal_hl(
 
 
 # ============================================================================
-# Displacement Candle Detector
-# ============================================================================
+# Enhanced Displacement Candle Detector
+# ===========================================================================
 
 
 def add_displacement_candle(
-    df: pd.DataFrame, body_atr_mult: float = 1.5
+    df: pd.DataFrame,
+    body_atr_mult: float = 1.5,
+    *,
+    close_extreme_frac: float = 0.20,
+    min_body_frac: float = 0.60,
+    max_opposite_wick_frac: float = 0.20,
 ) -> pd.DataFrame:
-    """Flag candles with body ≥ ``body_atr_mult × ATR``.
+    """Enhanced displacement candle detector.
 
-    Columns: ``displacement_candle``, ``displacement_body_atr``, ``displacement_close_extreme``.
+    A displacement candle has a large body relative to ATR, closes near its
+    directional extreme, and has controlled wick structure.
+
+    Parameters
+    ----------
+    body_atr_mult : float
+        Minimum body / ATR ratio.
+    close_extreme_frac : float
+        Maximum distance from close to directional extreme as fraction of range.
+    min_body_frac : float
+        Minimum body / range ratio (body dominance).
+    max_opposite_wick_frac : float
+        Maximum opposite-side wick / range (bull: lower wick, bear: upper wick).
+
+    Columns
+    ~~~~~~~
+    * ``displacement_candle``        – 1 if all conditions met
+    * ``displacement_body_atr``      – body / ATR (continuous)
+    * ``displacement_close_extreme`` – 1 if close near extreme
+    * ``displacement_direction``     – +1 bull, -1 bear, 0 doji
+    * ``displacement_bull_candle``   – 1 if bullish displacement
+    * ``displacement_bear_candle``   – 1 if bearish displacement
     """
     out = df.copy()
     atr = _ensure_atr(out)
-
-    body = (out["close"] - out["open"]).abs().astype(float)
     atr_s = pd.Series(atr, index=out.index)
-    rng = (out["high"] - out["low"]).astype(float)
 
-    ratio = np.where(atr_s > 0, body / atr_s, 0.0)
-    out["displacement_candle"] = (ratio >= body_atr_mult).astype(int)
-    out["displacement_body_atr"] = ratio
+    o = out["open"].astype(float)
+    h = out["high"].astype(float)
+    lo = out["low"].astype(float)
+    c = out["close"].astype(float)
 
-    bull = out["close"].values >= out["open"].values
-    dist = np.where(
-        bull,
-        out["high"].values - out["close"].values,
-        out["close"].values - out["low"].values,
-    ).astype(float)
-    out["displacement_close_extreme"] = np.where(
-        rng > 0, (dist / rng < 0.2).astype(int), 0
+    body = (c - o).abs()
+    rng = h - lo
+
+    # Direction
+    direction = np.where(c > o, 1, np.where(c < o, -1, 0)).astype(np.int8)
+    bull = direction == 1
+    bear = direction == -1
+
+    # Body / ATR ratio
+    with np.errstate(invalid="ignore", divide="ignore"):
+        body_atr = np.where(atr_s > 0, body / atr_s, 0.0)
+        body_frac = np.where(rng > 0, body / rng, 0.0)
+
+    # Close extreme: distance from close to directional extreme / range
+    dist_to_extreme = np.where(bull, h - c, np.where(bear, c - lo, np.nan)).astype(
+        float
     )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        close_ext_frac = np.where(rng > 0, dist_to_extreme / rng, np.nan)
+    close_extreme_ok = np.where(
+        np.isfinite(close_ext_frac), close_ext_frac <= close_extreme_frac, False
+    )
+
+    # Opposite wick: bull → lower wick, bear → upper wick
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - lo
+    opp_wick = np.where(bull, lower_wick, np.where(bear, upper_wick, 0.0)).astype(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        opp_wick_frac = np.where(rng > 0, opp_wick / rng, 0.0)
+    opp_wick_ok = opp_wick_frac <= max_opposite_wick_frac
+
+    # Body dominance
+    body_dom_ok = body_frac >= min_body_frac
+
+    # Final flag: all conditions
+    valid_dir = direction != 0
+    final = (
+        valid_dir
+        & (body_atr >= body_atr_mult)
+        & close_extreme_ok
+        & body_dom_ok
+        & opp_wick_ok
+    )
+
+    out["displacement_candle"] = final.astype(int)
+    out["displacement_body_atr"] = body_atr
+    out["displacement_close_extreme"] = close_extreme_ok.astype(int)
+    out["displacement_direction"] = direction
+    out["displacement_bull_candle"] = (final & bull).astype(int)
+    out["displacement_bear_candle"] = (final & bear).astype(int)
+
     return out
 
 
 # ============================================================================
-# AMD Phase Classifier
+# Enhanced AMD Engine (Accumulation → Manipulation → Distribution)
 # ============================================================================
 
+# AMD state constants
+AMD_UNKNOWN = -1
+AMD_ACCUMULATION = 0
+AMD_MANIPULATION = 1
+AMD_DISTRIBUTION = 2
 
-def add_amd_phase(df: pd.DataFrame, accumulation_candles: int = 10) -> pd.DataFrame:
-    """Classify market phase: Accumulation(0) / Manipulation(1) / Distribution(2).
 
-    Columns: ``amd_phase``.
+def _amd_rolling_rank_pct(arr: np.ndarray) -> float:
+    """Percentile rank of last element in trailing window, [0, 100]."""
+    if arr.size == 0 or np.isnan(arr[-1]):
+        return np.nan
+    valid = arr[~np.isnan(arr)]
+    if valid.size == 0:
+        return np.nan
+    return float((valid <= valid[-1]).mean() * 100.0)
+
+
+def _amd_safe_div(numer: pd.Series, denom: pd.Series) -> pd.Series:
+    """Element-wise division, NaN where denom is 0 or NaN."""
+    out = pd.Series(np.nan, index=numer.index, dtype=float)
+    valid = denom.notna() & (denom != 0)
+    out.loc[valid] = numer.loc[valid] / denom.loc[valid]
+    return out
+
+
+def _amd_rolling_overlap(high: pd.Series, low: pd.Series, window: int) -> pd.Series:
+    """Average consecutive-candle overlap fraction over trailing window."""
+    prev_h = high.shift(1)
+    prev_l = low.shift(1)
+    overlap = (np.minimum(high, prev_h) - np.maximum(low, prev_l)).clip(lower=0.0)
+    union = np.maximum(high, prev_h) - np.minimum(low, prev_l)
+    return (
+        _amd_safe_div(overlap, union).rolling(window=window, min_periods=window).mean()
+    )
+
+
+def _amd_rolling_efficiency(close: pd.Series, window: int) -> pd.Series:
+    """Directional efficiency: net move / gross path. Higher = trendier."""
+    net = (close - close.shift(window - 1)).abs()
+    gross = close.diff().abs().rolling(window=window, min_periods=window).sum()
+    return _amd_safe_div(net, gross)
+
+
+def add_amd_features(
+    df: pd.DataFrame,
+    *,
+    atr_pct_window: int = 50,
+    accumulation_window: int = 20,
+    overlap_window: int = 10,
+    accumulation_min_streak: int = 8,
+    atr_pct_low_threshold: float = 45.0,
+    box_width_atr_max: float = 12.0,
+    box_width_pct_max: float = 0.040,
+    overlap_min: float = 0.40,
+    efficiency_max: float = 0.35,
+    min_touch_count_each_side: int = 1,
+    sweep_tolerance_atr: float = 0.15,
+    reclaim_min_frac_of_box: float = 0.10,
+    displacement_mode: str = "break_only",
+    min_distribution_followthrough_bars: int = 2,
+    min_distribution_move_atr: float = 0.35,
+    min_distribution_move_box_frac: float = 0.30,
+    max_reentry_frac_of_box: float = 0.20,
+) -> pd.DataFrame:
     """
+    Compute causal AMD feature columns. Live-safe (trailing-only windows).
+
+    Parameters
+    ----------
+    displacement_mode : str
+        'all' — require displacement for both reclaim and break manipulation
+        'break_only' — require displacement only for break-style, not reclaim
+        'none' — never require displacement
+          Columns
+    ~~~~~~~
+    * ``amd_box_high / amd_box_low / amd_box_mid / amd_box_width``
+    * ``amd_compression_score``       – 0–5, quality of accumulation
+    * ``amd_overlap_score``           – candle overlap in range
+    * ``amd_efficiency``              – directional efficiency (low = choppy)
+    * ``amd_accumulation_active``     – 1 when compression streak met
+    * ``amd_manipulation_candidate``  – 1 on manipulation trigger bar
+    * ``amd_manipulation_direction``  – +1 bull / -1 bear / 0 none
+    * ``amd_distribution_bull_candidate / amd_distribution_bear_candidate``
+    * ``amd_reentry_strict``          – 1 when close is inside box
+    * ``amd_reentry_buffered``        – 1 when close is near box (with tolerance)
+    """
+    out = df.copy()
+    h = out["high"].astype(float)
+    lo = out["low"].astype(float)
+    c = out["close"].astype(float)
+    o = out["open"].astype(float)
+
+    atr = pd.Series(_ensure_atr(out), index=out.index, dtype=float)
+
+    # ATR percentile (causal)
+    atr_pct = atr.rolling(atr_pct_window, min_periods=atr_pct_window).apply(
+        _amd_rolling_rank_pct, raw=True
+    )
+
+    # Accumulation box
+    box_high = h.rolling(accumulation_window, min_periods=accumulation_window).max()
+    box_low = lo.rolling(accumulation_window, min_periods=accumulation_window).min()
+    box_mid = (box_high + box_low) / 2.0
+    box_width = (box_high - box_low).astype(float)
+    box_width_atr = _amd_safe_div(box_width, atr)
+    box_width_pct = _amd_safe_div(box_width, c.abs())
+
+    # Compression metrics
+    overlap_score = _amd_rolling_overlap(h, lo, overlap_window)
+    efficiency = _amd_rolling_efficiency(c, accumulation_window)
+
+    # Box touch counts
+    tol = box_width * 0.10
+    touch_high = (
+        ((box_high - h).abs() <= tol)
+        .rolling(accumulation_window, min_periods=accumulation_window)
+        .sum()
+    )
+    touch_low = (
+        ((lo - box_low).abs() <= tol)
+        .rolling(accumulation_window, min_periods=accumulation_window)
+        .sum()
+    )
+
+    # Compression flags
+    low_atr_flag = atr_pct <= atr_pct_low_threshold
+    narrow_box_flag = (box_width_atr <= box_width_atr_max) & (
+        box_width_pct <= box_width_pct_max
+    )
+    overlap_flag = overlap_score >= overlap_min
+    efficiency_flag = efficiency <= efficiency_max
+    touch_flag = (touch_high >= min_touch_count_each_side) & (
+        touch_low >= min_touch_count_each_side
+    )
+
+    compression_score = (
+        low_atr_flag.astype(int)
+        + narrow_box_flag.astype(int)
+        + overlap_flag.astype(int)
+        + efficiency_flag.astype(int)
+        + touch_flag.astype(int)
+    ).astype(np.int8)
+
+    accumulation_candidate = (
+        low_atr_flag & narrow_box_flag & overlap_flag & efficiency_flag & touch_flag
+    )
+    streak = pd.Series(
+        np.where(accumulation_candidate, 1, 0), index=out.index, dtype="int64"
+    )
+    streak = streak.groupby((streak == 0).cumsum()).cumsum()
+    accumulation_active = streak >= accumulation_min_streak
+
+    # Displacement integration
+    disp_flag = pd.Series(False, index=out.index)
+    disp_dir = pd.Series(0, index=out.index, dtype="int8")
+    if "displacement_candle" in out.columns:
+        disp_flag = out["displacement_candle"].fillna(0).astype(int) == 1
+    if "displacement_direction" in out.columns:
+        disp_dir = out["displacement_direction"].fillna(0).astype("int8")
+    else:
+        disp_dir = pd.Series(
+            np.where(c > o, 1, np.where(c < o, -1, 0)),
+            index=out.index,
+            dtype="int8",
+        )
+
+    # Box breaks and sweeps
+    prior_bh = box_high.shift(1)
+    prior_bl = box_low.shift(1)
+    prior_bw = (prior_bh - prior_bl).astype(float)
+    sweep_tol = atr * sweep_tolerance_atr
+
+    break_up = h > prior_bh
+    break_down = lo < prior_bl
+    sweep_up = break_up & (h <= (prior_bh + sweep_tol))
+    sweep_down = break_down & (lo >= (prior_bl - sweep_tol))
+
+    reclaim_thresh = prior_bw * reclaim_min_frac_of_box
+    reclaim_bull = sweep_down & (c >= (prior_bl + reclaim_thresh))
+    reclaim_bear = sweep_up & (c <= (prior_bh - reclaim_thresh))
+
+    # Manipulation candidates — two styles, gated by displacement_mode
+    acc_prev = accumulation_active.shift(1).fillna(False)
+
+    if displacement_mode == "all":
+        reclaim_manip_bull = acc_prev & reclaim_bull & disp_flag & (disp_dir == 1)
+        reclaim_manip_bear = acc_prev & reclaim_bear & disp_flag & (disp_dir == -1)
+        break_manip_bull = acc_prev & break_up & disp_flag & (disp_dir == 1)
+        break_manip_bear = acc_prev & break_down & disp_flag & (disp_dir == -1)
+    elif displacement_mode == "break_only":
+        reclaim_manip_bull = acc_prev & reclaim_bull
+        reclaim_manip_bear = acc_prev & reclaim_bear
+        break_manip_bull = acc_prev & break_up & disp_flag & (disp_dir == 1)
+        break_manip_bear = acc_prev & break_down & disp_flag & (disp_dir == -1)
+    elif displacement_mode == "none":
+        reclaim_manip_bull = acc_prev & reclaim_bull
+        reclaim_manip_bear = acc_prev & reclaim_bear
+        break_manip_bull = acc_prev & break_up
+        break_manip_bear = acc_prev & break_down
+    else:
+        raise ValueError(
+            "displacement_mode must be 'all', 'break_only', or 'none', "
+            f"got '{displacement_mode}'"
+        )
+
+    manip_bull = reclaim_manip_bull | break_manip_bull
+    manip_bear = reclaim_manip_bear | break_manip_bear
+
+    manip_candidate = manip_bull | manip_bear
+    manip_direction = pd.Series(
+        np.where(manip_bull, 1, np.where(manip_bear, -1, 0)),
+        index=out.index,
+        dtype="int8",
+    )
+
+    # Rolling-box distribution candidates kept as diagnostics only
+    prior_box_mid = box_mid.shift(1)
+    move_from_mid = (c - prior_box_mid).abs()
+    move_from_mid_atr = _amd_safe_div(move_from_mid, atr)
+    move_from_mid_box = _amd_safe_div(move_from_mid, prior_bw)
+
+    outside_up = c > prior_bh
+    outside_down = c < prior_bl
+
+    reentry_strict = (c >= prior_bl) & (c <= prior_bh)
+    reentry_buffered = (c >= (prior_bl - prior_bw * max_reentry_frac_of_box)) & (
+        c <= (prior_bh + prior_bw * max_reentry_frac_of_box)
+    )
+
+    dist_bull_pre = (
+        outside_up
+        & (move_from_mid_atr >= min_distribution_move_atr)
+        & (move_from_mid_box >= min_distribution_move_box_frac)
+    )
+    dist_bear_pre = (
+        outside_down
+        & (move_from_mid_atr >= min_distribution_move_atr)
+        & (move_from_mid_box >= min_distribution_move_box_frac)
+    )
+
+    bull_follow = pd.Series(
+        np.where(dist_bull_pre, 1, 0), index=out.index, dtype="int64"
+    )
+    bull_follow = bull_follow.groupby((~dist_bull_pre).cumsum()).cumsum()
+
+    bear_follow = pd.Series(
+        np.where(dist_bear_pre, 1, 0), index=out.index, dtype="int64"
+    )
+    bear_follow = bear_follow.groupby((~dist_bear_pre).cumsum()).cumsum()
+
+    dist_bull = (bull_follow >= min_distribution_followthrough_bars) & (~reentry_strict)
+    dist_bear = (bear_follow >= min_distribution_followthrough_bars) & (~reentry_strict)
+
+    # Output columns
+    out["amd_box_high"] = box_high
+    out["amd_box_low"] = box_low
+    out["amd_box_mid"] = box_mid
+    out["amd_box_width"] = box_width
+    out["amd_compression_score"] = compression_score
+    out["amd_overlap_score"] = overlap_score
+    out["amd_efficiency"] = efficiency
+    out["amd_accumulation_active"] = accumulation_active.astype(np.int8)
+    out["amd_manipulation_candidate"] = manip_candidate.astype(np.int8)
+    out["amd_manipulation_direction"] = manip_direction
+    out["amd_distribution_bull_candidate"] = dist_bull.astype(np.int8)
+    out["amd_distribution_bear_candidate"] = dist_bear.astype(np.int8)
+    out["amd_reentry_strict"] = reentry_strict.astype(np.int8)
+    out["amd_reentry_buffered"] = reentry_buffered.astype(np.int8)
+
+    return out
+
+
+def add_amd_state(
+    df: pd.DataFrame,
+    *,
+    manipulation_timeout_bars: int = 8,
+    allow_unknown_state: bool = True,
+    reset_to_accumulation_on_new_box: bool = True,
+    accumulation_grace_bars: int = 2,
+    max_distribution_stall: int = 4,
+    min_distribution_move_atr: float = 0.75,
+    min_distribution_move_box_frac: float = 0.60,
+    min_distribution_followthrough_bars: int = 4,
+    min_distribution_extension_atr: float = 0.10,
+) -> pd.DataFrame:
+    """
+    Causal AMD state machine. Assigns phase per bar.
+
+    Distribution confirmation and stall logic are based on the FROZEN
+    originating accumulation box, not the rolling box.
+    """
+    needed = [
+        "amd_box_high",
+        "amd_box_low",
+        "amd_box_mid",
+        "amd_accumulation_active",
+        "amd_manipulation_candidate",
+        "amd_manipulation_direction",
+    ]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise KeyError(f"Run add_amd_features first. Missing: {', '.join(missing)}")
+
     out = df.copy()
     n = len(out)
 
-    atr = _ensure_atr(out)
-    if "atr_pct_50" not in out.columns:
-        atr_s = pd.Series(atr, index=out.index)
-        out["atr_pct_50"] = atr_s.rolling(50).apply(
-            lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100, raw=False
-        )
+    acc_active = out["amd_accumulation_active"].values.astype(int)
+    manip_bull = (out["amd_manipulation_direction"].values == 1).astype(int)
+    manip_bear = (out["amd_manipulation_direction"].values == -1).astype(int)
+    close_v = out["close"].values.astype(float)
+    high_v = out["high"].values.astype(float)
+    low_v = out["low"].values.astype(float)
+    bx_h = out["amd_box_high"].values.astype(float)
+    bx_l = out["amd_box_low"].values.astype(float)
+    bx_m = out["amd_box_mid"].values.astype(float)
+    atr_v = np.asarray(_ensure_atr(out), dtype=float)
 
-    atr_pct = out["atr_pct_50"].values.astype(float)
-    disp = out.get("displacement_candle", pd.Series(np.zeros(n))).values
+    phase = np.full(n, AMD_UNKNOWN, dtype=np.int8)
+    direction = np.zeros(n, dtype=np.int8)
+    seq_id = np.full(n, -1, dtype=np.int32)
+    bars_in = np.zeros(n, dtype=np.int32)
+    active_box_high = np.full(n, np.nan, dtype=float)
+    active_box_low = np.full(n, np.nan, dtype=float)
+    active_box_mid = np.full(n, np.nan, dtype=float)
 
-    phase = np.zeros(n, dtype=np.int8)
-    low_atr_streak = 0
+    cur_phase = AMD_UNKNOWN
+    cur_dir = 0
+    cur_seq = -1
+    phase_age = 0
+    manip_age = 0
+    grace_count = 0
+    dist_stall = 0
+    dist_follow = 0
+    dist_best_high = np.nan
+    dist_best_low = np.nan
+
+    # Frozen box from the accumulation that spawned the current cycle
+    frozen_bh = np.nan
+    frozen_bl = np.nan
+    frozen_bm = np.nan
 
     for i in range(n):
-        if np.isnan(atr_pct[i]):
-            continue
-        if atr_pct[i] < 50:
-            low_atr_streak += 1
-        else:
-            low_atr_streak = 0
+        acc = acc_active[i] == 1
+        mb = manip_bull[i] == 1
+        ms = manip_bear[i] == 1
 
-        if low_atr_streak >= accumulation_candles:
-            phase[i] = 0
-        elif disp[i] == 1 and low_atr_streak > 0:
-            phase[i] = 1
-            low_atr_streak = 0
-        elif atr_pct[i] >= 50:
-            phase[i] = 2
-        else:
-            phase[i] = 0
+        # Reentry against frozen box
+        re = (
+            np.isfinite(frozen_bl)
+            and np.isfinite(frozen_bh)
+            and frozen_bl <= close_v[i] <= frozen_bh
+        )
+
+        # Distribution conditions based on frozen box
+        bull_dist_entry = False
+        bear_dist_entry = False
+        bull_dist_active = False
+        bear_dist_active = False
+
+        if (
+            np.isfinite(frozen_bh)
+            and np.isfinite(frozen_bl)
+            and np.isfinite(frozen_bm)
+            and np.isfinite(atr_v[i])
+            and atr_v[i] > 0
+        ):
+            frozen_bw = frozen_bh - frozen_bl
+            if np.isfinite(frozen_bw) and frozen_bw > 0:
+                move_from_frozen_mid = abs(close_v[i] - frozen_bm)
+                move_from_frozen_mid_atr = move_from_frozen_mid / atr_v[i]
+                move_from_frozen_mid_box = move_from_frozen_mid / frozen_bw
+
+                # Entry into distribution: confirmed escape + delivery away from frozen box
+                bull_dist_entry = (
+                    (close_v[i] > frozen_bh)
+                    and (move_from_frozen_mid_atr >= min_distribution_move_atr)
+                    and (move_from_frozen_mid_box >= min_distribution_move_box_frac)
+                )
+                bear_dist_entry = (
+                    (close_v[i] < frozen_bl)
+                    and (move_from_frozen_mid_atr >= min_distribution_move_atr)
+                    and (move_from_frozen_mid_box >= min_distribution_move_box_frac)
+                )
+
+                # Active distribution: must make fresh extreme beyond best seen in distribution
+                ext_thresh = min_distribution_extension_atr * atr_v[i]
+
+                if cur_phase == AMD_DISTRIBUTION:
+                    if cur_dir == 1 and np.isfinite(dist_best_high):
+                        bull_dist_active = (close_v[i] > frozen_bh) and (
+                            high_v[i] >= dist_best_high + ext_thresh
+                        )
+                    elif cur_dir == -1 and np.isfinite(dist_best_low):
+                        bear_dist_active = (close_v[i] < frozen_bl) and (
+                            low_v[i] <= dist_best_low - ext_thresh
+                        )
+
+        if cur_phase == AMD_UNKNOWN:
+            if acc:
+                cur_phase = AMD_ACCUMULATION
+                cur_dir = 0
+                cur_seq += 1
+                frozen_bh = bx_h[i]
+                frozen_bl = bx_l[i]
+                frozen_bm = bx_m[i]
+                phase_age = 1
+                grace_count = 0
+                manip_age = 0
+                dist_stall = 0
+                dist_follow = 0
+                dist_best_high = np.nan
+                dist_best_low = np.nan
+            else:
+                phase_age = 0
+
+        elif cur_phase == AMD_ACCUMULATION:
+            if acc:
+                # Update frozen box while still accumulating
+                frozen_bh = bx_h[i]
+                frozen_bl = bx_l[i]
+                frozen_bm = bx_m[i]
+                phase_age += 1
+                grace_count = 0
+
+            elif mb:
+                cur_phase = AMD_MANIPULATION
+                cur_dir = 1
+                manip_age = 1
+                phase_age = 1
+                grace_count = 0
+                dist_stall = 0
+                dist_follow = 0
+                dist_best_high = np.nan
+                dist_best_low = np.nan
+
+            elif ms:
+                cur_phase = AMD_MANIPULATION
+                cur_dir = -1
+                manip_age = 1
+                phase_age = 1
+                grace_count = 0
+                dist_stall = 0
+                dist_follow = 0
+                dist_best_high = np.nan
+                dist_best_low = np.nan
+
+            else:
+                grace_count += 1
+                phase_age += 1
+                if grace_count > accumulation_grace_bars and allow_unknown_state:
+                    cur_phase = AMD_UNKNOWN
+                    cur_dir = 0
+                    phase_age = 0
+                    grace_count = 0
+                    manip_age = 0
+                    dist_stall = 0
+                    dist_follow = 0
+                    dist_best_high = np.nan
+                    dist_best_low = np.nan
+                    frozen_bh = np.nan
+                    frozen_bl = np.nan
+                    frozen_bm = np.nan
+
+        elif cur_phase == AMD_MANIPULATION:
+            manip_age += 1
+            phase_age += 1
+
+            if cur_dir == 1 and bull_dist_entry:
+                dist_follow += 1
+                if dist_follow >= min_distribution_followthrough_bars:
+                    cur_phase = AMD_DISTRIBUTION
+                    phase_age = 1
+                    dist_stall = 0
+                    dist_best_high = high_v[i]
+                    dist_best_low = low_v[i]
+            elif cur_dir == -1 and bear_dist_entry:
+                dist_follow += 1
+                if dist_follow >= min_distribution_followthrough_bars:
+                    cur_phase = AMD_DISTRIBUTION
+                    phase_age = 1
+                    dist_stall = 0
+                    dist_best_high = high_v[i]
+                    dist_best_low = low_v[i]
+            else:
+                dist_follow = 0
+
+            if cur_phase == AMD_MANIPULATION and manip_age > manipulation_timeout_bars:
+                if acc and reset_to_accumulation_on_new_box:
+                    cur_phase = AMD_ACCUMULATION
+                    cur_dir = 0
+                    cur_seq += 1
+                    frozen_bh = bx_h[i]
+                    frozen_bl = bx_l[i]
+                    frozen_bm = bx_m[i]
+                    phase_age = 1
+                    grace_count = 0
+                    manip_age = 0
+                    dist_stall = 0
+                    dist_follow = 0
+                    dist_best_high = np.nan
+                    dist_best_low = np.nan
+                elif allow_unknown_state:
+                    cur_phase = AMD_UNKNOWN
+                    cur_dir = 0
+                    phase_age = 0
+                    manip_age = 0
+                    dist_stall = 0
+                    dist_follow = 0
+                    dist_best_high = np.nan
+                    dist_best_low = np.nan
+                    frozen_bh = np.nan
+                    frozen_bl = np.nan
+                    frozen_bm = np.nan
+
+        elif cur_phase == AMD_DISTRIBUTION:
+            phase_age += 1
+
+            if cur_dir == 1 and bull_dist_active:
+                dist_stall = 0
+                dist_best_high = high_v[i]
+            elif cur_dir == -1 and bear_dist_active:
+                dist_stall = 0
+                dist_best_low = low_v[i]
+            else:
+                dist_stall += 1
+
+            if re:
+                if acc and reset_to_accumulation_on_new_box:
+                    cur_phase = AMD_ACCUMULATION
+                    cur_dir = 0
+                    cur_seq += 1
+                    frozen_bh = bx_h[i]
+                    frozen_bl = bx_l[i]
+                    frozen_bm = bx_m[i]
+                    phase_age = 1
+                    grace_count = 0
+                    manip_age = 0
+                    dist_stall = 0
+                    dist_follow = 0
+                    dist_best_high = np.nan
+                    dist_best_low = np.nan
+                elif allow_unknown_state:
+                    cur_phase = AMD_UNKNOWN
+                    cur_dir = 0
+                    phase_age = 0
+                    manip_age = 0
+                    dist_stall = 0
+                    dist_follow = 0
+                    dist_best_high = np.nan
+                    dist_best_low = np.nan
+                    frozen_bh = np.nan
+                    frozen_bl = np.nan
+                    frozen_bm = np.nan
+
+            elif dist_stall > max_distribution_stall:
+                if acc and reset_to_accumulation_on_new_box:
+                    cur_phase = AMD_ACCUMULATION
+                    cur_dir = 0
+                    cur_seq += 1
+                    frozen_bh = bx_h[i]
+                    frozen_bl = bx_l[i]
+                    frozen_bm = bx_m[i]
+                    phase_age = 1
+                    grace_count = 0
+                    manip_age = 0
+                    dist_stall = 0
+                    dist_follow = 0
+                    dist_best_high = np.nan
+                    dist_best_low = np.nan
+                elif allow_unknown_state:
+                    cur_phase = AMD_UNKNOWN
+                    cur_dir = 0
+                    phase_age = 0
+                    manip_age = 0
+                    dist_stall = 0
+                    dist_follow = 0
+                    dist_best_high = np.nan
+                    dist_best_low = np.nan
+                    frozen_bh = np.nan
+                    frozen_bl = np.nan
+                    frozen_bm = np.nan
+
+            elif acc and reset_to_accumulation_on_new_box:
+                cur_phase = AMD_ACCUMULATION
+                cur_dir = 0
+                cur_seq += 1
+                frozen_bh = bx_h[i]
+                frozen_bl = bx_l[i]
+                frozen_bm = bx_m[i]
+                phase_age = 1
+                grace_count = 0
+                manip_age = 0
+                dist_stall = 0
+                dist_follow = 0
+                dist_best_high = np.nan
+                dist_best_low = np.nan
+
+        phase[i] = cur_phase
+        direction[i] = cur_dir
+        seq_id[i] = cur_seq
+        bars_in[i] = phase_age
+        active_box_high[i] = frozen_bh
+        active_box_low[i] = frozen_bl
+        active_box_mid[i] = frozen_bm
 
     out["amd_phase"] = phase
+    out["amd_direction"] = direction
+    out["amd_sequence_id"] = seq_id
+    out["amd_bars_in_phase"] = bars_in
+    out["amd_active_box_high"] = active_box_high
+    out["amd_active_box_low"] = active_box_low
+    out["amd_active_box_mid"] = active_box_mid
+    out["amd_is_accumulation"] = (phase == AMD_ACCUMULATION).astype(np.int8)
+    out["amd_is_manipulation"] = (phase == AMD_MANIPULATION).astype(np.int8)
+    out["amd_is_distribution"] = (phase == AMD_DISTRIBUTION).astype(np.int8)
+
+    return out
+
+
+def add_amd_labels(
+    df: pd.DataFrame,
+    *,
+    label_lookahead: int = 10,
+    label_target_atr: float = 1.5,
+    label_stop_box_frac: float = 0.50,
+) -> pd.DataFrame:
+    """
+    Retrospective AMD outcome labels for supervised learning.
+
+    NOT live-safe — uses future bars. For offline labeling only.
+    Uses the frozen active box for stop sizing.
+    """
+    needed = [
+        "amd_phase",
+        "amd_direction",
+        "amd_active_box_high",
+        "amd_active_box_low",
+    ]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise KeyError(
+            "Run add_amd_features + add_amd_state first. Missing: " + ", ".join(missing)
+        )
+
+    out = df.copy()
+    n = len(out)
+    atr = np.asarray(_ensure_atr(out), dtype=float)
+
+    phase_v = out["amd_phase"].values.astype(np.int8)
+    dir_v = out["amd_direction"].values.astype(np.int8)
+    bx_h = out["amd_active_box_high"].values.astype(float)
+    bx_l = out["amd_active_box_low"].values.astype(float)
+    h = out["high"].values.astype(float)
+    lo = out["low"].values.astype(float)
+    c = out["close"].values.astype(float)
+
+    outcome = np.zeros(n, dtype=np.int8)
+    fwd_ret = np.full(n, np.nan, dtype=float)
+
+    for i in range(n):
+        if phase_v[i] != AMD_MANIPULATION or dir_v[i] == 0:
+            continue
+        if not np.isfinite(atr[i]) or atr[i] <= 0:
+            continue
+
+        bw = bx_h[i] - bx_l[i]
+        if not np.isfinite(bw) or bw <= 0:
+            continue
+
+        end = min(n, i + 1 + label_lookahead)
+        if end <= i + 1:
+            continue
+
+        entry = c[i]
+        target_d = label_target_atr * atr[i]
+        stop_d = label_stop_box_frac * bw
+
+        if dir_v[i] == 1:
+            tgt = entry + target_d
+            stp = entry - stop_d
+            hit_tgt = np.where(h[i + 1 : end] >= tgt)[0]
+            hit_stp = np.where(lo[i + 1 : end] <= stp)[0]
+            max_fwd = h[i + 1 : end].max() - entry
+        else:
+            tgt = entry - target_d
+            stp = entry + stop_d
+            hit_tgt = np.where(lo[i + 1 : end] <= tgt)[0]
+            hit_stp = np.where(h[i + 1 : end] >= stp)[0]
+            max_fwd = entry - lo[i + 1 : end].min()
+
+        fwd_ret[i] = max_fwd / atr[i]
+        ft = hit_tgt[0] if hit_tgt.size > 0 else None
+        fs = hit_stp[0] if hit_stp.size > 0 else None
+
+        if ft is not None and (fs is None or ft < fs):
+            outcome[i] = 1
+        elif fs is not None and (ft is None or fs < ft):
+            outcome[i] = -1
+
+    out["amd_label_outcome"] = outcome
+    out["amd_label_forward_return_atr"] = fwd_ret
+    return out
+
+
+def add_amd_engine(
+    df: pd.DataFrame,
+    *,
+    add_labels: bool = False,
+    **kwargs,
+) -> pd.DataFrame:
+    """Full AMD pipeline: features → state machine → optional labels."""
+    feature_keys = {
+        "atr_pct_window",
+        "accumulation_window",
+        "overlap_window",
+        "accumulation_min_streak",
+        "atr_pct_low_threshold",
+        "box_width_atr_max",
+        "box_width_pct_max",
+        "overlap_min",
+        "efficiency_max",
+        "min_touch_count_each_side",
+        "sweep_tolerance_atr",
+        "reclaim_min_frac_of_box",
+        "displacement_mode",
+        "min_distribution_followthrough_bars",
+        "min_distribution_move_atr",
+        "min_distribution_move_box_frac",
+        "max_reentry_frac_of_box",
+    }
+    state_keys = {
+        "manipulation_timeout_bars",
+        "allow_unknown_state",
+        "reset_to_accumulation_on_new_box",
+        "accumulation_grace_bars",
+        "max_distribution_stall",
+        "min_distribution_move_atr",
+        "min_distribution_move_box_frac",
+        "min_distribution_followthrough_bars",
+        "min_distribution_extension_atr",
+    }
+    label_keys = {"label_lookahead", "label_target_atr", "label_stop_box_frac"}
+
+    feat_kw = {k: v for k, v in kwargs.items() if k in feature_keys}
+    state_kw = {k: v for k, v in kwargs.items() if k in state_keys}
+    label_kw = {k: v for k, v in kwargs.items() if k in label_keys}
+
+    out = add_amd_features(df, **feat_kw)
+    out = add_amd_state(out, **state_kw)
+    if add_labels:
+        out = add_amd_labels(out, **label_kw)
     return out
