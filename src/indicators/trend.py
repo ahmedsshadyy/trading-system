@@ -1,8 +1,12 @@
 """
 Trend & Structure indicators.
 
-EMA 20/50/200, ADX 14, Swing H/L detector, BOS detector, CHoCH detector,
+Swing H/L detector, BOS detector, CHoCH detector,
 trend state machine (HH/HL/LH/LL).
+
+EMA and ADX have moved to foundation/ema.py and foundation/adx.py.
+This module retains only structural indicators that downstream SMC
+detectors depend on.
 
 All functions are pure: input DataFrame is never mutated.
 """
@@ -13,71 +17,6 @@ import numpy as np
 import pandas as pd
 from src.indicators import ta_core as ta
 from src.indicators._helpers.arrays import get_atr_array
-
-# ---------------------------------------------------------------------------
-# EMA
-# ---------------------------------------------------------------------------
-
-
-def compute_ema(df: pd.DataFrame, period: int = 20, col: str = "close") -> pd.Series:
-    """Return EMA Series named ``ema_{period}``."""
-    return ta.ema(df[col], length=period).rename(f"ema_{period}")
-
-
-def add_emas(
-    df: pd.DataFrame, periods: tuple[int, ...] = (20, 50, 200)
-) -> pd.DataFrame:
-    """Add EMA columns + slope and position flags.
-
-    Per period P
-    ~~~~~~~~~~~~
-    * ``ema_{P}``              – EMA value
-    * ``ema_{P}_slope``        – 3-candle Δ normalised by ATR-14
-    * ``price_above_ema_{P}``  – binary
-
-    Cross flags
-    ~~~~~~~~~~~
-    * ``ema_20_above_50``
-    * ``ema_50_above_200``
-    """
-    out = df.copy()
-
-    if "atr_14" not in out.columns:
-        out["atr_14"] = ta.atr(out["high"], out["low"], out["close"], length=14)
-
-    for p in periods:
-        ema = ta.ema(out["close"], length=p)
-        out[f"ema_{p}"] = ema
-        out[f"ema_{p}_slope"] = ema.diff(3) / out["atr_14"]
-        out[f"price_above_ema_{p}"] = (out["close"] > ema).astype(int)
-
-    if 20 in periods and 50 in periods:
-        out["ema_20_above_50"] = (out["ema_20"] > out["ema_50"]).astype(int)
-    if 50 in periods and 200 in periods:
-        out["ema_50_above_200"] = (out["ema_50"] > out["ema_200"]).astype(int)
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# ADX
-# ---------------------------------------------------------------------------
-
-
-def add_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    """ADX value, threshold flags, and 3-candle delta.
-
-    Columns: ``adx_14``, ``adx_above_20/25/40``, ``adx_delta_3``.
-    """
-    out = df.copy()
-    adx_df = ta.adx(out["high"], out["low"], out["close"], length=period)
-    out[f"adx_{period}"] = adx_df[f"ADX_{period}"]
-    out["adx_above_20"] = (out[f"adx_{period}"] > 20).astype(int)
-    out["adx_above_25"] = (out[f"adx_{period}"] > 25).astype(int)
-    out["adx_above_40"] = (out[f"adx_{period}"] > 40).astype(int)
-    out["adx_delta_3"] = out[f"adx_{period}"].diff(3)
-    return out
-
 
 # ---------------------------------------------------------------------------
 # Swing High / Low Detector
