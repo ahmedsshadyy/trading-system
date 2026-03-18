@@ -1,5 +1,5 @@
 """
-src/indicators/init.py
+src/indicators/__init__.py
 Indicator Library — Phase 2.
 
 Exports all indicator functions and provides ``build_all_indicators()``
@@ -13,43 +13,49 @@ Usage
     df = build_all_indicators(df, instrument="XAU_USD")
 """
 
-from src.indicators.trend import (
-    compute_ema as compute_ema,
-    add_emas,
-    add_adx,
-    add_swings,
-    add_swings_causal,
-    add_trend_state,
-    add_bos,
-    add_choch,
-)
-from src.indicators.momentum import (
-    add_rsi,
-    add_macd,
-    add_rsi_divergence,
-)
-from src.indicators.volatility import (
+# --- Foundation (pure trailing indicators) ---
+from src.indicators.foundation.ema import compute_ema, add_emas
+from src.indicators.foundation.adx import add_adx
+from src.indicators.foundation.momentum import add_rsi, add_macd, add_rsi_divergence
+from src.indicators.foundation.volatility import (
     add_atr,
     add_bb_width,
-    compute_atr_ratio as compute_atr_ratio,
+    compute_atr_ratio,
     add_rolling_atr_ratio,
     add_body_ratio,
 )
-from src.indicators.volume import (
+from src.indicators.foundation.volume import (
     add_volume_ratio,
     add_key_volume_flags,
     add_candle_delta_proxy,
     add_vsa,
     add_wick_ratio,
 )
-from src.indicators.value import (
-    compute_anchored_vwap as compute_anchored_vwap,
+from src.indicators.foundation.value import (
+    compute_anchored_vwap,
     add_avwap_from_last_swing,
     add_asian_session_hl,
     add_prev_day_hl,
     add_prev_week_hl,
     add_round_number_flag,
 )
+from src.indicators.foundation.volume_profile import (
+    compute_volume_profile,
+    add_volume_profile,
+)
+from src.indicators.foundation.session import add_session_classifier, add_time_features
+from src.indicators.foundation.regime import add_regime
+
+# --- Structure (structural backbone) ---
+from src.indicators.trend import (
+    add_swings,
+    add_swings_causal,
+    add_trend_state,
+    add_bos,
+    add_choch,
+)
+
+# --- SMC (event detectors + active trackers) ---
 from src.indicators.smc import (
     add_fvg,
     add_fvg_fill,
@@ -60,22 +66,65 @@ from src.indicators.smc import (
     add_equal_hl,
     add_displacement_candle,
     add_amd_engine,
-    add_amd_features as add_amd_features,
-    add_amd_state as add_amd_state,
-    add_amd_labels as add_amd_labels,
+    add_amd_features,
+    add_amd_state,
+    add_amd_labels,
 )
-from src.indicators.volume_profile import (
-    compute_volume_profile as compute_volume_profile,
-    add_volume_profile,
-)
-from src.indicators.session import (
-    add_session_classifier,
-    add_time_features,
-)
-from src.indicators.regime import add_regime
 
 # SMT deferred
 # from src.indicators.smt import add_smt_divergence
+
+__all__ = [
+    # Foundation
+    "compute_ema",
+    "add_emas",
+    "add_adx",
+    "add_rsi",
+    "add_macd",
+    "add_rsi_divergence",
+    "add_atr",
+    "add_bb_width",
+    "compute_atr_ratio",
+    "add_rolling_atr_ratio",
+    "add_body_ratio",
+    "add_volume_ratio",
+    "add_key_volume_flags",
+    "add_candle_delta_proxy",
+    "add_vsa",
+    "add_wick_ratio",
+    "compute_anchored_vwap",
+    "add_avwap_from_last_swing",
+    "add_asian_session_hl",
+    "add_prev_day_hl",
+    "add_prev_week_hl",
+    "add_round_number_flag",
+    "compute_volume_profile",
+    "add_volume_profile",
+    "add_session_classifier",
+    "add_time_features",
+    "add_regime",
+    # Structure
+    "add_swings",
+    "add_swings_causal",
+    "add_trend_state",
+    "add_bos",
+    "add_choch",
+    # SMC
+    "add_fvg",
+    "add_fvg_fill",
+    "add_ifvg",
+    "add_ob",
+    "add_ob_mitigation",
+    "add_liquidity_sweep",
+    "add_equal_hl",
+    "add_displacement_candle",
+    "add_amd_engine",
+    "add_amd_features",
+    "add_amd_state",
+    "add_amd_labels",
+    # Pipeline
+    "build_all_indicators",
+]
 
 
 import pandas as pd
@@ -103,11 +152,11 @@ def build_all_indicators(
     swing_mode : str
         'symmetric' — look-ahead swing detection (cleaner pivots, standard for backtesting).
         'causal' — no look-ahead (same detector for training and live deployment).
+        'symmetric_causal' — symmetric detection with delayed availability (default).
     include_vp : bool
         Whether to compute Volume Profile (slower — disable for quick tests).
     include_avwap : bool
-        Whether to compute Anchored VWAP from last swing (disabled by
-        default — the scanner calls it per-signal with custom anchors).
+        Whether to compute Anchored VWAP from last swing.
 
     Returns
     -------
