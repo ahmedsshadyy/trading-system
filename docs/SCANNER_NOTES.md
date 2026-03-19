@@ -197,3 +197,7 @@ When a sweep occurs at a level that also has an active FVG or unmitigated OB:
 - This is the highest-conviction sweep setup — institutional level + imbalance zone + stop hunt
 - Feature: `sweep_at_fvg` (binary), `sweep_at_ob` (binary)
 - Applies to Strategy 5 primarily, but also S3 and S11
+
+
+## Timing is important. 
+The scanner should note, how things went in the Asian session. What are the critical numbers. Market behavior and structure in Asia. For example if Asia accumulates or expands, since this will make it more important to see if london manipulates or accumulates and then NY if it distributes. More generally, it should feed the agent with data that would allow it to tell me what is proper price entry, sizing and confirmations
