@@ -3,11 +3,10 @@ pipelines/build_research.py
 
 Full indicator pipeline for research and backtesting.
 
-Applies every indicator layer in dependency order, including optional
-diagnostics like Volume Profile and AVWAP. This is the pipeline used
-for historical signal scanning, labeling, and model training.
+Uses the same canonical causal swing engine as live so that research,
+training, backtesting, and deployment share the same structural backbone.
 
-For live deployment, use ``build_live.py`` instead.
+For live deployment, use ``build_live.py``.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ from src.indicators.foundation.session import add_session_classifier, add_time_f
 from src.indicators.foundation.regime import add_regime
 
 # --- Structure ---
-from src.indicators.structure.swings import add_swings, add_swings_causal
+from src.indicators.structure.swings import add_swings
 from src.indicators.structure.trend_state import add_trend_state
 from src.indicators.structure.bos import add_bos
 from src.indicators.structure.choch import add_choch
@@ -63,8 +62,7 @@ from src.indicators.smc.amd import add_amd_engine
 def build_research_indicators(
     df: pd.DataFrame,
     instrument: str = "XAU_USD",
-    swing_window: int = 3,
-    swing_mode: str = "symmetric_causal",
+    swing_window: int = 6,
     include_vp: bool = True,
     include_avwap: bool = False,
 ) -> pd.DataFrame:
@@ -77,14 +75,9 @@ def build_research_indicators(
     instrument : str
         For round-number detection (XAU_USD or USOIL).
     swing_window : int
-        Window for swing detection (default 3 for symmetric = 6-candle span,
-        default 6 for causal = 6-bar lookback).
-    swing_mode : str
-        'symmetric' — look-ahead swing detection (cleaner pivots, standard for backtesting).
-        'causal' — no look-ahead (same detector for training and live deployment).
-        'symmetric_causal' — symmetric detection with delayed availability (default).
+        Lookback window for canonical causal swing detection.
     include_vp : bool
-        Whether to compute Volume Profile (slower — disable for quick tests).
+        Whether to compute Volume Profile.
     include_avwap : bool
         Whether to compute Anchored VWAP from last swing.
 
@@ -94,12 +87,11 @@ def build_research_indicators(
     """
     out = df.copy()
 
-    # Ensure float types for OHLCV (PostgreSQL returns Decimal)
     for col in ("open", "high", "low", "close"):
         out[col] = out[col].astype(float)
     out["volume"] = out["volume"].astype(float)
 
-    # === Layer 1: Foundation (no dependencies) ===
+    # === Layer 1: Foundation ===
     out = add_atr(out)
     out = add_emas(out)
     out = add_adx(out)
@@ -108,29 +100,24 @@ def build_research_indicators(
     out = add_bb_width(out)
     out = add_body_ratio(out)
 
-    # === Layer 2: Structure (depends on Layer 1) ===
-    if swing_mode == "causal":
-        out = add_swings_causal(out, window=swing_window if swing_window != 3 else 6)
-    elif swing_mode == "symmetric_causal":
-        out = add_swings(out, window=swing_window, causal=True)
-    else:  # "symmetric"
-        out = add_swings(out, window=swing_window, causal=False)
+    # === Layer 2: Structure ===
+    out = add_swings(out, window=swing_window)
     out = add_trend_state(out)
     out = add_bos(out)
     out = add_choch(out)
 
-    # === Layer 3: Momentum + Divergence (depends on Layer 1 + 2) ===
+    # === Layer 3: Momentum + Divergence ===
     out = add_rsi_divergence(out)
     out = add_rolling_atr_ratio(out)
 
-    # === Layer 4: Volume (no structural deps) ===
+    # === Layer 4: Volume ===
     out = add_volume_ratio(out)
     out = add_key_volume_flags(out)
     out = add_candle_delta_proxy(out)
     out = add_vsa(out)
     out = add_wick_ratio(out)
 
-    # === Layer 5: SMC (depends on Layer 2) ===
+    # === Layer 5: SMC ===
     out = add_fvg(out)
     out = add_fvg_fill(out)
     out = add_ifvg(out)
@@ -146,22 +133,21 @@ def build_research_indicators(
     out = add_prev_week_hl(out)
     out = add_round_number_flag(out, instrument=instrument)
 
-    # Intraday-only features (skip for Daily timeframe)
     ts = pd.to_datetime(out["timestamp"], utc=True)
-    if ts.diff().median().total_seconds() < 86400:  # sub-daily
+    if ts.diff().median().total_seconds() < 86400:
         out = add_asian_session_hl(out)
         out = add_session_classifier(out)
         out = add_time_features(out)
 
-    # === Layer 7: Volume Profile (expensive) ===
+    # === Layer 7: Volume Profile ===
     if include_vp:
         out = add_volume_profile(out)
 
-    # === Layer 8: Anchored VWAP (per-signal usually) ===
+    # === Layer 8: Anchored VWAP ===
     if include_avwap:
         out = add_avwap_from_last_swing(out)
 
-    # === Layer 9: Regime (depends on multiple layers) ===
+    # === Layer 9: Regime ===
     out = add_regime(out)
 
     return out

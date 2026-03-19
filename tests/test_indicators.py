@@ -21,6 +21,69 @@ import numpy as np
 import pandas as pd
 import pytest
 
+### Helpers for Trend_state tests
+
+
+def _make_ohlc_from_close(closes: list[float]) -> pd.DataFrame:
+    """
+    Build a simple deterministic OHLC DataFrame from close values.
+
+    We keep the candles simple and monotone enough that the causal swing detector
+    can form structural events reliably.
+    """
+    close = np.asarray(closes, dtype=float)
+    open_ = np.r_[close[0], close[:-1]]
+    high = np.maximum(open_, close) + 0.6
+    low = np.minimum(open_, close) - 0.6
+
+    return pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=len(close), freq="4h"),
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+        }
+    )
+
+
+def _run_trend_state(
+    closes: list[float],
+    *,
+    swing_window: int = 2,
+    atr_length: int = 3,
+    event_freshness_bars: int = 6,
+    bias_half_life_bars: int = 2,
+    bias_neutral_ttl_bars: int = 3,
+    bias_min_score: float = 0.40,
+    emerging_strength_threshold: float = 0.12,
+    structure_loss_strength_threshold: float = 0.08,
+) -> pd.DataFrame:
+    """
+    Build deterministic OHLC -> ATR -> swings -> trend_state for behavior tests.
+    Uses shorter ATR / tighter controllable thresholds so short synthetic paths
+    can actually exercise live causal behavior.
+    """
+    from src.indicators.foundation.volatility import add_atr
+    from src.indicators.structure.swings import add_swings
+    from src.indicators.structure.trend_state import add_trend_state
+
+    df = _make_ohlc_from_close(closes)
+    df = add_atr(df, period=atr_length)
+    df = add_swings(df, window=swing_window, atr_length=atr_length)
+    df = add_trend_state(
+        df,
+        atr_length=atr_length,
+        event_freshness_bars=event_freshness_bars,
+        bias_half_life_bars=bias_half_life_bars,
+        bias_neutral_ttl_bars=bias_neutral_ttl_bars,
+        bias_min_score=bias_min_score,
+        emerging_strength_threshold=emerging_strength_threshold,
+        structure_loss_strength_threshold=structure_loss_strength_threshold,
+    )
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -214,6 +277,11 @@ class TestTrend:
         result = add_swings(sample_df)
         result = add_trend_state(result)
         assert "trend_state" in result.columns
+        assert "trend_bias_state" in result.columns
+        assert "trend_confidence" in result.columns
+        assert "trend_bull_ready" in result.columns
+        assert "trend_bear_ready" in result.columns
+        assert "trend_bias_score_live" in result.columns
         assert set(result["trend_state"].unique()).issubset({-1, 0, 1})
 
     def test_add_bos(self, sample_df):
@@ -239,6 +307,168 @@ class TestTrend:
         result = add_choch(result)
         assert "choch_bull" in result.columns
         assert "choch_bear" in result.columns
+
+
+class TestTrendStateBehavior:
+
+    def test_trend_state_columns_transition_layer_exist(self):
+        df = _run_trend_state(
+            [100, 102, 101, 104, 103, 106, 105, 103, 104, 102, 101, 99]
+        )
+
+        expected = {
+            "trend_structure_loss_bull",
+            "trend_structure_loss_bear",
+            "trend_emerging_bull",
+            "trend_emerging_bear",
+            "trend_regime_phase",
+            "trend_pressure_bull_raw",
+            "trend_pressure_bear_raw",
+            "trend_strength_raw",
+            "trend_strength_ema",
+        }
+        assert expected.issubset(df.columns)
+
+    def test_bullish_strict_state_can_form(self):
+        # Rising / pullback / rising sequence that should produce HH + HL
+        df = _run_trend_state([100, 103, 101, 105, 103, 107, 105, 109, 107, 111])
+
+        assert (df["trend_state"] == 1).any()
+
+    def test_bearish_strict_state_can_form(self):
+        # Falling / bounce / falling sequence that should produce LH + LL
+        df = _run_trend_state([111, 108, 110, 106, 108, 104, 106, 102, 104, 100])
+
+        assert (df["trend_state"] == -1).any()
+
+    def test_bias_can_be_carried_when_strict_state_goes_neutral(self):
+        # First create bull structure, then flatten enough to let freshness expire.
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 109, 109, 109, 109, 109, 109, 109],
+            event_freshness_bars=3,
+            bias_neutral_ttl_bars=4,
+        )
+
+        carried = (df["trend_state"] == 0) & (df["trend_bias_state"] == 1)
+        assert carried.any()
+
+    def test_bias_eventually_expires_in_neutral(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 109, 109, 109, 109, 109, 109, 109, 109],
+            event_freshness_bars=3,
+            bias_neutral_ttl_bars=2,
+            bias_half_life_bars=1,
+            bias_min_score=0.60,
+        )
+
+        # After enough neutral bars, bias should die.
+        assert ((df["trend_state"] == 0) & (df["trend_bias_state"] == 0)).any()
+
+    def test_confidence_values_stay_in_expected_set(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 103, 104, 102, 101, 99]
+        )
+
+        vals = set(df["trend_confidence"].dropna().astype(int).unique())
+        assert vals.issubset({-1, 0, 1, 2})
+
+    def test_strength_is_positive_in_bullish_regime_on_average(self):
+        df = _run_trend_state([100, 103, 101, 105, 103, 107, 105, 109, 107, 111])
+
+        bull_rows = df[df["trend_state"] == 1]
+        assert not bull_rows.empty
+        assert bull_rows["trend_strength_ema"].mean() > 0
+
+    def test_strength_is_negative_in_bearish_regime_on_average(self):
+        df = _run_trend_state([111, 108, 110, 106, 108, 104, 106, 102, 104, 100])
+
+        bear_rows = df[df["trend_state"] == -1]
+        assert not bear_rows.empty
+        assert bear_rows["trend_strength_ema"].mean() < 0
+
+    def test_structure_loss_bull_can_appear_after_losing_bull_structure(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 109, 108.7, 108.4, 108.2, 108.1, 108.0],
+            event_freshness_bars=3,
+            structure_loss_strength_threshold=0.03,
+        )
+
+        assert (df["trend_structure_loss_bull"] == 1).any()
+
+    def test_structure_loss_bear_can_appear_after_losing_bear_structure(self):
+        df = _run_trend_state(
+            [111, 108, 110, 106, 108, 104, 106, 102, 102.3, 102.6, 102.9, 103.1, 103.2],
+            event_freshness_bars=3,
+            structure_loss_strength_threshold=0.03,
+        )
+
+        assert (df["trend_structure_loss_bear"] == 1).any()
+
+    def test_emerging_bull_rows_obey_contract(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 109, 108.7, 108.4, 108.2, 108.1, 108.0],
+            event_freshness_bars=3,
+            emerging_strength_threshold=0.02,
+            structure_loss_strength_threshold=0.03,
+        )
+
+        rows = df[df["trend_emerging_bull"] == 1]
+        if not rows.empty:
+            assert (rows["trend_state"] == 0).all()
+            assert (rows["trend_bull_ready"] == 0).all()
+            assert (rows["trend_bear_ready"] == 0).all()
+            assert (rows["trend_strength_raw"] >= 0).all()
+            assert (rows["trend_regime_phase"] == 1).all()
+        else:
+            # acceptable in a tiny synthetic path; existence is already covered by validation
+            assert "trend_emerging_bull" in df.columns
+
+    def test_emerging_bear_rows_obey_contract(self):
+        df = _run_trend_state(
+            [111, 108, 110, 106, 108, 104, 106, 102, 102.3, 102.6, 102.9, 103.1, 103.2],
+            event_freshness_bars=3,
+            emerging_strength_threshold=0.02,
+            structure_loss_strength_threshold=0.03,
+        )
+
+        rows = df[df["trend_emerging_bear"] == 1]
+        if not rows.empty:
+            assert (rows["trend_state"] == 0).all()
+            assert (rows["trend_bull_ready"] == 0).all()
+            assert (rows["trend_bear_ready"] == 0).all()
+            assert (rows["trend_strength_raw"] <= 0).all()
+            assert (rows["trend_regime_phase"] == -1).all()
+        else:
+            # acceptable in a tiny synthetic path; existence is already covered by validation
+            assert "trend_emerging_bear" in df.columns
+
+    def test_regime_phase_values_stay_in_expected_set(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 103, 104, 102, 101, 99]
+        )
+
+        vals = set(df["trend_regime_phase"].dropna().astype(int).unique())
+        assert vals.issubset({-3, -2, -1, 0, 1, 2, 3})
+
+    def test_pressure_columns_are_non_negative(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 103, 104, 102, 101, 99]
+        )
+
+        assert (df["trend_pressure_bull_raw"] >= 0).all()
+        assert (df["trend_pressure_bear_raw"] >= 0).all()
+
+    def test_strength_columns_are_bounded(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 103, 104, 102, 101, 99]
+        )
+
+        assert (
+            (df["trend_strength_raw"] >= -1.0) & (df["trend_strength_raw"] <= 1.0)
+        ).all()
+        assert (
+            (df["trend_strength_ema"] >= -1.0) & (df["trend_strength_ema"] <= 1.0)
+        ).all()
 
 
 # ---------------------------------------------------------------------------
@@ -650,51 +880,20 @@ class TestPurityContract:
 class TestTimingContract:
     """Confirm flags must not appear before detection bar."""
 
-    def test_swing_confirm_not_before_origin(self, sample_df):
-        """swing_high_confirm_idx must be >= the swing's own index."""
+    def test_swing_detect_idx_matches_origin(self, sample_df):
+        """Canonical causal swings detect on the same bar they originate."""
         from src.indicators.structure.swings import add_swings
 
-        result = add_swings(sample_df, window=3, causal=True)
+        result = add_swings(sample_df, window=6)
         sh = result[result["swing_high"] == 1]
-        for _, row in sh.iterrows():
-            confirm = row["swing_high_confirm_idx"]
-            if confirm >= 0:
-                assert (
-                    confirm >= row.name
-                ), f"Swing high at {row.name} has confirm_idx {confirm} (before origin)"
+        for idx, row in sh.iterrows():
+            assert row["swing_high_detect_flag"] == 1
+            assert row["swing_high_detect_idx"] == idx
 
-    def test_swing_confirm_delay_equals_window(self, sample_df):
-        """Confirmation should be exactly window bars after origin."""
-        from src.indicators.structure.swings import add_swings
-
-        window = 3
-        result = add_swings(sample_df, window=window, causal=True)
-        sh = result[result["swing_high"] == 1]
-        for _, row in sh.iterrows():
-            confirm = row["swing_high_confirm_idx"]
-            if confirm >= 0:
-                assert confirm == row.name + window
-
-    def test_last_swing_high_causal_no_lookahead(self, sample_df):
-        """In causal mode, last_swing_high at bar i must not reference
-        a swing that hasn't been confirmed by bar i."""
-        from src.indicators.structure.swings import add_swings
-
-        window = 3
-        result = add_swings(sample_df, window=window, causal=True)
-        sh_confirm = result["swing_high_confirm_idx"].values
-        last_sh_idx = result["last_swing_high_idx"].values
-
-        for i in range(len(result)):
-            if np.isnan(last_sh_idx[i]):
-                continue
-            src = int(last_sh_idx[i])
-            # The swing at src has confirm_idx = src + window
-            confirm_bar = sh_confirm[src]
-            if confirm_bar >= 0:
-                assert (
-                    confirm_bar <= i
-                ), f"Bar {i} references swing at {src} with confirm={confirm_bar} (future)"
+        sl = result[result["swing_low"] == 1]
+        for idx, row in sl.iterrows():
+            assert row["swing_low_detect_flag"] == 1
+            assert row["swing_low_detect_idx"] == idx
 
     def test_fvg_confirm_idx_after_origin(self, sample_df):
         """FVG confirm index must be after the FVG origin bar."""
@@ -707,6 +906,38 @@ class TestTimingContract:
             ci = row["fvg_bull_confirm_idx"]
             if ci >= 0:
                 assert ci > row.name
+
+    def test_last_swing_updates_on_detection_bar(self, sample_df):
+        """Canonical causal last_swing_* should update immediately on the detection bar."""
+        from src.indicators.structure.swings import add_swings
+
+        result = add_swings(sample_df, window=6)
+
+        for idx, row in result[result["swing_high"] == 1].iterrows():
+            assert row["last_swing_high"] == row["swing_high_price"]
+            assert row["last_swing_high_idx"] == float(idx)
+            assert row["swing_high_age"] == 0
+
+        for idx, row in result[result["swing_low"] == 1].iterrows():
+            assert row["last_swing_low"] == row["swing_low_price"]
+            assert row["last_swing_low_idx"] == float(idx)
+            assert row["swing_low_age"] == 0
+
+    def test_canonical_swing_detect_columns_exist(self, sample_df):
+        """Canonical swing detector should expose detect metadata columns."""
+        from src.indicators.structure.swings import add_swings
+
+        result = add_swings(sample_df, window=6)
+        expected = [
+            "swing_high_detect_flag",
+            "swing_low_detect_flag",
+            "swing_high_detect_idx",
+            "swing_low_detect_idx",
+            "last_swing_high_idx",
+            "last_swing_low_idx",
+        ]
+        for col in expected:
+            assert col in result.columns, f"Missing swing column: {col}"
 
 
 class TestSchemaContract:

@@ -3,7 +3,7 @@ pipelines/build_live.py
 
 Live indicator pipeline — causal only, no look-ahead, no labels.
 
-Uses ``add_swings_causal()`` (not symmetric) to ensure all features
+Uses the causal ``add_swings`` (not symmetric) to ensure all features
 are point-in-time safe. Never calls retrospective labeling functions.
 
 For research/backtesting, use ``build_research.py`` instead.
@@ -41,7 +41,7 @@ from src.indicators.foundation.session import add_session_classifier, add_time_f
 from src.indicators.foundation.regime import add_regime
 
 # --- Structure ---
-from src.indicators.structure.swings import add_swings_causal
+from src.indicators.structure.swings import add_swings
 from src.indicators.structure.trend_state import add_trend_state
 from src.indicators.structure.bos import add_bos
 from src.indicators.structure.choch import add_choch
@@ -67,7 +67,7 @@ def build_live_indicators(
     """Apply the causal-only indicator stack for live deployment.
 
     Key differences from ``build_research_indicators``:
-    - Always uses ``add_swings_causal()`` — no symmetric look-ahead.
+    - Always uses causal ``add_swings()`` — no symmetric look-ahead.
     - Never calls ``add_amd_labels`` or any retrospective function.
     - No ``include_avwap`` option — AVWAP is computed per-signal by the scanner.
 
@@ -102,7 +102,7 @@ def build_live_indicators(
     out = add_body_ratio(out)
 
     # === Layer 2: Structure (causal only) ===
-    out = add_swings_causal(out, window=swing_window)
+    out = add_swings(out, window=swing_window)
     out = add_trend_state(out)
     out = add_bos(out)
     out = add_choch(out)
