@@ -303,6 +303,57 @@ class TestTrend:
         assert "bos_direction" in result.columns
         assert_binary_column(result, "bos_bull")
 
+    def test_add_bos_emits_research_grade_quality_columns(self):
+        from src.indicators.foundation.volatility import add_atr
+        from src.indicators.structure.swings import add_swings
+        from src.indicators.structure.trend_state import add_trend_state
+        from src.indicators.structure.bos import add_bos
+
+        df = _make_ohlc_from_close(
+            [100, 104, 101, 106, 103, 108, 104, 110, 105, 111, 103, 99, 102, 97]
+        )
+        original = df.copy(deep=True)
+
+        result = add_atr(df, period=3)
+        result = add_swings(
+            result,
+            window=2,
+            atr_length=3,
+            min_retrace_atr=0.0,
+            min_confirm_bars=1,
+        )
+        result = add_trend_state(result, atr_length=3, event_freshness_bars=6)
+        result = add_bos(result, atr_length=3, min_source_age_bars=1)
+
+        pd.testing.assert_frame_equal(df, original)
+
+        expected = {
+            "bos_candle_range_atr",
+            "bos_upper_wick_atr",
+            "bos_lower_wick_atr",
+            "bos_body_to_range",
+            "bos_close_location",
+            "bos_gap_from_level_atr",
+            "bos_displacement_score",
+            "bos_source_prominence_atr",
+            "bos_source_fresh",
+            "bos_source_stale",
+            "bos_source_rank",
+            "bos_source_in_trend_direction",
+        }
+        assert expected.issubset(result.columns)
+
+        event_rows = result[(result["bos_bull"] == 1) | (result["bos_bear"] == 1)]
+        assert not event_rows.empty
+        assert event_rows["bos_body_to_range"].between(0, 1).all()
+        assert event_rows["bos_close_location"].between(0, 1).all()
+        assert (event_rows["bos_displacement_score"] > 0).all()
+        assert event_rows["bos_source_rank"].between(1, 10).all()
+        assert (
+            event_rows["bos_source_fresh"].astype(bool)
+            & event_rows["bos_source_stale"].astype(bool)
+        ).sum() == 0
+
     def test_add_choch(self, sample_df):
         from src.indicators.structure.swings import add_swings
         from src.indicators.structure.trend_state import add_trend_state
@@ -315,6 +366,190 @@ class TestTrend:
         result = add_choch(result)
         assert "choch_bull" in result.columns
         assert "choch_bear" in result.columns
+
+    def test_add_choch_emits_canonical_transition_schema(self):
+        from src.indicators.foundation.volatility import add_atr
+        from src.indicators.structure.swings import add_swings
+        from src.indicators.structure.trend_state import add_trend_state
+        from src.indicators.structure.bos import add_bos
+        from src.indicators.structure.choch import add_choch
+
+        df = _make_ohlc_from_close(
+            [111, 108, 110, 106, 108, 104, 106, 102, 104, 100, 103, 107, 105, 109]
+        )
+        original = df.copy(deep=True)
+
+        result = add_atr(df, period=3)
+        result = add_swings(
+            result,
+            window=2,
+            atr_length=3,
+            min_retrace_atr=0.0,
+            min_confirm_bars=1,
+        )
+        result = add_trend_state(result, atr_length=3, event_freshness_bars=6)
+        result = add_bos(result, atr_length=3, min_source_age_bars=1)
+        result = add_choch(result, atr_length=3, min_source_age_bars=1)
+
+        pd.testing.assert_frame_equal(df, original)
+
+        expected = {
+            "choch_bull",
+            "choch_bear",
+            "choch_direction",
+            "choch_event_id",
+            "choch_source_side",
+            "choch_source_idx",
+            "choch_source_price",
+            "choch_level",
+            "choch_close_break_bull",
+            "choch_close_break_bear",
+            "choch_wick_break_bull",
+            "choch_wick_break_bear",
+            "choch_raw_candidate_bull",
+            "choch_raw_candidate_bear",
+            "choch_pass_source_age_bull",
+            "choch_pass_source_age_bear",
+            "choch_pass_break_distance_bull",
+            "choch_pass_break_distance_bear",
+            "choch_pass_body_bull",
+            "choch_pass_body_bear",
+            "choch_pass_source_strength_bull",
+            "choch_pass_source_strength_bear",
+            "choch_pass_trend_bull",
+            "choch_pass_trend_bear",
+            "choch_break_distance",
+            "choch_break_distance_atr",
+            "choch_candle_body_atr",
+            "choch_candle_range_atr",
+            "choch_upper_wick_atr",
+            "choch_lower_wick_atr",
+            "choch_body_to_range",
+            "choch_close_location",
+            "choch_gap_from_level_atr",
+            "choch_displacement_score",
+            "choch_trend_state_from",
+            "choch_trend_state_to",
+            "choch_bias_state_from",
+            "choch_bias_state_to",
+            "choch_against_prev_trend",
+            "choch_after_structure_loss",
+        }
+        assert expected.issubset(result.columns)
+
+        event_rows = result[(result["choch_bull"] == 1) | (result["choch_bear"] == 1)]
+        assert len(event_rows) == 1
+        event = event_rows.iloc[0]
+
+        assert event["choch_direction"] == 1
+        assert event["choch_trend_state_from"] == -1
+        assert event["choch_trend_state_to"] == 1
+        assert event["choch_bias_state_from"] == -1
+        assert event["choch_bias_state_to"] == 1
+        assert event["choch_against_prev_trend"] == 1
+        assert 0 <= event["choch_body_to_range"] <= 1
+        assert 0 <= event["choch_close_location"] <= 1
+        assert event["choch_displacement_score"] > 0
+
+    def test_default_bos_is_continuation_only_and_excludes_choch_reversal(self):
+        from src.indicators.foundation.volatility import add_atr
+        from src.indicators.structure.swings import add_swings
+        from src.indicators.structure.trend_state import add_trend_state
+        from src.indicators.structure.bos import add_bos
+        from src.indicators.structure.choch import add_choch
+
+        df = _make_ohlc_from_close(
+            [100, 103, 101, 105, 103, 107, 105, 109, 107, 111, 108, 104, 106, 102]
+        )
+
+        result = add_atr(df, period=3)
+        result = add_swings(
+            result,
+            window=2,
+            atr_length=3,
+            min_retrace_atr=0.0,
+            min_confirm_bars=1,
+        )
+        result = add_trend_state(result, atr_length=3, event_freshness_bars=6)
+        result = add_bos(result, atr_length=3, min_source_age_bars=1)
+        result = add_choch(result, atr_length=3, min_source_age_bars=1)
+
+        choch_rows = result[result["choch_bear"] == 1]
+        assert len(choch_rows) == 1
+
+        choch_idx = choch_rows.index[0]
+        assert result.loc[choch_idx, "bos_bear"] == 0
+        assert result.loc[choch_idx, "bos_bull"] == 0
+
+    def test_validate_structure_context_outputs_summary_and_html(self, tmp_path):
+        from src.indicators.foundation.volatility import add_atr
+        from src.indicators.structure.swings import add_swings
+        from src.indicators.structure.trend_state import add_trend_state
+        from src.indicators.structure.bos import add_bos
+        from src.indicators.structure.choch import add_choch
+        from src.validation.indicators.structure_context import (
+            validate_structure_context,
+        )
+
+        df = _make_ohlc_from_close(
+            [111, 108, 110, 106, 108, 104, 106, 102, 104, 100, 103, 107, 105, 109]
+        )
+        df = add_atr(df, period=3)
+        df = add_swings(
+            df,
+            window=2,
+            atr_length=3,
+            min_retrace_atr=0.0,
+            min_confirm_bars=1,
+        )
+        df = add_trend_state(df, atr_length=3, event_freshness_bars=6)
+        df = add_bos(df, atr_length=3, min_source_age_bars=1)
+        df = add_choch(df, atr_length=3, min_source_age_bars=1)
+
+        result = validate_structure_context(
+            df,
+            outpath=tmp_path / "structure_context_test.html",
+            title="Structure Context Test",
+        )
+
+        assert result["summary"]["event_counts"]["choch_count"] >= 1
+        assert result["summary"]["event_counts"]["same_bar_overlap"] == 0
+        assert result["html_path"].exists()
+
+    def test_validate_choch_outputs_summary_windows_and_html(self, tmp_path):
+        from src.indicators.foundation.volatility import add_atr
+        from src.indicators.structure.swings import add_swings
+        from src.indicators.structure.trend_state import add_trend_state
+        from src.indicators.structure.bos import add_bos
+        from src.indicators.structure.choch import add_choch
+        from src.validation.indicators.choch import validate_choch
+
+        df = _make_ohlc_from_close(
+            [111, 108, 110, 106, 108, 104, 106, 102, 104, 100, 103, 107, 105, 109]
+        )
+        df = add_atr(df, period=3)
+        df = add_swings(
+            df,
+            window=2,
+            atr_length=3,
+            min_retrace_atr=0.0,
+            min_confirm_bars=1,
+        )
+        df = add_trend_state(df, atr_length=3, event_freshness_bars=6)
+        df = add_bos(df, atr_length=3, min_source_age_bars=1)
+        df = add_choch(df, atr_length=3, min_source_age_bars=1)
+
+        result = validate_choch(
+            df,
+            outpath=tmp_path / "choch_validation_test.html",
+            title="CHoCH Validation Test",
+            n_windows=3,
+        )
+
+        assert result["summary"]["event_counts"]["choch_count"] >= 1
+        assert result["summary"]["sanity_checks"]["displacement_score_positive"] is True
+        assert len(result["bull_windows"]) >= 1
+        assert result["html_path"].exists()
 
 
 class TestTrendStateBehavior:
@@ -479,6 +714,631 @@ class TestTrendStateBehavior:
         ).all()
 
 
+class TestBOSContext:
+    @staticmethod
+    def _make_context_df() -> pd.DataFrame:
+        n = 12
+        ts = pd.date_range("2026-01-01", periods=n, freq="4h", tz="UTC")
+        close = np.array(
+            [
+                99.6,
+                99.9,
+                100.2,
+                100.6,
+                101.0,
+                100.8,
+                101.2,
+                100.3,
+                99.2,
+                99.0,
+                100.1,
+                99.4,
+            ],
+            dtype=float,
+        )
+        open_ = np.array(
+            [
+                99.4,
+                99.7,
+                100.0,
+                100.4,
+                100.7,
+                100.9,
+                100.9,
+                100.7,
+                99.6,
+                99.4,
+                99.7,
+                99.7,
+            ],
+            dtype=float,
+        )
+        high = np.array(
+            [
+                99.8,
+                100.1,
+                100.4,
+                100.8,
+                101.2,
+                101.4,
+                101.5,
+                100.9,
+                99.7,
+                100.0,
+                100.2,
+                99.8,
+            ],
+            dtype=float,
+        )
+        low = np.array(
+            [
+                99.2,
+                99.5,
+                99.8,
+                100.2,
+                100.4,
+                100.4,
+                100.7,
+                100.0,
+                99.0,
+                98.6,
+                99.6,
+                99.1,
+            ],
+            dtype=float,
+        )
+
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "atr_14": np.full(n, 1.0),
+                "bos_bull": np.zeros(n, dtype=int),
+                "bos_bear": np.zeros(n, dtype=int),
+                "bos_direction": np.zeros(n, dtype=int),
+                "bos_level": np.full(n, np.nan),
+                "bos_break_distance_atr": np.full(n, np.nan),
+                "bos_candle_body_atr": np.full(n, np.nan),
+                "bos_body_to_range": np.full(n, np.nan),
+                "bos_displacement_score": np.full(n, np.nan),
+                "bos_source_strength": np.full(n, np.nan),
+                "bos_source_prominence_atr": np.full(n, np.nan),
+                "bos_source_age": np.full(n, np.nan),
+                "trend_state": np.zeros(n, dtype=int),
+                "trend_bias_state": np.zeros(n, dtype=int),
+                "wedge_active": np.zeros(n, dtype=int),
+                "wedge_kind": np.zeros(n, dtype=int),
+                "wedge_breakout_idx": np.full(n, np.nan),
+                "sweep_high": np.zeros(n, dtype=int),
+                "sweep_low": np.zeros(n, dtype=int),
+                "displacement_candle": np.zeros(n, dtype=int),
+                "displacement_direction": np.zeros(n, dtype=int),
+                "fvg_bull": np.zeros(n, dtype=int),
+                "fvg_bear": np.zeros(n, dtype=int),
+                "fvg_bull_low": np.full(n, np.nan),
+                "fvg_bull_high": np.full(n, np.nan),
+                "fvg_bear_low": np.full(n, np.nan),
+                "fvg_bear_high": np.full(n, np.nan),
+                "ob_bull": np.zeros(n, dtype=int),
+                "ob_bear": np.zeros(n, dtype=int),
+                "ob_bull_low": np.full(n, np.nan),
+                "ob_bull_high": np.full(n, np.nan),
+                "ob_bear_low": np.full(n, np.nan),
+                "ob_bear_high": np.full(n, np.nan),
+                "equal_highs_level": np.full(n, np.nan),
+                "equal_highs_active": np.zeros(n, dtype=int),
+                "equal_highs_cluster_id": np.full(n, np.nan),
+                "equal_lows_level": np.full(n, np.nan),
+                "equal_lows_active": np.zeros(n, dtype=int),
+                "equal_lows_cluster_id": np.full(n, np.nan),
+                "prev_day_high": np.full(n, np.nan),
+                "prev_day_low": np.full(n, np.nan),
+                "prev_week_high": np.full(n, np.nan),
+                "prev_week_low": np.full(n, np.nan),
+                "asian_high": np.full(n, np.nan),
+                "asian_low": np.full(n, np.nan),
+                "vp_vah": np.full(n, np.nan),
+                "vp_val": np.full(n, np.nan),
+            }
+        )
+
+        df.loc[4, ["bos_bull", "bos_direction", "bos_level"]] = [1, 1, 100.5]
+        df.loc[8, ["bos_bear", "bos_direction", "bos_level"]] = [1, -1, 100.0]
+
+        df.loc[
+            4, ["bos_break_distance_atr", "bos_candle_body_atr", "bos_body_to_range"]
+        ] = [
+            0.7,
+            0.8,
+            0.7,
+        ]
+        df.loc[
+            4,
+            [
+                "bos_displacement_score",
+                "bos_source_strength",
+                "bos_source_prominence_atr",
+                "bos_source_age",
+            ],
+        ] = [
+            0.4,
+            2.4,
+            1.5,
+            5.0,
+        ]
+        df.loc[
+            8, ["bos_break_distance_atr", "bos_candle_body_atr", "bos_body_to_range"]
+        ] = [
+            0.6,
+            0.7,
+            0.6,
+        ]
+        df.loc[
+            8,
+            [
+                "bos_displacement_score",
+                "bos_source_strength",
+                "bos_source_prominence_atr",
+                "bos_source_age",
+            ],
+        ] = [
+            0.35,
+            1.8,
+            1.2,
+            8.0,
+        ]
+
+        df.loc[4, ["trend_state", "trend_bias_state", "wedge_active", "wedge_kind"]] = [
+            1,
+            1,
+            1,
+            1,
+        ]
+        df.loc[8, ["trend_state", "trend_bias_state"]] = [-1, -1]
+        df.loc[7, "wedge_breakout_idx"] = 7
+        df.loc[7, "wedge_kind"] = -1
+
+        df.loc[2, "sweep_low"] = 1
+        df.loc[7, "sweep_high"] = 1
+
+        df.loc[3, ["displacement_candle", "displacement_direction"]] = [1, 1]
+        df.loc[7, ["displacement_candle", "displacement_direction"]] = [1, -1]
+
+        df.loc[3, ["fvg_bull", "fvg_bull_low", "fvg_bull_high"]] = [1, 100.7, 101.1]
+        df.loc[7, ["fvg_bear", "fvg_bear_low", "fvg_bear_high"]] = [1, 99.1, 99.5]
+
+        df.loc[4, ["ob_bull", "ob_bull_low", "ob_bull_high"]] = [1, 100.8, 101.1]
+        df.loc[8, ["ob_bear", "ob_bear_low", "ob_bear_high"]] = [1, 99.0, 99.4]
+
+        df.loc[
+            3, ["equal_highs_level", "equal_highs_active", "equal_highs_cluster_id"]
+        ] = [
+            101.2,
+            1,
+            11,
+        ]
+        df.loc[
+            7, ["equal_lows_level", "equal_lows_active", "equal_lows_cluster_id"]
+        ] = [
+            99.0,
+            1,
+            21,
+        ]
+
+        df.loc[4, ["prev_day_high", "asian_high", "vp_vah"]] = [101.1, 101.25, 101.4]
+        df.loc[8, ["prev_day_low", "asian_low", "vp_val"]] = [99.1, 99.0, 98.9]
+
+        return df
+
+    def test_add_bos_context_research_mode_schema_and_contract(self):
+        from src.indicators.features.bos_context import (
+            RESEARCH_BOS_CONTEXT_COLUMNS,
+            add_bos_context,
+        )
+
+        df = self._make_context_df()
+        original = df.copy(deep=True)
+
+        result = add_bos_context(df, include_forward_diagnostics=True)
+
+        pd.testing.assert_frame_equal(df, original)
+        assert set(RESEARCH_BOS_CONTEXT_COLUMNS).issubset(result.columns)
+
+        non_event_mask = result["bos_direction"] == 0
+        assert (
+            result.loc[non_event_mask, RESEARCH_BOS_CONTEXT_COLUMNS].isna().all().all()
+        )
+
+        event_rows = result[result["bos_direction"] != 0]
+        assert len(event_rows) == 2
+        assert (
+            (event_rows["bos_quality_score"] >= 0)
+            & (event_rows["bos_quality_score"] <= 1)
+        ).all()
+        assert (
+            (event_rows["bos_tradeable_score"] >= 0)
+            & (event_rows["bos_tradeable_score"] <= 1)
+        ).all()
+
+    def test_add_bos_context_forward_diagnostics_follow_spec(self):
+        from src.indicators.features.bos_context import add_bos_context
+
+        result = add_bos_context(
+            self._make_context_df(), include_forward_diagnostics=True
+        )
+
+        bull_event = result[result["bos_bull"] == 1].iloc[0]
+        bear_event = result[result["bos_bear"] == 1].iloc[0]
+
+        assert bull_event["bos_after_sweep"] == 1
+        assert bull_event["bos_after_displacement"] == 1
+        assert bull_event["bos_after_fvg"] == 1
+        assert bull_event["bos_near_wedge"] == 1
+        assert bull_event["bos_into_ob"] == 1
+        assert bull_event["bos_into_fvg"] == 1
+        assert bull_event["bos_near_eqhl"] == 1
+        assert bull_event["bos_near_liquidity"] == 1
+        assert bull_event["bos_hold_1"] == 1
+        assert bull_event["bos_hold_2"] == 1
+        assert bull_event["bos_hold_3"] == 0
+        assert bull_event["bos_failed_3"] == 1
+        assert bull_event["bos_retest_1"] == 1
+
+        assert bear_event["bos_after_sweep"] == 1
+        assert bear_event["bos_after_displacement"] == 1
+        assert bear_event["bos_after_fvg"] == 1
+        assert bear_event["bos_hold_1"] == 1
+        assert bear_event["bos_hold_2"] == 0
+        assert bear_event["bos_failed_2"] == 1
+        assert bear_event["bos_retest_1"] == 1
+        assert bear_event["bos_mfe_3_atr"] >= 0
+        assert bear_event["bos_mae_3_atr"] >= 0
+
+    def test_add_bos_context_live_mode_omits_forward_columns(self):
+        from src.indicators.features.bos_context import (
+            EXCURSION_COLUMNS,
+            FOLLOW_THROUGH_COLUMNS,
+            LIVE_BOS_CONTEXT_COLUMNS,
+            add_bos_context,
+        )
+
+        result = add_bos_context(
+            self._make_context_df(), include_forward_diagnostics=False
+        )
+
+        assert set(LIVE_BOS_CONTEXT_COLUMNS).issubset(result.columns)
+        for col in FOLLOW_THROUGH_COLUMNS + EXCURSION_COLUMNS:
+            assert col not in result.columns
+
+    def test_validate_bos_context_outputs_summary_and_html(self, tmp_path):
+        from src.indicators.features.bos_context import add_bos_context
+        from src.validation.indicators.bos_context import validate_bos_context
+
+        df = add_bos_context(
+            self._make_context_df(),
+            include_forward_diagnostics=True,
+        )
+
+        result = validate_bos_context(
+            df,
+            outpath=tmp_path / "bos_context_validation_test.html",
+            title="BOS Context Validation Test",
+        )
+
+        assert result["summary"]["event_counts"]["bos_count"] == 2
+        assert (
+            result["summary"]["sanity_checks"]["quality_score_in_unit_interval"] is True
+        )
+        assert (
+            result["summary"]["sanity_checks"]["tradeable_score_in_unit_interval"]
+            is True
+        )
+        assert result["html_path"].exists()
+
+
+class TestCHOCHContext:
+    @staticmethod
+    def _make_context_df() -> pd.DataFrame:
+        n = 12
+        ts = pd.date_range("2026-01-01", periods=n, freq="4h", tz="UTC")
+        close = np.array(
+            [
+                100.4,
+                100.1,
+                99.8,
+                100.0,
+                100.9,
+                100.7,
+                100.2,
+                99.6,
+                98.9,
+                99.2,
+                100.2,
+                100.5,
+            ],
+            dtype=float,
+        )
+        open_ = np.array(
+            [
+                100.6,
+                100.3,
+                100.0,
+                99.8,
+                100.2,
+                100.9,
+                100.6,
+                100.0,
+                99.4,
+                99.0,
+                99.6,
+                100.2,
+            ],
+            dtype=float,
+        )
+        high = np.array(
+            [
+                100.8,
+                100.5,
+                100.2,
+                100.4,
+                101.1,
+                101.0,
+                100.8,
+                100.2,
+                99.7,
+                99.5,
+                100.4,
+                100.8,
+            ],
+            dtype=float,
+        )
+        low = np.array(
+            [
+                100.1,
+                99.9,
+                99.5,
+                99.6,
+                99.9,
+                99.9,
+                99.8,
+                99.4,
+                98.7,
+                98.8,
+                99.2,
+                99.9,
+            ],
+            dtype=float,
+        )
+
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "atr_14": np.full(n, 1.0),
+                "choch_bull": np.zeros(n, dtype=int),
+                "choch_bear": np.zeros(n, dtype=int),
+                "choch_direction": np.zeros(n, dtype=int),
+                "choch_level": np.full(n, np.nan),
+                "choch_break_distance_atr": np.full(n, np.nan),
+                "choch_candle_body_atr": np.full(n, np.nan),
+                "choch_body_to_range": np.full(n, np.nan),
+                "choch_displacement_score": np.full(n, np.nan),
+                "choch_trend_state_from": np.full(n, np.nan),
+                "choch_bias_state_from": np.full(n, np.nan),
+                "choch_against_prev_trend": np.zeros(n, dtype=int),
+                "choch_after_structure_loss": np.zeros(n, dtype=int),
+                "trend_state": np.zeros(n, dtype=int),
+                "trend_bias_state": np.zeros(n, dtype=int),
+                "wedge_active": np.zeros(n, dtype=int),
+                "wedge_kind": np.zeros(n, dtype=int),
+                "wedge_breakout_dir": np.zeros(n, dtype=int),
+                "sweep_high": np.zeros(n, dtype=int),
+                "sweep_low": np.zeros(n, dtype=int),
+                "displacement_candle": np.zeros(n, dtype=int),
+                "displacement_direction": np.zeros(n, dtype=int),
+                "fvg_bull": np.zeros(n, dtype=int),
+                "fvg_bear": np.zeros(n, dtype=int),
+                "fvg_bull_low": np.full(n, np.nan),
+                "fvg_bull_high": np.full(n, np.nan),
+                "fvg_bear_low": np.full(n, np.nan),
+                "fvg_bear_high": np.full(n, np.nan),
+                "ob_bull": np.zeros(n, dtype=int),
+                "ob_bear": np.zeros(n, dtype=int),
+                "ob_bull_low": np.full(n, np.nan),
+                "ob_bull_high": np.full(n, np.nan),
+                "ob_bear_low": np.full(n, np.nan),
+                "ob_bear_high": np.full(n, np.nan),
+            }
+        )
+
+        df.loc[4, ["choch_bull", "choch_direction", "choch_level"]] = [1, 1, 100.0]
+        df.loc[8, ["choch_bear", "choch_direction", "choch_level"]] = [1, -1, 99.2]
+
+        df.loc[
+            4,
+            [
+                "choch_break_distance_atr",
+                "choch_candle_body_atr",
+                "choch_body_to_range",
+            ],
+        ] = [0.8, 0.7, 0.65]
+        df.loc[
+            4,
+            [
+                "choch_displacement_score",
+                "choch_trend_state_from",
+                "choch_bias_state_from",
+            ],
+        ] = [0.42, -1, -1]
+        df.loc[
+            4,
+            [
+                "choch_against_prev_trend",
+                "choch_after_structure_loss",
+                "trend_state",
+                "trend_bias_state",
+            ],
+        ] = [1, 1, -1, -1]
+
+        df.loc[
+            8,
+            [
+                "choch_break_distance_atr",
+                "choch_candle_body_atr",
+                "choch_body_to_range",
+            ],
+        ] = [0.7, 0.8, 0.60]
+        df.loc[
+            8,
+            [
+                "choch_displacement_score",
+                "choch_trend_state_from",
+                "choch_bias_state_from",
+            ],
+        ] = [0.38, 1, 0]
+        df.loc[
+            8,
+            [
+                "choch_against_prev_trend",
+                "choch_after_structure_loss",
+                "trend_state",
+                "trend_bias_state",
+            ],
+        ] = [1, 0, 1, 0]
+
+        df.loc[2, "sweep_low"] = 1
+        df.loc[7, "sweep_high"] = 1
+
+        df.loc[3, ["displacement_candle", "displacement_direction"]] = [1, 1]
+        df.loc[7, ["displacement_candle", "displacement_direction"]] = [1, -1]
+
+        df.loc[3, ["wedge_active", "wedge_kind", "wedge_breakout_dir"]] = [1, -1, 1]
+        df.loc[7, ["wedge_active", "wedge_kind", "wedge_breakout_dir"]] = [1, 1, -1]
+
+        df.loc[3, ["fvg_bull", "fvg_bull_low", "fvg_bull_high"]] = [1, 100.8, 101.1]
+        df.loc[7, ["fvg_bear", "fvg_bear_low", "fvg_bear_high"]] = [1, 98.8, 99.1]
+
+        df.loc[4, ["ob_bull", "ob_bull_low", "ob_bull_high"]] = [1, 100.8, 101.0]
+        df.loc[8, ["ob_bear", "ob_bear_low", "ob_bear_high"]] = [1, 98.8, 99.1]
+
+        return df
+
+    def test_add_choch_context_research_mode_schema_and_contract(self):
+        from src.indicators.features.choch_context import (
+            RESEARCH_CHOCH_CONTEXT_COLUMNS,
+            add_choch_context,
+        )
+
+        df = self._make_context_df()
+        original = df.copy(deep=True)
+
+        result = add_choch_context(df, include_forward_diagnostics=True)
+
+        pd.testing.assert_frame_equal(df, original)
+        assert set(RESEARCH_CHOCH_CONTEXT_COLUMNS).issubset(result.columns)
+
+        non_event_mask = result["choch_direction"] == 0
+        assert (
+            result.loc[non_event_mask, RESEARCH_CHOCH_CONTEXT_COLUMNS]
+            .isna()
+            .all()
+            .all()
+        )
+
+        event_rows = result[result["choch_direction"] != 0]
+        assert len(event_rows) == 2
+        assert (
+            (event_rows["choch_quality_score"] >= 0)
+            & (event_rows["choch_quality_score"] <= 1)
+        ).all()
+        assert (
+            (event_rows["choch_tradeable_score"] >= 0)
+            & (event_rows["choch_tradeable_score"] <= 1)
+        ).all()
+
+    def test_add_choch_context_forward_diagnostics_follow_spec(self):
+        from src.indicators.features.choch_context import add_choch_context
+
+        result = add_choch_context(
+            self._make_context_df(), include_forward_diagnostics=True
+        )
+
+        bull_event = result[result["choch_bull"] == 1].iloc[0]
+        bear_event = result[result["choch_bear"] == 1].iloc[0]
+
+        assert bull_event["choch_reversal_alignment"] == 1
+        assert bull_event["choch_after_sweep"] == 1
+        assert bull_event["choch_after_wedge"] == 1
+        assert bull_event["choch_after_displacement"] == 1
+        assert bull_event["choch_into_fvg"] == 1
+        assert bull_event["choch_into_ob"] == 1
+        assert bull_event["choch_hold_1"] == 1
+        assert bull_event["choch_hold_2"] == 1
+        assert bull_event["choch_hold_3"] == 0
+        assert bull_event["choch_failed_3"] == 1
+        assert bull_event["choch_retest_1"] == 1
+
+        assert bear_event["choch_reversal_alignment"] == 0
+        assert bear_event["choch_after_sweep"] == 1
+        assert bear_event["choch_after_wedge"] == 1
+        assert bear_event["choch_after_displacement"] == 1
+        assert bear_event["choch_into_fvg"] == 1
+        assert bear_event["choch_into_ob"] == 1
+        assert bear_event["choch_hold_1"] == 1
+        assert bear_event["choch_hold_2"] == 0
+        assert bear_event["choch_failed_2"] == 1
+        assert bear_event["choch_retest_1"] == 1
+        assert bear_event["choch_mfe_3_atr"] >= 0
+        assert bear_event["choch_mae_3_atr"] >= 0
+
+    def test_add_choch_context_live_mode_omits_forward_columns(self):
+        from src.indicators.features.choch_context import (
+            EXCURSION_COLUMNS,
+            FOLLOW_THROUGH_COLUMNS,
+            LIVE_CHOCH_CONTEXT_COLUMNS,
+            add_choch_context,
+        )
+
+        result = add_choch_context(
+            self._make_context_df(), include_forward_diagnostics=False
+        )
+
+        assert set(LIVE_CHOCH_CONTEXT_COLUMNS).issubset(result.columns)
+        for col in FOLLOW_THROUGH_COLUMNS + EXCURSION_COLUMNS:
+            assert col not in result.columns
+
+    def test_validate_choch_context_outputs_summary_and_html(self, tmp_path):
+        from src.indicators.features.choch_context import add_choch_context
+        from src.validation.indicators.choch_context import validate_choch_context
+
+        df = add_choch_context(
+            self._make_context_df(),
+            include_forward_diagnostics=True,
+        )
+
+        result = validate_choch_context(
+            df,
+            outpath=tmp_path / "choch_context_validation_test.html",
+            title="CHoCH Context Validation Test",
+        )
+
+        assert result["summary"]["event_counts"]["choch_count"] == 2
+        assert (
+            result["summary"]["sanity_checks"]["quality_score_in_unit_interval"] is True
+        )
+        assert (
+            result["summary"]["sanity_checks"]["tradeable_score_in_unit_interval"]
+            is True
+        )
+        assert result["html_path"].exists()
+
+
 # tests/test_indicators.py  (append this class)
 
 
@@ -507,6 +1367,8 @@ class TestBOS:
 
     @staticmethod
     def _run_bos_from_df(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        kwargs.setdefault("require_trend_alignment", False)
+        kwargs.setdefault("allow_neutral_trend_breaks", True)
         return add_bos(df, **kwargs)
 
     @staticmethod

@@ -34,3 +34,19 @@ A weakening structure should sometimes “bleed off” prior pressure faster.
 3. Positive carry from earlier strong swings is dominating small opposite evidence
 
 This can actually be logically correct in many cases, but sometimes visually it lingers too long.
+
+
+Revisit note:
+
+BOS context and CHoCH context are implemented early so the execution plan can continue, but they are NOT final research truth yet.
+
+After the full indicator suite is finalized, especially the remaining SMC detectors and foundation indicators, revisit:
+
+1. `src/indicators/features/bos_context.py`
+2. `src/indicators/features/choch_context.py`
+
+Reason:
+
+- some context columns depend on upstream detectors that are still provisional
+- context usefulness should be re-evaluated once the full suite is calibrated
+- scoring weights and proximity rules should be re-validated after final indicator refinement
