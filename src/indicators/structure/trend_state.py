@@ -1,6 +1,6 @@
-"""
-structure/trend_state.py
+# src/indicators/structure/trend_state.py
 
+"""
 Causal trend state engine built on canonical swing events.
 
 Separates:
@@ -54,28 +54,34 @@ def add_trend_state(
     emerging_strength_threshold: float = 0.12,
     structure_loss_strength_threshold: float = 0.08,
 ) -> pd.DataFrame:
-    """Build causal structural trend state from swing events."""
+    """Build causal structural trend state from swing confirmation events."""
     out = df.copy()
 
     require_columns(
         out,
         {
-            "swing_high",
-            "swing_low",
-            "swing_high_price",
-            "swing_low_price",
+            "swing_high_confirm_flag",
+            "swing_low_confirm_flag",
+            "swing_high_confirm_origin_idx",
+            "swing_low_confirm_origin_idx",
+            "swing_high_confirm_price",
+            "swing_low_confirm_price",
         },
     )
 
     n = len(out)
 
-    sh_flag = out["swing_high"].to_numpy(dtype=np.int8)
-    sl_flag = out["swing_low"].to_numpy(dtype=np.int8)
-    sh_price = out["swing_high_price"].to_numpy(dtype=float)
-    sl_price = out["swing_low_price"].to_numpy(dtype=float)
+    sh_flag = out["swing_high_confirm_flag"].to_numpy(dtype=np.int8)
+    sl_flag = out["swing_low_confirm_flag"].to_numpy(dtype=np.int8)
+
+    sh_price = out["swing_high_confirm_price"].to_numpy(dtype=float)
+    sl_price = out["swing_low_confirm_price"].to_numpy(dtype=float)
+
+    sh_origin_idx = out["swing_high_confirm_origin_idx"].to_numpy(dtype=float)
+    sl_origin_idx = out["swing_low_confirm_origin_idx"].to_numpy(dtype=float)
+
     atr = get_atr_array(out, atr_length)
 
-    # Optional quality inputs from swings.py
     sh_strength_src = (
         out["swing_high_strength"].to_numpy(dtype=float)
         if "swing_high_strength" in out.columns
@@ -115,8 +121,8 @@ def add_trend_state(
     lh_count = np.zeros(n, dtype=np.int16)
     ll_count = np.zeros(n, dtype=np.int16)
 
-    trend_event_high = np.zeros(n, dtype=np.int8)  # +1 HH / -1 LH
-    trend_event_low = np.zeros(n, dtype=np.int8)  # +1 HL / -1 LL
+    trend_event_high = np.zeros(n, dtype=np.int8)
+    trend_event_low = np.zeros(n, dtype=np.int8)
     trend_event = np.zeros(n, dtype=np.int8)
 
     trend_state_changed = np.zeros(n, dtype=np.int8)
@@ -143,20 +149,11 @@ def add_trend_state(
     trend_strength_event_score = np.zeros(n, dtype=float)
     trend_strength_event_dir = np.zeros(n, dtype=np.int8)
 
-    # Step 2: interpretability helpers
     trend_structure_loss_bull = np.zeros(n, dtype=np.int8)
     trend_structure_loss_bear = np.zeros(n, dtype=np.int8)
     trend_emerging_bull = np.zeros(n, dtype=np.int8)
     trend_emerging_bear = np.zeros(n, dtype=np.int8)
     trend_regime_phase = np.zeros(n, dtype=np.int8)
-    # phase:
-    # -2 = bear structure loss
-    # -1 = emerging bear
-    #  0 = neutral / none
-    # +1 = emerging bull
-    # +2 = bull structure loss
-    # +3 = strict bull
-    # -3 = strict bear
 
     prev_swing_high = np.nan
     prev_swing_low = np.nan
@@ -181,7 +178,7 @@ def add_trend_state(
 
     curr_bias = 0
     curr_bias_age = 0
-    curr_bias_mag = 0.0  # always non-negative magnitude
+    curr_bias_mag = 0.0
 
     inherited_bias_dir = 0
     inherited_bias_age = 0
@@ -215,14 +212,6 @@ def add_trend_state(
         fallback_move: float,
         atr_i: float,
     ) -> float:
-        """
-        Convert event magnitude into a bounded positive quality score.
-
-        Preference order:
-        1) swing strength from swings.py
-        2) prominence_atr from swings.py
-        3) fallback move / ATR from local structure comparison
-        """
         score = np.nan
 
         if np.isfinite(base_strength):
@@ -247,9 +236,7 @@ def add_trend_state(
         if np.isfinite(atr[i]) and atr[i] > 0:
             tol_i = max(equal_tol, equal_tol_atr_mult * atr[i])
 
-        # ---------------------------------------------------------
         # High-side structure: HH / LH
-        # ---------------------------------------------------------
         if sh_flag[i] == 1 and np.isfinite(sh_price[i]):
             rel = _cmp(sh_price[i], prev_swing_high, tol_i)
 
@@ -259,9 +246,13 @@ def add_trend_state(
                 else np.nan
             )
 
-            base_strength = sh_strength_src[i]
-            if not np.isfinite(base_strength):
-                base_strength = sh_prom_atr_src[i]
+            origin_idx = int(sh_origin_idx[i]) if np.isfinite(sh_origin_idx[i]) else -1
+
+            base_strength = np.nan
+            if 0 <= origin_idx < n:
+                base_strength = sh_strength_src[origin_idx]
+                if not np.isfinite(base_strength):
+                    base_strength = sh_prom_atr_src[origin_idx]
 
             event_mag = _bounded_strength_score(
                 base_strength=base_strength,
@@ -289,9 +280,7 @@ def add_trend_state(
 
             prev_swing_high = sh_price[i]
 
-        # ---------------------------------------------------------
         # Low-side structure: HL / LL
-        # ---------------------------------------------------------
         if sl_flag[i] == 1 and np.isfinite(sl_price[i]):
             rel = _cmp(sl_price[i], prev_swing_low, tol_i)
 
@@ -301,9 +290,13 @@ def add_trend_state(
                 else np.nan
             )
 
-            base_strength = sl_strength_src[i]
-            if not np.isfinite(base_strength):
-                base_strength = sl_prom_atr_src[i]
+            origin_idx = int(sl_origin_idx[i]) if np.isfinite(sl_origin_idx[i]) else -1
+
+            base_strength = np.nan
+            if 0 <= origin_idx < n:
+                base_strength = sl_strength_src[origin_idx]
+                if not np.isfinite(base_strength):
+                    base_strength = sl_prom_atr_src[origin_idx]
 
             event_mag = _bounded_strength_score(
                 base_strength=base_strength,
@@ -331,9 +324,6 @@ def add_trend_state(
 
             prev_swing_low = sl_price[i]
 
-        # ---------------------------------------------------------
-        # Strict current readiness
-        # ---------------------------------------------------------
         bull_pair_recent = _recent(
             cur_last_hh_idx, i, event_freshness_bars
         ) and _recent(cur_last_hl_idx, i, event_freshness_bars)
@@ -393,9 +383,6 @@ def add_trend_state(
         else:
             curr_state_age = curr_state_age + 1 if curr_state != 0 else 0
 
-        # ---------------------------------------------------------
-        # Inherited neutral bias logic
-        # ---------------------------------------------------------
         prev_bias = curr_bias
 
         if prev_state != 0 and curr_state == 0:
@@ -417,7 +404,6 @@ def add_trend_state(
             curr_bias_mag = 1.0
 
         else:
-            # strict neutral
             if inherited_bias_dir == 0:
                 curr_bias = 0
                 curr_bias_mag = 0.0
@@ -450,9 +436,6 @@ def add_trend_state(
         else:
             curr_bias_age = curr_bias_age + 1 if curr_bias != 0 else 0
 
-        # ---------------------------------------------------------
-        # Confidence
-        # ---------------------------------------------------------
         if curr_state == 1:
             conf = 2 if (high_evt == 1 or low_evt == 1) else 1
         elif curr_state == -1:
@@ -462,9 +445,6 @@ def add_trend_state(
         else:
             conf = -1
 
-        # ---------------------------------------------------------
-        # Directional structural pressure / strength
-        # ---------------------------------------------------------
         bull_pressure *= strength_decay
         bear_pressure *= strength_decay
 
@@ -505,9 +485,6 @@ def add_trend_state(
         trend_strength_event_score[i] = event_score
         trend_strength_event_dir[i] = event_dir
 
-        # ---------------------------------------------------------
-        # Step 2: transition interpretability helpers
-        # ---------------------------------------------------------
         structure_loss_bull = 0
         structure_loss_bear = 0
         emerging_bull = 0
@@ -519,7 +496,6 @@ def add_trend_state(
         elif curr_state == -1:
             regime_phase = -3
         else:
-            # strict neutral only below
             recent_bull_component = _recent(
                 cur_last_hh_idx, i, event_freshness_bars
             ) or _recent(cur_last_hl_idx, i, event_freshness_bars)
@@ -527,8 +503,6 @@ def add_trend_state(
                 cur_last_lh_idx, i, event_freshness_bars
             ) or _recent(cur_last_ll_idx, i, event_freshness_bars)
 
-            # structure loss: immediately after losing strict structure,
-            # while bias/strength still leans in the old direction
             if (
                 prev_strict_state_for_phase == 1
                 and curr_state == 0
@@ -547,8 +521,6 @@ def add_trend_state(
                 structure_loss_bear = 1
                 regime_phase = -2
 
-            # emerging structure: neutral strict state, but directional pressure
-            # and recent same-side evidence are building before strict confirmation
             elif (
                 not bull_ready
                 and not bear_ready
@@ -575,9 +547,6 @@ def add_trend_state(
         trend_emerging_bear[i] = emerging_bear
         trend_regime_phase[i] = regime_phase
 
-        # ---------------------------------------------------------
-        # Stamp outputs
-        # ---------------------------------------------------------
         trend_event_high[i] = high_evt
         trend_event_low[i] = low_evt
         trend_event[i] = high_evt + low_evt

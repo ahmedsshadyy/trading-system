@@ -1,4 +1,4 @@
-"""scripts/validate_trend_state.py"""
+# scripts/validate_trend_state.py
 
 from __future__ import annotations
 
@@ -14,45 +14,14 @@ import pandas as pd
 from src.indicators.foundation.volatility import add_atr
 from src.indicators.structure.swings import add_swings
 from src.indicators.structure.trend_state import add_trend_state
-from src.validation.indicators.trend_state import (
-    validate_trend_state,
-    plot_trend_state_validation,
-)
+from src.validation.indicators.trend_state import validate_trend_state
 
 DATA_FILE = Path("data/raw/XAU_USD_H4.parquet")
 OUT_DIR = Path("notebooks/structure")
 
-
-def build_recent_transition_plot_df(
-    df: pd.DataFrame,
-    *,
-    transition_col: str = "trend_state_changed",
-    n_transitions: int = 8,
-    pad: int = 12,
-) -> pd.DataFrame:
-    """
-    Build a readable plotting slice centered around the most recent strict transitions.
-
-    This keeps visual validation focused on regime changes instead of plotting a long,
-    congested recent time range.
-    """
-    if transition_col not in df.columns:
-        return df.tail(200).copy().reset_index(drop=True)
-
-    transition_idxs = df.index[df[transition_col].fillna(0).astype(int) == 1].tolist()
-    if not transition_idxs:
-        return df.tail(200).copy().reset_index(drop=True)
-
-    selected = transition_idxs[-n_transitions:]
-    keep: set[int] = set()
-
-    for idx in selected:
-        start = max(0, idx - pad)
-        end = min(len(df), idx + pad + 1)
-        keep.update(range(start, end))
-
-    ordered = sorted(keep)
-    return df.iloc[ordered].copy().reset_index(drop=True)
+SWING_WINDOW = 4
+SWING_RETRACE = 0.7
+SWING_CONFIRM_BARS = 2
 
 
 def main() -> None:
@@ -60,37 +29,34 @@ def main() -> None:
     print("loaded parquet")
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # full-data computation for numeric validation
     df = add_atr(df)
     print("atr done")
-    df = add_swings(df, window=6)
+
+    df = add_swings(
+        df,
+        window=SWING_WINDOW,
+        min_retrace_atr=SWING_RETRACE,
+        min_confirm_bars=SWING_CONFIRM_BARS,
+    )
     print("swings done")
+
     df = add_trend_state(df)
     print("trend_state done")
 
-    # transition-centered readable plotting slice
-    plot_df = build_recent_transition_plot_df(
-        df,
-        transition_col="trend_state_changed",
-        n_transitions=8,
-        pad=12,
+    title_base = (
+        f"Trend State Validation — XAU_USD H4 "
+        f"(swing w={SWING_WINDOW}, ret={SWING_RETRACE}, confirm={SWING_CONFIRM_BARS})"
     )
 
-    # numeric validation on full dataset
+    plot_df = df[df["timestamp"] >= pd.Timestamp("2026-02-15", tz="UTC")].copy()
+
     result = validate_trend_state(
-        df,
+        plot_df,
         outpath=OUT_DIR / "trend_state_validation.html",
-        title="Trend State Validation — XAU_USD H4",
+        title=f"{title_base} (2026-02-15 onward)",
         n_windows=5,
     )
     print("numeric validation done")
-
-    # overwrite chart with a readable transition-focused slice
-    result["html_path"] = plot_trend_state_validation(
-        plot_df,
-        outpath=OUT_DIR / "trend_state_validation.html",
-        title="Trend State Validation — XAU_USD H4 (Recent Transition Windows)",
-    )
     print("plot done")
 
     summary = result["summary"]

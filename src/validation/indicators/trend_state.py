@@ -1,3 +1,5 @@
+# src/validation/indicators/trend_state.py
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -43,13 +45,6 @@ def _add_state_background(
     opacity: float,
     max_runs: int = 250,
 ) -> None:
-    """
-    Add lightweight regime shading for strict trend state only.
-
-    Important:
-    - Only intended for low-frequency regime states like trend_state.
-    - Do NOT use for rapidly flipping bias states.
-    """
     if state_col != "trend_state":
         return
     if state_col not in df.columns:
@@ -71,7 +66,6 @@ def _add_state_background(
             if state == 1
             else f"rgba(200, 0, 0, {opacity})"
         )
-
         fig.add_vrect(
             x0=x.iloc[start],
             x1=x.iloc[end],
@@ -88,14 +82,13 @@ def _transition_table(series: pd.Series, from_name: str, to_name: str) -> pd.Dat
     cur = series.fillna(0).astype(int)
     changed = prev != cur
 
-    tbl = (
+    return (
         pd.DataFrame({from_name: prev[changed], to_name: cur[changed]})
         .value_counts()
         .reset_index(name="count")
         .sort_values("count", ascending=False)
         .reset_index(drop=True)
     )
-    return tbl
 
 
 def _duration_stats(series: pd.Series) -> pd.DataFrame:
@@ -322,18 +315,9 @@ def plot_trend_state_validation(
 ) -> Path:
     out = _ensure_datetime(df).copy()
 
-    if "trend_bias_score_live" in out.columns:
-        out["trend_bias_score_live"] = pd.to_numeric(
-            out["trend_bias_score_live"], errors="coerce"
-        )
-    if "trend_strength_raw" in out.columns:
-        out["trend_strength_raw"] = pd.to_numeric(
-            out["trend_strength_raw"], errors="coerce"
-        )
-    if "trend_strength_ema" in out.columns:
-        out["trend_strength_ema"] = pd.to_numeric(
-            out["trend_strength_ema"], errors="coerce"
-        )
+    for col in ["trend_bias_score_live", "trend_strength_raw", "trend_strength_ema"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
 
     outpath = Path(outpath)
 
@@ -351,7 +335,6 @@ def plot_trend_state_validation(
         ),
     )
 
-    # Panel 1: price
     fig.add_trace(
         go.Candlestick(
             x=out["timestamp"],
@@ -360,6 +343,10 @@ def plot_trend_state_validation(
             low=out["low"],
             close=out["close"],
             name="OHLC",
+            increasing_line_color="#00cc96",
+            increasing_fillcolor="#00cc96",
+            decreasing_line_color="#ef553b",
+            decreasing_fillcolor="#ef553b",
         ),
         row=1,
         col=1,
@@ -382,8 +369,8 @@ def plot_trend_state_validation(
                 x=sh["timestamp"],
                 y=sh["high"],
                 mode="markers",
-                name="Swing High",
-                marker=dict(symbol="triangle-down", size=8),
+                name="Swing High (Origin)",
+                marker=dict(symbol="triangle-down", size=8, color="#ef553b"),
             ),
             row=1,
             col=1,
@@ -396,8 +383,62 @@ def plot_trend_state_validation(
                 x=sl["timestamp"],
                 y=sl["low"],
                 mode="markers",
-                name="Swing Low",
-                marker=dict(symbol="triangle-up", size=8),
+                name="Swing Low (Origin)",
+                marker=dict(symbol="triangle-up", size=8, color="#00cc96"),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if {"swing_high_confirm_flag", "swing_high_confirm_price"}.issubset(out.columns):
+        shc = out[out["swing_high_confirm_flag"] == 1]
+        fig.add_trace(
+            go.Scatter(
+                x=shc["timestamp"],
+                y=shc["swing_high_confirm_price"],
+                mode="markers",
+                name="Swing High (Confirm)",
+                marker=dict(symbol="x", size=9, color="#ffa15a"),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if {"swing_low_confirm_flag", "swing_low_confirm_price"}.issubset(out.columns):
+        slc = out[out["swing_low_confirm_flag"] == 1]
+        fig.add_trace(
+            go.Scatter(
+                x=slc["timestamp"],
+                y=slc["swing_low_confirm_price"],
+                mode="markers",
+                name="Swing Low (Confirm)",
+                marker=dict(symbol="x", size=9, color="#ab63fa"),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if "last_swing_high" in out.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=out["timestamp"],
+                y=out["last_swing_high"],
+                mode="lines",
+                name="Last Confirmed Swing High",
+                line=dict(width=1, dash="dot", color="#ef553b"),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if "last_swing_low" in out.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=out["timestamp"],
+                y=out["last_swing_low"],
+                mode="lines",
+                name="Last Confirmed Swing Low",
+                line=dict(width=1, dash="dot", color="#00cc96"),
             ),
             row=1,
             col=1,
@@ -411,7 +452,7 @@ def plot_trend_state_validation(
                 y=tc["close"],
                 mode="markers",
                 name="Strict Transition",
-                marker=dict(symbol="x", size=10),
+                marker=dict(symbol="x", size=10, color="#ffffff"),
             ),
             row=1,
             col=1,
@@ -425,7 +466,7 @@ def plot_trend_state_validation(
                 y=bc["close"],
                 mode="markers",
                 name="Bias Transition",
-                marker=dict(symbol="diamond", size=7),
+                marker=dict(symbol="diamond", size=7, color="#19d3f3"),
             ),
             row=1,
             col=1,
@@ -439,7 +480,7 @@ def plot_trend_state_validation(
                 y=tlb["close"],
                 mode="markers",
                 name="Bull Structure Loss",
-                marker=dict(symbol="circle-open", size=9),
+                marker=dict(symbol="circle-open", size=9, color="#00cc96"),
             ),
             row=1,
             col=1,
@@ -453,7 +494,7 @@ def plot_trend_state_validation(
                 y=tlbr["close"],
                 mode="markers",
                 name="Bear Structure Loss",
-                marker=dict(symbol="circle-open", size=9),
+                marker=dict(symbol="circle-open", size=9, color="#ef553b"),
             ),
             row=1,
             col=1,
@@ -467,7 +508,7 @@ def plot_trend_state_validation(
                 y=eb["close"],
                 mode="markers",
                 name="Emerging Bull",
-                marker=dict(symbol="star", size=9),
+                marker=dict(symbol="star", size=9, color="#00cc96"),
             ),
             row=1,
             col=1,
@@ -481,13 +522,12 @@ def plot_trend_state_validation(
                 y=er["close"],
                 mode="markers",
                 name="Emerging Bear",
-                marker=dict(symbol="star", size=9),
+                marker=dict(symbol="star", size=9, color="#ef553b"),
             ),
             row=1,
             col=1,
         )
 
-    # Panel 2: strict + bias state
     if "trend_state" in out.columns:
         fig.add_trace(
             go.Scatter(
@@ -495,7 +535,7 @@ def plot_trend_state_validation(
                 y=out["trend_state"].astype(float),
                 mode="lines",
                 name="Strict State",
-                line=dict(width=2),
+                line=dict(width=2, color="#ffffff"),
             ),
             row=2,
             col=1,
@@ -508,15 +548,16 @@ def plot_trend_state_validation(
                 y=out["trend_bias_state"].astype(float),
                 mode="lines",
                 name="Bias State",
-                line=dict(width=2, dash="dot"),
+                line=dict(width=2, dash="dot", color="#19d3f3"),
             ),
             row=2,
             col=1,
         )
 
-    fig.add_hline(y=0.0, line_dash="dot", row=2, col=1)
+    fig.add_hline(
+        y=0.0, line_dash="dot", line_color="rgba(255,255,255,0.35)", row=2, col=1
+    )
 
-    # Panel 3: confidence
     if "trend_confidence" in out.columns:
         fig.add_trace(
             go.Scatter(
@@ -524,17 +565,22 @@ def plot_trend_state_validation(
                 y=out["trend_confidence"].astype(float),
                 mode="lines",
                 name="Confidence",
-                line=dict(width=2),
+                line=dict(width=2, color="#ffa15a"),
             ),
             row=3,
             col=1,
         )
 
-    fig.add_hline(y=0.0, line_dash="dot", row=3, col=1)
-    fig.add_hline(y=1.0, line_dash="dot", row=3, col=1)
-    fig.add_hline(y=2.0, line_dash="dot", row=3, col=1)
+    fig.add_hline(
+        y=0.0, line_dash="dot", line_color="rgba(255,255,255,0.35)", row=3, col=1
+    )
+    fig.add_hline(
+        y=1.0, line_dash="dot", line_color="rgba(255,255,255,0.35)", row=3, col=1
+    )
+    fig.add_hline(
+        y=2.0, line_dash="dot", line_color="rgba(255,255,255,0.35)", row=3, col=1
+    )
 
-    # Panel 4: bias / strength scores
     if "trend_bias_score_live" in out.columns:
         fig.add_trace(
             go.Scatter(
@@ -542,7 +588,7 @@ def plot_trend_state_validation(
                 y=out["trend_bias_score_live"],
                 mode="lines",
                 name="Bias Score Live",
-                line=dict(width=2),
+                line=dict(width=2, color="#19d3f3"),
             ),
             row=4,
             col=1,
@@ -555,7 +601,7 @@ def plot_trend_state_validation(
                 y=out["trend_strength_raw"],
                 mode="lines",
                 name="Trend Strength Raw",
-                line=dict(width=1),
+                line=dict(width=1, color="#b6e880"),
             ),
             row=4,
             col=1,
@@ -568,17 +614,17 @@ def plot_trend_state_validation(
                 y=out["trend_strength_ema"],
                 mode="lines",
                 name="Trend Strength EMA",
-                line=dict(width=3),
+                line=dict(width=3, color="#fecb52"),
             ),
             row=4,
             col=1,
         )
 
-    fig.add_hline(y=0.0, line_dash="dot", row=4, col=1)
+    fig.add_hline(
+        y=0.0, line_dash="dot", line_color="rgba(255,255,255,0.35)", row=4, col=1
+    )
 
-    # Axes / layout
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-
+    fig.update_yaxes(title_text="Price", row=1, col=1, side="right")
     fig.update_yaxes(
         title_text="State",
         row=2,
@@ -587,7 +633,6 @@ def plot_trend_state_validation(
         tickvals=[-1, 0, 1],
         range=[-1.25, 1.25],
     )
-
     fig.update_yaxes(
         title_text="Conf",
         row=3,
@@ -596,7 +641,6 @@ def plot_trend_state_validation(
         tickvals=[-1, 0, 1, 2],
         range=[-1.25, 2.25],
     )
-
     fig.update_yaxes(
         title_text="Bias / Strength",
         row=4,
@@ -604,11 +648,18 @@ def plot_trend_state_validation(
         range=[-1.05, 1.05],
     )
 
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
+
     fig.update_layout(
         title=title,
         xaxis_rangeslider_visible=False,
-        template="plotly_white",
+        template="plotly_dark",
         height=1200,
+        plot_bgcolor="#111111",
+        paper_bgcolor="#111111",
+        font=dict(color="white"),
+        hovermode="x unified",
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -616,6 +667,7 @@ def plot_trend_state_validation(
             xanchor="left",
             x=0,
         ),
+        margin=dict(l=40, r=40, t=80, b=40),
     )
 
     outpath.parent.mkdir(parents=True, exist_ok=True)

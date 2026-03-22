@@ -11,37 +11,40 @@ import pandas as pd
 
 from src.indicators.foundation.volatility import add_atr
 from src.indicators.structure.swings import add_swings
-from src.validation.indicators.swings import validate_swings, plot_swings_validation
+from src.validation.indicators.swings import validate_swings
 
 DATA_FILE = Path("data/raw/XAU_USD_H4.parquet")
 OUT_DIR = Path("notebooks/structure")
+
+SWING_WINDOW = 4
+SWING_RETRACE = 0.7
+SWING_CONFIRM_BARS = 2
 
 
 def main() -> None:
     df = pd.read_parquet(DATA_FILE)
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # Full-history numerics
     df = add_atr(df)
-    df = add_swings(df, window=6)
+    df = add_swings(
+        df,
+        window=SWING_WINDOW,
+        min_retrace_atr=SWING_RETRACE,
+        min_confirm_bars=SWING_CONFIRM_BARS,
+    )
 
-    # Recent-slice visuals (last ~90 days)
-    plot_end_ts = df["timestamp"].max()
-    plot_start_ts = plot_end_ts - pd.Timedelta(days=90)
-    plot_df = df[df["timestamp"] >= plot_start_ts].copy().reset_index(drop=True)
+    title_base = (
+        f"Swings Validation — XAU_USD H4 "
+        f"(w={SWING_WINDOW}, ret={SWING_RETRACE}, confirm={SWING_CONFIRM_BARS})"
+    )
 
     result = validate_swings(
         df,
         outpath=OUT_DIR / "swings_validation.html",
-        title="Swings Validation — XAU_USD H4",
+        title=f"{title_base} (2026-01-01 to 2026-03-14)",
+        start_ts="2026-01-01",
+        end_ts="2026-03-15",
         n_windows=3,
-    )
-
-    # Overwrite chart with readable recent slice
-    result["html_path"] = plot_swings_validation(
-        plot_df,
-        outpath=OUT_DIR / "swings_validation.html",
-        title="Swings Validation — XAU_USD H4 (Last 90 Days)",
     )
 
     print("\n=== SWINGS SUMMARY ===")

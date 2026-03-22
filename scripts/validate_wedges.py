@@ -1,4 +1,4 @@
-# scripts/validate_bos.py
+# scripts/validate_wedges.py
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ import pandas as pd
 
 from src.indicators.foundation.volatility import add_atr
 from src.indicators.structure.swings import add_swings
-from src.indicators.structure.bos import add_bos
-from src.validation.indicators.bos import validate_bos
+from src.indicators.structure.wedges import add_wedges
+from src.validation.indicators.wedges import validate_wedges
 
 DATA_FILE = Path("data/raw/XAU_USD_H4.parquet")
 OUT_DIR = Path("notebooks/structure")
@@ -35,45 +35,39 @@ def main() -> None:
         min_retrace_atr=SWING_RETRACE,
         min_confirm_bars=SWING_CONFIRM_BARS,
     )
-
-    df = add_bos(
-        df,
-        min_source_age_bars=1,
-        min_break_distance_atr=0.05,
-        min_body_atr=0.10,
-    )
+    df = add_wedges(df)
 
     plot_df = (
-        df[df["timestamp"] >= pd.Timestamp("2026-02-01", tz="UTC")]
+        df[df["timestamp"] >= pd.Timestamp("2026-01-01", tz="UTC")]
         .copy()
         .reset_index(drop=True)
     )
 
     title = (
-        f"BOS Validation — XAU_USD H4 "
+        f"Wedges Validation — XAU_USD H4 "
         f"(swing w={SWING_WINDOW}, ret={SWING_RETRACE}, confirm={SWING_CONFIRM_BARS}) "
         f"(2026-01-01 onward)"
     )
 
-    result = validate_bos(
+    result = validate_wedges(
         plot_df,
-        outpath=OUT_DIR / "bos_validation.html",
+        outpath=OUT_DIR / "wedges_validation.html",
         title=title,
         n_windows=5,
     )
 
-    print("\n=== BOS SUMMARY ===")
+    print("\n=== WEDGES SUMMARY ===")
     for k, v in result["summary"].items():
         print(f"{k}: {v}")
 
-    print("\n=== SAMPLE BULL BOS WINDOWS ===")
-    for i, win in enumerate(result["bull_windows"], start=1):
-        print(f"\n--- bull window {i} ---")
+    print("\n=== SAMPLE WEDGE BREAKOUT UP WINDOWS ===")
+    for i, win in enumerate(result["breakout_up_windows"], start=1):
+        print(f"\n--- breakout up window {i} ---")
         print(win.to_string(index=True))
 
-    print("\n=== SAMPLE BEAR BOS WINDOWS ===")
-    for i, win in enumerate(result["bear_windows"], start=1):
-        print(f"\n--- bear window {i} ---")
+    print("\n=== SAMPLE WEDGE BREAKOUT DOWN WINDOWS ===")
+    for i, win in enumerate(result["breakout_down_windows"], start=1):
+        print(f"\n--- breakout down window {i} ---")
         print(win.to_string(index=True))
 
     print(f"\nWrote chart to: {result['html_path']}")

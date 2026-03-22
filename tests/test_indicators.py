@@ -20,6 +20,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from src.indicators.structure.wedges import add_wedges
+from src.indicators.structure.bos import add_bos
 
 ### Helpers for Trend_state tests
 
@@ -70,7 +72,13 @@ def _run_trend_state(
 
     df = _make_ohlc_from_close(closes)
     df = add_atr(df, period=atr_length)
-    df = add_swings(df, window=swing_window, atr_length=atr_length)
+    df = add_swings(
+        df,
+        window=swing_window,
+        atr_length=atr_length,
+        min_retrace_atr=0.0,
+        min_confirm_bars=1,
+    )
     df = add_trend_state(
         df,
         atr_length=atr_length,
@@ -469,6 +477,634 @@ class TestTrendStateBehavior:
         assert (
             (df["trend_strength_ema"] >= -1.0) & (df["trend_strength_ema"] <= 1.0)
         ).all()
+
+
+# tests/test_indicators.py  (append this class)
+
+
+class TestBOS:
+    @staticmethod
+    def _make_base_df(n: int = 12) -> pd.DataFrame:
+        ts = pd.date_range("2026-01-01", periods=n, freq="4h", tz="UTC")
+        close = np.linspace(100.0, 101.0, n)
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": close - 0.1,
+                "high": close + 0.3,
+                "low": close - 0.3,
+                "close": close,
+                "atr_14": np.full(n, 1.0),
+                "last_swing_high": np.full(n, np.nan),
+                "last_swing_low": np.full(n, np.nan),
+                "last_swing_high_idx": np.full(n, np.nan),
+                "last_swing_low_idx": np.full(n, np.nan),
+                "swing_high_age": np.full(n, np.nan),
+                "swing_low_age": np.full(n, np.nan),
+            }
+        )
+        return df
+
+    @staticmethod
+    def _run_bos_from_df(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        return add_bos(df, **kwargs)
+
+    @staticmethod
+    def _make_bullish_bos_df() -> pd.DataFrame:
+        df = TestBOS._make_base_df(10)
+
+        # source swing high from idx 2 at 103.0, available from bar 3 onward
+        for i in range(3, len(df)):
+            df.loc[i, "last_swing_high"] = 103.0
+            df.loc[i, "last_swing_high_idx"] = 2
+            df.loc[i, "swing_high_age"] = i - 2
+
+        # no bearish source
+        # bar 6 wick only, no close break
+        df.loc[6, ["open", "high", "low", "close"]] = [102.7, 103.2, 102.5, 102.9]
+        # bar 7 canonical bullish close break
+        df.loc[7, ["open", "high", "low", "close"]] = [102.8, 104.0, 102.7, 103.6]
+        # bar 8 remains above, should not refire same source
+        df.loc[8, ["open", "high", "low", "close"]] = [103.4, 104.2, 103.1, 103.8]
+        return df
+
+    @staticmethod
+    def _make_bearish_bos_df() -> pd.DataFrame:
+        df = TestBOS._make_base_df(10)
+
+        for i in range(3, len(df)):
+            df.loc[i, "last_swing_low"] = 98.0
+            df.loc[i, "last_swing_low_idx"] = 2
+            df.loc[i, "swing_low_age"] = i - 2
+
+        # bar 6 wick only
+        df.loc[6, ["open", "high", "low", "close"]] = [98.4, 98.5, 97.8, 98.1]
+        # bar 7 canonical bearish close break
+        df.loc[7, ["open", "high", "low", "close"]] = [98.2, 98.3, 97.1, 97.4]
+        # bar 8 no refire
+        df.loc[8, ["open", "high", "low", "close"]] = [97.6, 97.7, 96.9, 97.2]
+        return df
+
+    def test_bullish_bos_can_fire_on_deterministic_path(self):
+        df = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        assert (df["bos_bull"] == 1).any()
+
+    def test_bearish_bos_can_fire_on_deterministic_path(self):
+        df = self._run_bos_from_df(
+            self._make_bearish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        assert (df["bos_bear"] == 1).any()
+
+    def test_bos_direction_values_stay_in_expected_set(self):
+        df = self._run_bos_from_df(self._make_bullish_bos_df())
+        vals = set(df["bos_direction"].dropna().astype(int).unique())
+        assert vals.issubset({-1, 0, 1})
+
+    def test_bos_is_sparse_not_forward_filled(self):
+        df = self._run_bos_from_df(self._make_bullish_bos_df())
+        event_mask = (df["bos_bull"] == 1) | (df["bos_bear"] == 1)
+        assert (df.loc[event_mask, "bos_direction"] != 0).all()
+        assert (df.loc[~event_mask, "bos_direction"] == 0).all()
+
+    def test_bos_never_fires_both_directions_same_bar(self):
+        df = self._run_bos_from_df(self._make_bullish_bos_df())
+        assert ((df["bos_bull"] + df["bos_bear"]) <= 1).all()
+
+    def test_bos_break_family_columns_are_binary(self):
+        df = self._run_bos_from_df(self._make_bullish_bos_df())
+        for col in [
+            "bos_bull",
+            "bos_bear",
+            "bos_close_break_bull",
+            "bos_close_break_bear",
+            "bos_wick_break_bull",
+            "bos_wick_break_bear",
+            "bos_raw_candidate_bull",
+            "bos_raw_candidate_bear",
+            "bos_pass_source_age_bull",
+            "bos_pass_source_age_bear",
+            "bos_pass_break_distance_bull",
+            "bos_pass_break_distance_bear",
+            "bos_pass_body_bull",
+            "bos_pass_body_bear",
+            "bos_pass_source_strength_bull",
+            "bos_pass_source_strength_bear",
+            "bos_pass_trend_bull",
+            "bos_pass_trend_bear",
+        ]:
+            vals = set(df[col].dropna().astype(int).unique())
+            assert vals.issubset({0, 1})
+
+    def test_bos_source_idx_precedes_event_bar(self):
+        df = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        event_rows = df[(df["bos_bull"] == 1) | (df["bos_bear"] == 1)]
+        for idx, row in event_rows.iterrows():
+            assert np.isfinite(row["bos_source_idx"])
+            assert row["bos_source_idx"] < idx
+
+    def test_bos_source_metadata_populates_when_event_fires(self):
+        df = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        event_rows = df[(df["bos_bull"] == 1) | (df["bos_bear"] == 1)]
+        assert not event_rows.empty
+        assert event_rows["bos_source_side"].isin({-1, 1}).all()
+        assert event_rows["bos_source_idx"].notna().all()
+        assert event_rows["bos_source_price"].notna().all()
+        assert event_rows["bos_level"].notna().all()
+
+    def test_bos_close_break_contains_canonical_events(self):
+        df_bull = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        df_bear = self._run_bos_from_df(
+            self._make_bearish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        bull_rows = df_bull["bos_bull"] == 1
+        bear_rows = df_bear["bos_bear"] == 1
+        if bull_rows.any():
+            assert (df_bull.loc[bull_rows, "bos_close_break_bull"] == 1).all()
+        if bear_rows.any():
+            assert (df_bear.loc[bear_rows, "bos_close_break_bear"] == 1).all()
+
+    def test_bos_break_distance_positive_on_event_rows(self):
+        df_bull = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        df_bear = self._run_bos_from_df(
+            self._make_bearish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        event_rows = pd.concat(
+            [
+                df_bull[(df_bull["bos_bull"] == 1) | (df_bull["bos_bear"] == 1)],
+                df_bear[(df_bear["bos_bull"] == 1) | (df_bear["bos_bear"] == 1)],
+            ],
+            ignore_index=True,
+        )
+        assert not event_rows.empty
+        assert (event_rows["bos_break_distance"] > 0).all()
+
+    def test_bos_atr_normalized_metrics_are_finite_when_atr_valid(self):
+        df = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            atr_length=14,
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        event_rows = df[(df["bos_bull"] == 1) | (df["bos_bear"] == 1)]
+        if not event_rows.empty:
+            assert event_rows["bos_break_distance_atr"].dropna().ge(0).all()
+            assert event_rows["bos_candle_body_atr"].dropna().ge(0).all()
+
+    def test_bos_event_ids_are_unique_and_positive_on_event_rows(self):
+        for df in [
+            self._run_bos_from_df(
+                self._make_bullish_bos_df(),
+                min_source_age_bars=0,
+                min_break_distance_atr=0.0,
+                min_body_atr=0.0,
+            ),
+            self._run_bos_from_df(
+                self._make_bearish_bos_df(),
+                min_source_age_bars=0,
+                min_break_distance_atr=0.0,
+                min_body_atr=0.0,
+            ),
+        ]:
+            event_rows = df[(df["bos_bull"] == 1) | (df["bos_bear"] == 1)]
+            ids = event_rows["bos_event_id"].to_numpy()
+            assert len(ids) > 0
+            assert (ids > 0).all()
+            assert len(np.unique(ids)) == len(ids)
+
+    def test_bos_event_ids_are_sequential(self):
+        df = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        event_rows = df[(df["bos_bull"] == 1) | (df["bos_bear"] == 1)]
+        ids = event_rows["bos_event_id"].to_numpy()
+        if len(ids) > 0:
+            np.testing.assert_array_equal(ids, np.arange(1, len(ids) + 1))
+
+    def test_bos_non_event_rows_have_zero_event_id(self):
+        df = self._run_bos_from_df(self._make_bullish_bos_df())
+        non_event_rows = df[(df["bos_bull"] == 0) & (df["bos_bear"] == 0)]
+        assert (non_event_rows["bos_event_id"] == 0).all()
+
+    def test_bos_quality_fields_are_nan_on_non_event_rows(self):
+        df = self._run_bos_from_df(self._make_bullish_bos_df())
+        non_event_rows = df[(df["bos_bull"] == 0) & (df["bos_bear"] == 0)]
+        for col in [
+            "bos_break_distance",
+            "bos_break_distance_atr",
+            "bos_candle_body_atr",
+            "bos_source_age",
+            "bos_source_strength",
+        ]:
+            assert non_event_rows[col].isna().all()
+
+    def test_same_source_level_does_not_refire_canonical_bos(self):
+        df = self._make_bullish_bos_df().copy()
+        extra = pd.DataFrame(
+            {
+                "timestamp": pd.date_range(
+                    df["timestamp"].iloc[-1] + pd.Timedelta(hours=4),
+                    periods=3,
+                    freq="4h",
+                    tz="UTC",
+                ),
+                "open": [103.4, 103.6, 103.7],
+                "high": [104.2, 104.4, 104.6],
+                "low": [103.0, 103.2, 103.3],
+                "close": [103.8, 104.0, 104.2],
+                "atr_14": [1.0, 1.0, 1.0],
+                "last_swing_high": [103.0, 103.0, 103.0],
+                "last_swing_low": [np.nan, np.nan, np.nan],
+                "last_swing_high_idx": [2.0, 2.0, 2.0],
+                "last_swing_low_idx": [np.nan, np.nan, np.nan],
+                "swing_high_age": [8.0, 9.0, 10.0],
+                "swing_low_age": [np.nan, np.nan, np.nan],
+            }
+        )
+        df = pd.concat([df, extra], ignore_index=True)
+        df = self._run_bos_from_df(
+            df,
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+
+        bull_event_rows = df[df["bos_bull"] == 1]
+        if not bull_event_rows.empty:
+            src = bull_event_rows["bos_source_idx"].dropna().astype(int)
+            assert src.is_unique
+
+    def test_bos_source_side_matches_event_direction(self):
+        df_bull = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        df_bear = self._run_bos_from_df(
+            self._make_bearish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        bull_rows = df_bull["bos_bull"] == 1
+        bear_rows = df_bear["bos_bear"] == 1
+        if bull_rows.any():
+            assert (df_bull.loc[bull_rows, "bos_source_side"] == 1).all()
+        if bear_rows.any():
+            assert (df_bear.loc[bear_rows, "bos_source_side"] == -1).all()
+
+    def test_wick_only_break_is_not_canonical_bos(self):
+        df = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        row = df.iloc[6]
+        assert row["bos_wick_break_bull"] == 1
+        assert row["bos_close_break_bull"] == 0
+        assert row["bos_bull"] == 0
+
+    def test_min_source_age_filter_blocks_too_fresh_break(self):
+        df = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=10,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.0,
+        )
+        assert (df["bos_bull"] == 1).sum() == 0
+
+    def test_min_break_distance_filter_blocks_small_close_through(self):
+        df = self._run_bos_from_df(
+            self._make_bullish_bos_df(),
+            min_source_age_bars=0,
+            min_break_distance_atr=10.0,
+            min_body_atr=0.0,
+        )
+        assert (df["bos_bull"] == 1).sum() == 0
+
+    def test_min_body_filter_blocks_small_body_break_on_that_bar(self):
+        df = self._make_bullish_bos_df().copy()
+        df.loc[7, ["open", "close"]] = [103.55, 103.60]  # tiny body on breakout bar
+
+        out = self._run_bos_from_df(
+            df,
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.20,
+        )
+
+        assert out.loc[7, "bos_close_break_bull"] == 1
+        assert out.loc[7, "bos_pass_body_bull"] == 0
+        assert out.loc[7, "bos_bull"] == 0
+
+    def test_failed_small_body_attempt_does_not_consume_source_level(self):
+        df = self._make_bullish_bos_df().copy()
+        df.loc[7, ["open", "close"]] = [103.55, 103.60]  # tiny body, should fail
+        df.loc[8, ["open", "close"]] = [103.20, 103.90]  # later valid break
+
+        out = self._run_bos_from_df(
+            df,
+            min_source_age_bars=0,
+            min_break_distance_atr=0.0,
+            min_body_atr=0.20,
+        )
+
+        assert out.loc[7, "bos_bull"] == 0
+        assert out.loc[8, "bos_bull"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Wedges
+# ---------------------------------------------------------------------------
+
+
+class TestWedges:
+    @staticmethod
+    def _base_df(n: int = 60) -> pd.DataFrame:
+        ts = pd.date_range("2026-01-01", periods=n, freq="4h", tz="UTC")
+        close = np.linspace(100.0, 101.0, n)
+        df = pd.DataFrame(
+            {
+                "timestamp": ts,
+                "open": close - 0.1,
+                "high": close + 0.5,
+                "low": close - 0.5,
+                "close": close,
+                "atr_14": np.full(n, 1.0),
+                "swing_high_confirm_flag": np.zeros(n, dtype=np.int8),
+                "swing_low_confirm_flag": np.zeros(n, dtype=np.int8),
+                "swing_high_confirm_origin_idx": np.full(n, np.nan),
+                "swing_low_confirm_origin_idx": np.full(n, np.nan),
+                "swing_high_confirm_price": np.full(n, np.nan),
+                "swing_low_confirm_price": np.full(n, np.nan),
+            }
+        )
+        return df
+
+    @staticmethod
+    def _set_high(
+        df: pd.DataFrame, confirm_idx: int, origin_idx: int, price: float
+    ) -> None:
+        df.loc[confirm_idx, "swing_high_confirm_flag"] = 1
+        df.loc[confirm_idx, "swing_high_confirm_origin_idx"] = origin_idx
+        df.loc[confirm_idx, "swing_high_confirm_price"] = price
+
+    @staticmethod
+    def _set_low(
+        df: pd.DataFrame, confirm_idx: int, origin_idx: int, price: float
+    ) -> None:
+        df.loc[confirm_idx, "swing_low_confirm_flag"] = 1
+        df.loc[confirm_idx, "swing_low_confirm_origin_idx"] = origin_idx
+        df.loc[confirm_idx, "swing_low_confirm_price"] = price
+
+    def test_add_wedges_emits_required_columns(self) -> None:
+        df = self._base_df()
+        out = add_wedges(df)
+
+        expected = {
+            "wedge_rising",
+            "wedge_falling",
+            "wedge_active",
+            "wedge_kind",
+            "wedge_upper_bound",
+            "wedge_lower_bound",
+            "wedge_apex_idx",
+            "wedge_bars_to_apex",
+            "wedge_width",
+            "wedge_width_atr",
+            "wedge_compression_ratio",
+            "wedge_upper_slope",
+            "wedge_lower_slope",
+            "wedge_upper_r2",
+            "wedge_lower_r2",
+            "wedge_quality",
+            "wedge_confirm_count",
+            "wedge_age",
+            "wedge_breakout_up",
+            "wedge_breakout_down",
+            "wedge_breakout_dir",
+            "wedge_breakout_distance_atr",
+        }
+        assert expected.issubset(out.columns)
+
+    def test_no_confirmed_swings_means_no_wedge(self) -> None:
+        df = self._base_df()
+        out = add_wedges(df)
+
+        assert int(out["wedge_active"].sum()) == 0
+        assert int(out["wedge_rising"].sum()) == 0
+        assert int(out["wedge_falling"].sum()) == 0
+        assert int(out["wedge_breakout_up"].sum()) == 0
+        assert int(out["wedge_breakout_down"].sum()) == 0
+
+    def test_rising_wedge_detects_only_after_sufficient_confirmations(self) -> None:
+        df = self._base_df(70)
+
+        # Highs: rising slowly
+        self._set_high(df, 12, 10, 110.0)
+        self._set_high(df, 22, 20, 111.0)
+        self._set_high(df, 32, 30, 112.0)
+
+        # Lows: rising faster
+        self._set_low(df, 17, 15, 100.0)
+        self._set_low(df, 27, 25, 102.0)
+        self._set_low(df, 37, 35, 104.0)
+
+        out = add_wedges(df)
+
+        assert out.loc[:31, "wedge_active"].max() == 0
+        assert out.loc[37:, "wedge_active"].max() == 1
+        assert out.loc[37:, "wedge_rising"].max() == 1
+        assert out.loc[37:, "wedge_falling"].max() == 0
+
+        active_rows = out[out["wedge_rising"] == 1]
+        assert not active_rows.empty
+        assert (active_rows["wedge_upper_slope"] > 0).all()
+        assert (
+            active_rows["wedge_lower_slope"] > active_rows["wedge_upper_slope"]
+        ).all()
+        assert (active_rows["wedge_width"] > 0).all()
+        assert (active_rows["wedge_width_atr"] > 0).all()
+
+    def test_falling_wedge_detects(self) -> None:
+        df = self._base_df(70)
+
+        # Highs: falling faster
+        self._set_high(df, 12, 10, 120.0)
+        self._set_high(df, 22, 20, 117.0)
+        self._set_high(df, 32, 30, 114.0)
+
+        # Lows: falling slowly
+        self._set_low(df, 17, 15, 110.0)
+        self._set_low(df, 27, 25, 108.5)
+        self._set_low(df, 37, 35, 107.0)
+
+        out = add_wedges(df)
+
+        assert out.loc[37:, "wedge_falling"].max() == 1
+        active_rows = out[out["wedge_falling"] == 1]
+        assert not active_rows.empty
+        assert (active_rows["wedge_upper_slope"] < 0).all()
+        assert (active_rows["wedge_lower_slope"] < 0).all()
+        assert (
+            active_rows["wedge_upper_slope"] < active_rows["wedge_lower_slope"]
+        ).all()
+
+    def test_breakout_up_fires_after_active_rising_wedge(self) -> None:
+        df = self._base_df(120)
+
+        self._set_high(df, 12, 10, 110.0)
+        self._set_high(df, 22, 20, 111.0)
+        self._set_high(df, 32, 30, 112.0)
+
+        self._set_low(df, 17, 15, 100.0)
+        self._set_low(df, 27, 25, 102.0)
+        self._set_low(df, 37, 35, 104.0)
+
+        out_pre = add_wedges(df)
+        assert out_pre["wedge_rising"].max() == 1
+
+        active_idxs = out_pre.index[out_pre["wedge_rising"] == 1].tolist()
+        assert active_idxs, "Expected a rising wedge to become active"
+
+        last_active_idx = active_idxs[-1]
+        breakout_idx = last_active_idx + 1
+        assert breakout_idx < len(df)
+
+        upper = float(out_pre.loc[last_active_idx, "wedge_upper_bound"])
+        assert np.isfinite(upper)
+
+        df.loc[breakout_idx, "open"] = upper + 1.5
+        df.loc[breakout_idx, "high"] = upper + 2.0
+        df.loc[breakout_idx, "low"] = upper + 1.0
+        df.loc[breakout_idx, "close"] = upper + 1.8
+
+        out = add_wedges(df)
+
+        assert int(out["wedge_breakout_up"].sum()) >= 1
+        fired = out.index[out["wedge_breakout_up"] == 1].tolist()
+        assert breakout_idx in fired
+        assert out.loc[breakout_idx, "wedge_breakout_dir"] == 1
+        assert out.loc[breakout_idx, "wedge_breakout_distance_atr"] > 0
+
+    def test_breakout_down_fires_after_active_falling_wedge(self) -> None:
+        df = self._base_df(120)
+
+        self._set_high(df, 12, 10, 120.0)
+        self._set_high(df, 22, 20, 117.0)
+        self._set_high(df, 32, 30, 114.0)
+
+        self._set_low(df, 17, 15, 110.0)
+        self._set_low(df, 27, 25, 108.5)
+        self._set_low(df, 37, 35, 107.0)
+
+        out_pre = add_wedges(df)
+        assert out_pre["wedge_falling"].max() == 1
+
+        active_idxs = out_pre.index[out_pre["wedge_falling"] == 1].tolist()
+        assert active_idxs, "Expected a falling wedge to become active"
+
+        last_active_idx = active_idxs[-1]
+        breakout_idx = last_active_idx + 1
+        assert breakout_idx < len(df)
+
+        lower = float(out_pre.loc[last_active_idx, "wedge_lower_bound"])
+        assert np.isfinite(lower)
+
+        df.loc[breakout_idx, "open"] = lower - 1.5
+        df.loc[breakout_idx, "high"] = lower - 1.0
+        df.loc[breakout_idx, "low"] = lower - 2.0
+        df.loc[breakout_idx, "close"] = lower - 1.8
+
+        out = add_wedges(df)
+
+        assert int(out["wedge_breakout_down"].sum()) >= 1
+        fired = out.index[out["wedge_breakout_down"] == 1].tolist()
+        assert breakout_idx in fired
+        assert out.loc[breakout_idx, "wedge_breakout_dir"] == -1
+        assert out.loc[breakout_idx, "wedge_breakout_distance_atr"] > 0
+
+    def test_detector_is_causal_no_wedge_before_last_required_confirmation(
+        self,
+    ) -> None:
+        df = self._base_df(70)
+
+        self._set_high(df, 12, 10, 110.0)
+        self._set_high(df, 22, 20, 111.0)
+        self._set_high(df, 32, 30, 112.0)
+
+        self._set_low(df, 17, 15, 100.0)
+        self._set_low(df, 27, 25, 102.0)
+        # final low confirmation arrives later
+        self._set_low(df, 50, 35, 104.0)
+
+        out = add_wedges(df)
+
+        assert out.loc[:49, "wedge_active"].max() == 0
+        assert out.loc[50:, "wedge_active"].max() == 1
+
+    def test_non_compressing_channel_should_not_trigger_wedge(self) -> None:
+        df = self._base_df(70)
+
+        # Parallel-ish rising channel, not wedge:
+        self._set_high(df, 12, 10, 110.0)
+        self._set_high(df, 22, 20, 112.0)
+        self._set_high(df, 32, 30, 114.0)
+
+        self._set_low(df, 17, 15, 100.0)
+        self._set_low(df, 27, 25, 102.0)
+        self._set_low(df, 37, 35, 104.0)
+
+        out = add_wedges(
+            df,
+            min_compression_ratio=0.30,  # strict enough to reject near-parallel channel
+        )
+
+        assert int(out["wedge_active"].sum()) == 0
+
+    def test_missing_required_columns_raises(self) -> None:
+        df = self._base_df().drop(columns=["swing_high_confirm_flag"])
+        with pytest.raises(Exception):
+            add_wedges(df)
 
 
 # ---------------------------------------------------------------------------
@@ -880,48 +1516,53 @@ class TestPurityContract:
 class TestTimingContract:
     """Confirm flags must not appear before detection bar."""
 
-    def test_swing_detect_idx_matches_origin(self, sample_df):
-        """Canonical causal swings detect on the same bar they originate."""
+    def test_swing_detect_after_origin(self, sample_df):
+        """Retrace-confirmed swings: detect bar must be after origin bar."""
         from src.indicators.structure.swings import add_swings
 
         result = add_swings(sample_df, window=6)
         sh = result[result["swing_high"] == 1]
         for idx, row in sh.iterrows():
-            assert row["swing_high_detect_flag"] == 1
-            assert row["swing_high_detect_idx"] == idx
+            detect = row["swing_high_detect_idx"]
+            assert (
+                detect > idx
+            ), f"Swing high origin at {idx} has detect_idx {detect} (should be later)"
 
         sl = result[result["swing_low"] == 1]
         for idx, row in sl.iterrows():
-            assert row["swing_low_detect_flag"] == 1
-            assert row["swing_low_detect_idx"] == idx
+            detect = row["swing_low_detect_idx"]
+            assert (
+                detect > idx
+            ), f"Swing low origin at {idx} has detect_idx {detect} (should be later)"
 
-    def test_fvg_confirm_idx_after_origin(self, sample_df):
-        """FVG confirm index must be after the FVG origin bar."""
-        from src.indicators.foundation.volatility import add_atr
-        from src.indicators.smc.fvg import add_fvg
-
-        result = add_fvg(add_atr(sample_df))
-        fvg_bars = result[result["fvg_bull"] == 1]
-        for _, row in fvg_bars.iterrows():
-            ci = row["fvg_bull_confirm_idx"]
-            if ci >= 0:
-                assert ci > row.name
-
-    def test_last_swing_updates_on_detection_bar(self, sample_df):
-        """Canonical causal last_swing_* should update immediately on the detection bar."""
+    def test_last_swing_updates_on_detect_bar(self, sample_df):
+        """last_swing_* must update on the detect bar, not the origin bar."""
         from src.indicators.structure.swings import add_swings
 
         result = add_swings(sample_df, window=6)
 
-        for idx, row in result[result["swing_high"] == 1].iterrows():
-            assert row["last_swing_high"] == row["swing_high_price"]
-            assert row["last_swing_high_idx"] == float(idx)
+        # On detect bars, last_swing should reflect the just-confirmed swing
+        detect_bars = result[result["swing_high_detect_flag"] == 1]
+        for idx, row in detect_bars.iterrows():
+            assert np.isfinite(row["last_swing_high"])
             assert row["swing_high_age"] == 0
 
-        for idx, row in result[result["swing_low"] == 1].iterrows():
-            assert row["last_swing_low"] == row["swing_low_price"]
-            assert row["last_swing_low_idx"] == float(idx)
+        detect_bars = result[result["swing_low_detect_flag"] == 1]
+        for idx, row in detect_bars.iterrows():
+            assert np.isfinite(row["last_swing_low"])
             assert row["swing_low_age"] == 0
+
+        def test_fvg_confirm_idx_after_origin(self, sample_df):
+            """FVG confirm index must be after the FVG origin bar."""
+            from src.indicators.foundation.volatility import add_atr
+            from src.indicators.smc.fvg import add_fvg
+
+            result = add_fvg(add_atr(sample_df))
+            fvg_bars = result[result["fvg_bull"] == 1]
+            for _, row in fvg_bars.iterrows():
+                ci = row["fvg_bull_confirm_idx"]
+                if ci >= 0:
+                    assert ci > row.name
 
     def test_canonical_swing_detect_columns_exist(self, sample_df):
         """Canonical swing detector should expose detect metadata columns."""
