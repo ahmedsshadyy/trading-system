@@ -1,0 +1,27 @@
+section,metric,value
+window,start,2026-01-11 22:00:00+00:00
+window,end,2026-03-13 17:00:00+00:00
+window,start_idx,17713
+window,end_idx,17982
+window,row_count,270
+fvg_counts,detected_total,51
+fvg_counts,detected_bull,36
+fvg_counts,detected_bear,15
+fvg_counts,touching_window_total,53
+fvg_counts,touching_window_bull,38
+fvg_counts,touching_window_bear,15
+fvg_counts,active_reps_intersecting_window_total,53
+fvg_counts,active_reps_intersecting_window_bull,38
+fvg_counts,active_reps_intersecting_window_bear,15
+fvg_counts,carried_in_active_reps_total,2
+fvg_counts,carried_in_active_reps_bull,2
+fvg_counts,carried_in_active_reps_bear,0
+ifvg_counts,detected_total,5
+ifvg_counts,detected_bull,2
+ifvg_counts,detected_bear,3
+ifvg_counts,active_rows_bull,270
+ifvg_counts,active_rows_bear,71
+fill_selection_counts,bull_rows_where_fill_rep_differs_from_structural_selected,14
+fill_selection_counts,bear_rows_where_fill_rep_differs_from_structural_selected,3
+fill_selection_counts,bull_rows_where_visual_confusion_pattern_occurs,14
+fill_selection_counts,bear_rows_where_visual_confusion_pattern_occurs,3

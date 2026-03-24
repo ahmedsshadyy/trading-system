@@ -1,0 +1,36 @@
+{
+  "window": {
+    "start": "2026-01-11 22:00:00+00:00",
+    "end": "2026-03-13 17:00:00+00:00",
+    "start_idx": 17713,
+    "end_idx": 17982,
+    "row_count": 270
+  },
+  "fvg_counts": {
+    "detected_total": 51,
+    "detected_bull": 36,
+    "detected_bear": 15,
+    "touching_window_total": 53,
+    "touching_window_bull": 38,
+    "touching_window_bear": 15,
+    "active_reps_intersecting_window_total": 53,
+    "active_reps_intersecting_window_bull": 38,
+    "active_reps_intersecting_window_bear": 15,
+    "carried_in_active_reps_total": 2,
+    "carried_in_active_reps_bull": 2,
+    "carried_in_active_reps_bear": 0
+  },
+  "ifvg_counts": {
+    "detected_total": 5,
+    "detected_bull": 2,
+    "detected_bear": 3,
+    "active_rows_bull": 270,
+    "active_rows_bear": 71
+  },
+  "fill_selection_counts": {
+    "bull_rows_where_fill_rep_differs_from_structural_selected": 14,
+    "bear_rows_where_fill_rep_differs_from_structural_selected": 3,
+    "bull_rows_where_visual_confusion_pattern_occurs": 14,
+    "bear_rows_where_visual_confusion_pattern_occurs": 3
+  }
+}
