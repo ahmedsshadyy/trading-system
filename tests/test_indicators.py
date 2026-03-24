@@ -2127,14 +2127,34 @@ class TestSMC:
 
     def test_add_fvg_fill(self, sample_df):
         from src.indicators.foundation.volatility import add_atr
-        from src.indicators.smc.fvg import add_fvg
+        from src.indicators.smc.fvg import collect_fvg_debug_tables
         from src.indicators.smc.fvg_fill import add_fvg_fill
 
         result = add_atr(sample_df)
-        result = add_fvg(result)
-        result = add_fvg_fill(result)
+        debug_tables = collect_fvg_debug_tables(result)
+        result = add_fvg_fill(debug_tables["frame"], debug_tables=debug_tables)
         assert "fvg_fill_pct" in result.columns
         assert "fvg_age" in result.columns
+        assert "fvg_fill_bull_remaining_width" in result.columns
+        assert "fvg_fill_bear_remaining_width" in result.columns
+        assert "fvg_fill_bull_rep_id" in result.columns
+        assert "fvg_fill_bear_rep_id" in result.columns
+
+    def test_add_ifvg(self, sample_df):
+        from src.indicators.foundation.volatility import add_atr
+        from src.indicators.smc.fvg import collect_fvg_debug_tables
+        from src.indicators.smc.ifvg import add_ifvg
+
+        result = add_atr(sample_df)
+        debug_tables = collect_fvg_debug_tables(result)
+        result = add_ifvg(debug_tables["frame"], debug_tables=debug_tables)
+        assert "ifvg_bull" in result.columns
+        assert "ifvg_bear" in result.columns
+        assert "ifvg_bull_detect_flag" in result.columns
+        assert "ifvg_bear_active" in result.columns
+        assert "ifvg_bull_source_fvg_event_id" in result.columns
+        assert "ifvg_bull_active_age_decay" in result.columns
+        assert "ifvg_bear_active_effective_significance" in result.columns
 
     def test_add_ob(self, sample_df):
         from src.indicators.foundation.volatility import add_atr

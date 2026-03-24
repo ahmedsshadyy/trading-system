@@ -47,7 +47,7 @@ from src.indicators.structure.bos import add_bos
 from src.indicators.structure.choch import add_choch
 
 # --- SMC ---
-from src.indicators.smc.fvg import add_fvg
+from src.indicators.smc.fvg import collect_fvg_debug_tables
 from src.indicators.smc.fvg_fill import add_fvg_fill
 from src.indicators.smc.ifvg import add_ifvg
 from src.indicators.smc.ob import add_ob
@@ -119,9 +119,10 @@ def build_live_indicators(
     out = add_wick_ratio(out)
 
     # === Layer 5: SMC (no labels) ===
-    out = add_fvg(out)
-    out = add_fvg_fill(out)
-    out = add_ifvg(out)
+    fvg_debug = collect_fvg_debug_tables(out)
+    out = fvg_debug["frame"]
+    out = add_fvg_fill(out, debug_tables=fvg_debug)
+    out = add_ifvg(out, debug_tables=fvg_debug)
     out = add_displacement_candle(out)
     out = add_ob(out)
     out = add_ob_mitigation(out)

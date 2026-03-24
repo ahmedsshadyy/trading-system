@@ -1,0 +1,21 @@
+{
+  "active_id": 2895,
+  "side": "bear",
+  "start_idx": 17799,
+  "detect_idx": 17799,
+  "age_anchor_idx": 17799,
+  "end_idx": 17847.0,
+  "terminal_reason": "expired",
+  "low": 5205.615,
+  "high": 5290.755,
+  "width": 85.14000000000033,
+  "width_atr": 0.6788566708487064,
+  "base_quality": 0.4332618013349484,
+  "source_count": 1,
+  "source_ids": "2895",
+  "source_detect_indices": "17799",
+  "start_ts": "2026-01-30 06:00:00+00:00",
+  "detect_ts": "2026-01-30 06:00:00+00:00",
+  "end_ts": "2026-02-11 06:00:00+00:00",
+  "carried_in": false
+}

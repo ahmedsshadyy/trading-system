@@ -1,0 +1,22 @@
+{
+  "target_ids": [
+    2894,
+    2895
+  ],
+  "files": {
+    "2894": {
+      "meta": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2894_rep_meta.json",
+      "member_history": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2894_member_history.csv",
+      "plot_history": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2894_plot_history.csv",
+      "event_history": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2894_event_history.csv",
+      "mismatch_rows": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2894_bear_fill_mismatch_rows.csv"
+    },
+    "2895": {
+      "meta": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2895_rep_meta.json",
+      "member_history": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2895_member_history.csv",
+      "plot_history": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2895_plot_history.csv",
+      "event_history": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2895_event_history.csv",
+      "mismatch_rows": "/Users/ahmadshady/Developer/trading-system/notebooks/smc/forensics_2026-01-11_plus/targeted_bear_fvgs_2026_01_29_30/bear_fvg_2895_bear_fill_mismatch_rows.csv"
+    }
+  }
+}
