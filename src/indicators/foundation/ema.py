@@ -26,7 +26,8 @@ def add_emas(
     Per period P
     ~~~~~~~~~~~~
     * ``ema_{P}``              – EMA value
-    * ``ema_{P}_slope``        – 3-candle Δ normalised by ATR-14
+    * ``ema_{P}_slope``        – raw 3-candle Δ
+    * ``ema_{P}_slope_atr``    – raw 3-candle Δ normalised by ATR-14
     * ``price_above_ema_{P}``  – binary
 
     Cross flags
@@ -42,7 +43,9 @@ def add_emas(
     for p in periods:
         ema = ta.ema(out["close"], length=p)
         out[f"ema_{p}"] = ema
-        out[f"ema_{p}_slope"] = ema.diff(3) / out["atr_14"]
+        raw_slope = ema.diff(3)
+        out[f"ema_{p}_slope"] = raw_slope
+        out[f"ema_{p}_slope_atr"] = raw_slope / out["atr_14"]
         out[f"price_above_ema_{p}"] = (out["close"] > ema).astype(int)
 
     if 20 in periods and 50 in periods:

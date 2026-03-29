@@ -1,11 +1,15 @@
 import os
+import sys
 from pathlib import Path
 import pyarrow.parquet as pq
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv(Path(__file__).parent.parent / ".env")
+
+from src.indicators._helpers.schema import normalize_candle_schema
 
 engine = create_engine(os.getenv("DATABASE_URL"))
 
@@ -50,8 +54,7 @@ with tqdm(total=len(parquet_files), desc="Loading candles", unit="file") as bar:
 
         df = pq.read_table(f).to_pandas()
 
-        # Rename columns to match schema
-        df = df.rename(columns={"tickVolume": "volume"})
+        df = normalize_candle_schema(df, require_volume=True)
 
         # Keep only schema columns
         df = df[

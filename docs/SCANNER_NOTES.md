@@ -168,6 +168,17 @@ These apply across multiple strategies:
 
 1. **Regime gating** — every strategy has a regime requirement. Check `regime` column
    before evaluating strategy conditions.
+   Canonical doctrine:
+   - the scanner-safe base regime is frozen to `RANGING / TRANSITIONAL / TRENDING`
+   - the stabilized `regime` output is the only primary contract
+   - `raw_regime*` fields are validator/audit outputs, not scanner-gating inputs
+   Treat degraded regime context with caution:
+   - `regime_boundary_flag == 1`
+   - `regime_confidence < 0.60`
+   - `bars_in_regime <= 2`
+   - or the canonical convenience flag `regime_context_caution == 1`
+   Derived richer regime labels, if added later, must sit on top of canonical
+   regime rather than replacing it inside scanner logic.
 
 2. **Daily bias** — most strategies require Daily trend alignment. Scanner loads
    Daily timeframe data and checks `trend_state` on Daily.

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(python -m pytest tests/test_equal_hl.py tests/test_equal_hl_research.py tests/test_equal_hl_validation.py -q)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''scripts/audit_equal_hl_features.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"from src.validation.indicators.equal_hl import _enrich_detect_rows_with_context, _add_forward_returns, EQHL_AUDIT_RAW_FEATURES; print\\(''imports OK''\\); print\\(''Stage 1 features:'', [f for f in EQHL_AUDIT_RAW_FEATURES if ''distance_atr'' not in f or ''at_detect'' in f][:8]\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''''scripts/audit_equal_hl_features.py''''\\).read\\(\\)\\); print\\(''''OK''''\\)\")",
+      "Bash(python -m pytest tests/test_equal_hl.py tests/test_equal_hl_validation.py -q)",
+      "Bash(poetry run:*)",
+      "Bash(ls /Users/ahmadshady/Developer/trading-system/tests/test_equal_hl*.py /Users/ahmadshady/Developer/trading-system/tests/test_sweeps*.py /Users/ahmadshady/Developer/trading-system/tests/test_displacement*.py)",
+      "Bash(python -m pytest tests/test_equal_hl.py tests/test_equal_hl_research.py tests/test_equal_hl_validation.py tests/test_sweeps.py tests/test_displacement.py -x -q)",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(ls /Users/ahmadshady/Developer/trading-system/scripts/validate_vol*)"
+    ]
+  }
+}

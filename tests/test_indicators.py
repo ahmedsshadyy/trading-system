@@ -92,6 +92,85 @@ def _run_trend_state(
     return df
 
 
+def _run_trend_with_regime_context(closes: list[float]) -> pd.DataFrame:
+    from src.indicators.foundation.volatility import add_atr, add_bb_width
+    from src.indicators.foundation.adx import add_adx
+    from src.indicators.foundation.ema import add_emas
+    from src.indicators.foundation.regime import add_regime
+    from src.indicators.structure.swings import add_swings
+    from src.indicators.structure.trend_state import add_trend_state
+
+    df = _make_ohlc_from_close(closes)
+    df = add_atr(df, period=3)
+    df = add_emas(df)
+    df = add_adx(df)
+    df = add_bb_width(df)
+    df = add_swings(
+        df,
+        window=2,
+        atr_length=3,
+        min_retrace_atr=0.0,
+        min_confirm_bars=1,
+    )
+    df = add_trend_state(
+        df,
+        atr_length=3,
+        event_freshness_bars=6,
+        bias_half_life_bars=2,
+        bias_neutral_ttl_bars=3,
+        bias_min_score=0.40,
+        emerging_strength_threshold=0.12,
+        structure_loss_strength_threshold=0.08,
+    )
+    df = add_regime(df)
+    return df
+
+
+def _run_trend_with_env_overrides(
+    closes: list[float],
+    *,
+    event_freshness_bars: int = 6,
+    bias_half_life_bars: int = 2,
+    bias_neutral_ttl_bars: int = 3,
+    bias_min_score: float = 0.40,
+    env_start_idx: int | None = None,
+) -> pd.DataFrame:
+    from src.indicators.foundation.volatility import add_atr, add_bb_width
+    from src.indicators.foundation.adx import add_adx
+    from src.indicators.foundation.ema import add_emas
+    from src.indicators.structure.swings import add_swings
+    from src.indicators.structure.trend_state import add_trend_state
+
+    df = _make_ohlc_from_close(closes)
+    df = add_atr(df, period=3)
+    df = add_emas(df)
+    df = add_adx(df)
+    df = add_bb_width(df)
+    df = add_swings(
+        df,
+        window=2,
+        atr_length=3,
+        min_retrace_atr=0.0,
+        min_confirm_bars=1,
+    )
+
+    if env_start_idx is not None:
+        df.loc[df.index >= env_start_idx, "adx_strength"] = 0.85
+        df.loc[df.index >= env_start_idx, "ema_slope_strength"] = 0.85
+        df.loc[df.index >= env_start_idx, "compression_score"] = 0.20
+        df.loc[df.index >= env_start_idx, "structure_continuity"] = 0.85
+
+    df = add_trend_state(
+        df,
+        atr_length=3,
+        event_freshness_bars=event_freshness_bars,
+        bias_half_life_bars=bias_half_life_bars,
+        bias_neutral_ttl_bars=bias_neutral_ttl_bars,
+        bias_min_score=bias_min_score,
+    )
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -560,6 +639,33 @@ class TestTrendStateBehavior:
         )
 
         expected = {
+            "trend_prev",
+            "trend_enter_bullish",
+            "trend_enter_bearish",
+            "trend_enter_neutral",
+            "bars_in_trend_state",
+            "trend_persistence_5",
+            "trend_persistence_20",
+            "trend_direct_opposite_flip",
+            "trend_bias_inherited_flag",
+            "trend_bias_expired_flag",
+            "trend_bias_contradicted_flag",
+            "trend_conf_structure_continuity",
+            "trend_conf_freshness",
+            "trend_conf_event_quality",
+            "trend_conf_persistence",
+            "trend_conf_contradiction_penalty",
+            "trend_conf_neutral_coherence",
+            "trend_bull_commit_score",
+            "trend_bear_commit_score",
+            "trend_directional_evidence_score",
+            "trend_commit_gap",
+            "trend_commit_dominant_side",
+            "trend_commit_gap_persist_3",
+            "trend_bull_dominant_2_of_3",
+            "trend_bear_dominant_2_of_3",
+            "trend_bull_commit_override",
+            "trend_bear_commit_override",
             "trend_structure_loss_bull",
             "trend_structure_loss_bear",
             "trend_emerging_bull",
@@ -607,13 +713,263 @@ class TestTrendStateBehavior:
         # After enough neutral bars, bias should die.
         assert ((df["trend_state"] == 0) & (df["trend_bias_state"] == 0)).any()
 
-    def test_confidence_values_stay_in_expected_set(self):
+    def test_confidence_values_stay_in_unit_interval(self):
         df = _run_trend_state(
             [100, 103, 101, 105, 103, 107, 105, 103, 104, 102, 101, 99]
         )
 
-        vals = set(df["trend_confidence"].dropna().astype(int).unique())
-        assert vals.issubset({-1, 0, 1, 2})
+        conf = pd.to_numeric(df["trend_confidence"], errors="coerce")
+        assert ((conf >= 0.0) & (conf <= 1.0)).all()
+
+    def test_neutral_rows_can_have_nonzero_confidence(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 109, 109, 109, 109, 109, 109, 109],
+            event_freshness_bars=3,
+            bias_neutral_ttl_bars=4,
+        )
+
+        neutral = df[df["trend_state"] == 0]
+        assert not neutral.empty
+        assert (neutral["trend_confidence"] > 0).any()
+        assert (neutral["trend_confidence"] <= 0.65).all()
+
+    def test_bull_commit_override_can_promote_direction_without_strict_readiness(self):
+        df = _run_trend_state(
+            [
+                100,
+                103,
+                101,
+                105,
+                103,
+                107,
+                105,
+                109,
+                108.5,
+                108.9,
+                109.4,
+                109.8,
+                110.2,
+                110.6,
+                111.0,
+                111.4,
+            ],
+            event_freshness_bars=4,
+            bias_neutral_ttl_bars=4,
+        )
+
+        rows = df[df["trend_bull_commit_override"] == 1]
+        assert not rows.empty
+        assert (rows["trend_state"] == 1).all()
+        assert (rows["trend_bull_ready"] == 0).all()
+        assert (rows["trend_bull_commit_score"] >= 0.62).all()
+        assert (rows["trend_bear_commit_score"] <= 0.38).all()
+
+    def test_bear_commit_override_can_promote_direction_without_strict_readiness(self):
+        df = _run_trend_state(
+            [
+                111,
+                108,
+                110,
+                106,
+                108,
+                104,
+                106,
+                102,
+                102.1,
+                102.2,
+                102.0,
+                101.8,
+                101.6,
+                101.4,
+                101.2,
+                101.0,
+            ],
+            event_freshness_bars=4,
+            bias_neutral_ttl_bars=4,
+        )
+
+        rows = df[df["trend_bear_commit_override"] == 1]
+        assert not rows.empty
+        assert (rows["trend_state"] == -1).all()
+        assert (rows["trend_bear_ready"] == 0).all()
+        assert (rows["trend_bear_commit_score"] >= 0.62).all()
+        assert (rows["trend_bull_commit_score"] <= 0.38).all()
+
+    def test_close_commit_scores_remain_neutral(self):
+        df = _run_trend_state(
+            [
+                100,
+                102,
+                101,
+                103,
+                102,
+                104,
+                103,
+                105,
+                104,
+                103,
+                104,
+                103,
+                104,
+                103,
+                104,
+                103,
+            ],
+            event_freshness_bars=4,
+            bias_neutral_ttl_bars=4,
+        )
+
+        row = df.iloc[-1]
+        assert int(row["trend_state"]) == 0
+        assert int(row["trend_bull_commit_override"]) == 0
+        assert int(row["trend_bear_commit_override"]) == 0
+        assert (
+            abs(
+                float(row["trend_bull_commit_score"])
+                - float(row["trend_bear_commit_score"])
+            )
+            < 0.18
+        )
+
+    def test_neutral_confidence_falls_as_directional_evidence_rises(self):
+        low_evidence = _run_trend_state(
+            [
+                100,
+                103,
+                101,
+                104,
+                102,
+                104,
+                103,
+                105,
+                104,
+                103,
+                104,
+                103,
+                104,
+                103,
+                104,
+                103,
+            ],
+            event_freshness_bars=4,
+            bias_neutral_ttl_bars=4,
+        )
+        high_evidence = _run_trend_state(
+            [
+                100,
+                103,
+                101,
+                105,
+                103,
+                107,
+                105,
+                109,
+                109,
+                109,
+                109,
+                109,
+                109,
+                109,
+                109,
+                109,
+            ],
+            event_freshness_bars=4,
+            bias_neutral_ttl_bars=4,
+        )
+
+        low_row = low_evidence[low_evidence["trend_state"] == 0].iloc[-1]
+        high_row = high_evidence[high_evidence["trend_state"] == 0].iloc[-1]
+
+        assert float(high_row["trend_directional_evidence_score"]) > float(
+            low_row["trend_directional_evidence_score"]
+        )
+        assert float(high_row["trend_confidence"]) < float(low_row["trend_confidence"])
+
+    def test_coherent_directional_fixture_has_higher_confidence_than_weaker_directional_fixture(
+        self,
+    ):
+        coherent = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 109, 107, 111],
+            event_freshness_bars=4,
+        )
+        weaker = _run_trend_state(
+            [
+                100,
+                103,
+                101,
+                105,
+                103,
+                107,
+                105,
+                109,
+                108.5,
+                108.9,
+                109.4,
+                109.8,
+                110.2,
+                110.6,
+                111.0,
+                111.4,
+            ],
+            event_freshness_bars=4,
+            bias_neutral_ttl_bars=4,
+        )
+
+        coherent_dir = coherent[coherent["trend_state"] != 0]["trend_confidence"]
+        weaker_dir = weaker[weaker["trend_state"] != 0]["trend_confidence"]
+
+        assert not coherent_dir.empty
+        assert not weaker_dir.empty
+        assert float(coherent_dir.mean()) > float(weaker_dir.mean())
+
+    def test_neutral_dwell_contract_counts_neutral_runs(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 109, 109, 109, 109, 109, 109, 109],
+            event_freshness_bars=3,
+            bias_neutral_ttl_bars=4,
+        )
+
+        neutral = df[df["trend_state"] == 0]
+        assert not neutral.empty
+        assert (neutral["bars_in_trend_state"] >= 1).all()
+        assert neutral["bars_in_trend_state"].max() > 1
+
+    def test_commit_gap_helpers_obey_contract(self):
+        df = _run_trend_state(
+            [100, 103, 101, 105, 103, 107, 105, 109, 108, 107, 106, 105, 106, 107, 108]
+        )
+
+        gap = pd.to_numeric(df["trend_commit_gap"], errors="coerce")
+        bull = pd.to_numeric(df["trend_bull_commit_score"], errors="coerce")
+        bear = pd.to_numeric(df["trend_bear_commit_score"], errors="coerce")
+        dom = pd.to_numeric(df["trend_commit_dominant_side"], errors="coerce")
+        gap_persist = pd.to_numeric(df["trend_commit_gap_persist_3"], errors="coerce")
+
+        np.testing.assert_allclose(gap.to_numpy(), (bull - bear).abs().to_numpy())
+        assert set(dom.dropna().astype(int).unique()).issubset({-1, 0, 1})
+        assert ((gap_persist >= 0.0) & (gap_persist <= 1.0)).all()
+        assert_binary_column(df, "trend_bull_dominant_2_of_3")
+        assert_binary_column(df, "trend_bear_dominant_2_of_3")
+
+    def test_trend_persistence_fields_stay_in_unit_interval(self):
+        df = _run_trend_state([100, 103, 101, 105, 103, 107, 105, 109, 107, 111])
+        assert (
+            (df["trend_persistence_5"].dropna() >= 0.0)
+            & (df["trend_persistence_5"].dropna() <= 1.0)
+        ).all()
+        assert (
+            (df["trend_persistence_20"].dropna() >= 0.0)
+            & (df["trend_persistence_20"].dropna() <= 1.0)
+        ).all()
+
+    def test_transition_helper_flags_direct_opposite_flips(self):
+        from src.indicators.structure.trend_state import _add_trend_transition_contract
+
+        raw = pd.DataFrame({"trend_state": pd.Series([1.0, 1.0, -1.0, -1.0, 0.0, 1.0])})
+        result = _add_trend_transition_contract(raw)
+        assert int(result.loc[2, "trend_direct_opposite_flip"]) == 1
+        assert int(result.loc[5, "trend_enter_bullish"]) == 1
+        assert int(result.loc[4, "trend_enter_neutral"]) == 1
 
     def test_strength_is_positive_in_bullish_regime_on_average(self):
         df = _run_trend_state([100, 103, 101, 105, 103, 107, 105, 109, 107, 111])
@@ -712,6 +1068,48 @@ class TestTrendStateBehavior:
         assert (
             (df["trend_strength_ema"] >= -1.0) & (df["trend_strength_ema"] <= 1.0)
         ).all()
+
+    def test_validator_exposes_trend_regime_interaction_sections(self):
+        from src.validation.indicators.trend_state import validate_trend_state
+
+        df = _run_trend_with_regime_context(
+            [100, 103, 101, 105, 103, 107, 105, 109, 108, 107, 106, 105, 106, 107, 108]
+        )
+        result = validate_trend_state(
+            df.tail(10),
+            summary_df=df,
+            outpath="/tmp/trend_state_validation_test.html",
+            n_windows=3,
+        )
+        summary = result["summary"]
+        assert "transition_matrix" in summary
+        assert "dwell_diagnostics" in summary
+        assert "confidence_by_state" in summary
+        assert "confidence_ordering_check" in summary
+        assert "confidence_separation_check" in summary
+        assert "neutral_confidence_cap_check" in summary
+        assert "strength_by_state" in summary
+        assert "commitment_by_state" in summary
+        assert "bias_interaction" in summary
+        assert "regime_interaction" in summary
+        assert "neutral_overuse_audit" in summary
+        assert "neutral_confidence_audit" in summary
+        assert "neutral_in_trend_audit" in summary
+        assert "directional_in_range_audit" in summary
+        assert "neutral_with_directional_bias_audit" in summary
+        assert "commit_gap_audit" in summary
+        assert "neutral_age_audit" in summary
+        assert "semantic_buckets" in summary
+        assert "neutral_with_high_bull_commit" in summary["semantic_buckets"]
+        assert (
+            "neutral_with_high_directional_evidence_strict"
+            in summary["semantic_buckets"]
+        )
+        assert (
+            "neutral_with_high_directional_evidence_broad"
+            in summary["semantic_buckets"]
+        )
+        assert result["transition_windows"]
 
 
 class TestBOSContext:
@@ -2048,6 +2446,16 @@ class TestVolatility:
 
 
 class TestVolume:
+    def test_add_volume_features(self, sample_df):
+        from src.indicators.foundation.volume import add_volume_features
+
+        result = add_volume_features(sample_df)
+        assert "vol_ratio" in result.columns
+        assert "candle_delta_proxy" in result.columns
+        assert "signed_tick_pressure_blend" in result.columns
+        assert "pressure_divergence_flag" in result.columns
+        assert "upper_rejection_effort" in result.columns
+
     def test_add_volume_ratio(self, sample_df):
         from src.indicators.foundation.volume import add_volume_ratio
 
@@ -2078,6 +2486,20 @@ class TestVolume:
 
 
 class TestValue:
+    def test_add_anchored_vwap(self, sample_df):
+        from src.indicators.foundation.value import add_anchored_vwap
+
+        result = add_anchored_vwap(
+            sample_df,
+            anchor_idx=20,
+            anchor_label="day_open",
+            anchor_class="live_safe",
+        )
+        assert "avwap" in result.columns
+        assert "avwap_std" in result.columns
+        assert "avwap_anchor_label" in result.columns
+        assert result.loc[20, "avwap_anchor_label"] == "day_open"
+
     def test_prev_day_hl(self, intraday_df):
         from src.indicators.foundation.value import add_prev_day_hl
 
@@ -2267,7 +2689,9 @@ class TestRegime:
         result = add_trend_state(result)
         result = add_regime(result)
         assert "regime" in result.columns
-        assert set(result["regime"].unique()).issubset({0, 1, 2})
+        valid = pd.to_numeric(result["regime"], errors="coerce").dropna().astype(int)
+        assert not valid.empty
+        assert set(valid.unique()).issubset({0, 1, 2})
 
 
 # ---------------------------------------------------------------------------

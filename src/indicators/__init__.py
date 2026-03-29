@@ -24,6 +24,14 @@ from src.indicators.foundation.volatility import (
     add_body_ratio,
 )
 from src.indicators.foundation.volume import (
+    add_volume_features,
+    add_volume_baselines,
+    add_volume_flags,
+    add_effort_result_features,
+    add_delta_proxy_features,
+    add_signed_tick_pressure_features,
+    add_vsa_features,
+    add_wick_effort_features,
     add_volume_ratio,
     add_key_volume_flags,
     add_candle_delta_proxy,
@@ -32,6 +40,7 @@ from src.indicators.foundation.volume import (
 )
 from src.indicators.foundation.value import (
     compute_anchored_vwap,
+    add_anchored_vwap,
     add_avwap_from_last_swing,
     add_asian_session_hl,
     add_prev_day_hl,
@@ -42,7 +51,7 @@ from src.indicators.foundation.volume_profile import (
     compute_volume_profile,
     add_volume_profile,
 )
-from src.indicators.foundation.session import add_session_classifier, add_time_features
+from src.indicators.foundation.session import add_session_features, add_time_features
 from src.indicators.foundation.regime import add_regime
 
 # --- Structure (structural backbone) ---
@@ -71,8 +80,14 @@ from src.indicators.smc import (
 from src.indicators.pipelines.build_research import (
     build_research_indicators,
     build_all_indicators,
+    materialize_research_features,
+    run_research_pipeline,
 )
-from src.indicators.pipelines.build_live import build_live_indicators
+from src.indicators.pipelines.build_live import (
+    build_live_indicators,
+    materialize_live_features,
+    run_live_pipeline,
+)
 
 # SMT deferred
 # from src.indicators.smt import add_smt_divergence
@@ -90,12 +105,21 @@ __all__ = [
     "compute_atr_ratio",
     "add_rolling_atr_ratio",
     "add_body_ratio",
+    "add_volume_features",
+    "add_volume_baselines",
+    "add_volume_flags",
+    "add_effort_result_features",
+    "add_delta_proxy_features",
+    "add_signed_tick_pressure_features",
+    "add_vsa_features",
+    "add_wick_effort_features",
     "add_volume_ratio",
     "add_key_volume_flags",
     "add_candle_delta_proxy",
     "add_vsa",
     "add_wick_ratio",
     "compute_anchored_vwap",
+    "add_anchored_vwap",
     "add_avwap_from_last_swing",
     "add_asian_session_hl",
     "add_prev_day_hl",
@@ -103,7 +127,7 @@ __all__ = [
     "add_round_number_flag",
     "compute_volume_profile",
     "add_volume_profile",
-    "add_session_classifier",
+    "add_session_features",
     "add_time_features",
     "add_regime",
     # Structure
@@ -128,4 +152,8 @@ __all__ = [
     "build_research_indicators",
     "build_all_indicators",
     "build_live_indicators",
+    "materialize_live_features",
+    "materialize_research_features",
+    "run_live_pipeline",
+    "run_research_pipeline",
 ]

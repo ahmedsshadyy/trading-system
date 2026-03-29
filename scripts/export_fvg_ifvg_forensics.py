@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
+from src.indicators._helpers.schema import normalize_candle_schema
 from src.indicators.foundation.volatility import add_atr
 from src.indicators.research.fvg_research import build_fvg_research_table
 from src.indicators.smc.fvg import ALL_FVG_CORE_COLUMNS, collect_fvg_debug_tables
@@ -266,7 +267,7 @@ def _add_rep_timestamps(
 
 
 def main() -> None:
-    df = pd.read_parquet(DATA_FILE)
+    df = normalize_candle_schema(pd.read_parquet(DATA_FILE), require_volume=False)
     df = df.sort_values("timestamp").reset_index(drop=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 

@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
 
 import pandas as pd
 
+from src.indicators._helpers.schema import normalize_candle_schema
 from src.indicators.foundation.volatility import add_atr
 from src.indicators.structure.swings import add_swings
 from src.validation.indicators.swings import validate_swings
@@ -22,7 +23,7 @@ SWING_CONFIRM_BARS = 2
 
 
 def main() -> None:
-    df = pd.read_parquet(DATA_FILE)
+    df = normalize_candle_schema(pd.read_parquet(DATA_FILE), require_volume=False)
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     df = add_atr(df)

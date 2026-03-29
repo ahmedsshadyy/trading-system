@@ -18,6 +18,7 @@ from sqlalchemy import create_engine
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+from src.indicators._helpers.schema import normalize_candle_schema
 from src.indicators.foundation.volatility import add_atr
 from src.indicators.structure.swings import add_swings
 
@@ -31,7 +32,7 @@ def load_candles(instrument, timeframe, engine):
         WHERE instrument = '{instrument}' AND timeframe = '{timeframe}'
         ORDER BY timestamp ASC
     """
-    return pd.read_sql(query, engine)
+    return normalize_candle_schema(pd.read_sql(query, engine), require_volume=True)
 
 
 def summarize_swings(df, label):
@@ -123,7 +124,6 @@ def main():
     df = load_candles("XAU_USD", "H4", engine)
     for col in ("open", "high", "low", "close"):
         df[col] = df[col].astype(float)
-    df["volume"] = df["volume"].astype(float)
     print(f"  {len(df):,} candles")
 
     df = add_atr(df)
