@@ -176,7 +176,8 @@ Single-feature tests are useful, but many structural features only become meanin
 
 Examples:
 - high `bos_displacement_score` + trend alignment
-- high `bos_displacement_score` + after sweep
+- high `bos_displacement_score` + after sweep 
+-  high `bos_displacement_score` + after EQH/L
 - high `bos_source_rank` + after displacement
 - fresh source + trend alignment + nearby liquidity event
 

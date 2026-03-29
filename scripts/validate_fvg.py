@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
 
 import pandas as pd
 
+from src.indicators._helpers.schema import normalize_candle_schema
 from src.indicators.foundation.volatility import add_atr
 from src.indicators.research.fvg_research import build_fvg_research_table
 from src.indicators.smc.fvg import collect_fvg_debug_tables
@@ -72,7 +73,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    df = pd.read_parquet(DATA_FILE)
+    df = normalize_candle_schema(pd.read_parquet(DATA_FILE), require_volume=False)
     df = df.sort_values("timestamp").reset_index(drop=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 

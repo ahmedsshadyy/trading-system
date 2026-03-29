@@ -1,0 +1,148 @@
+{
+  "dataset": "data/raw/XAU_USD_H4.parquet",
+  "thresholds": {
+    "atr_length": 14,
+    "body_atr_mult": 1.35,
+    "close_extreme_frac": 0.2,
+    "min_body_frac": 0.6,
+    "max_opposite_wick_frac": 0.2
+  },
+  "candidate_comparison": {
+    "event_count": 612,
+    "bull_count": 335,
+    "bear_count": 277,
+    "hold_5_rate": 0.6568627450980392,
+    "failed_5_rate": 0.09640522875816994,
+    "tradeable_score_mean": 0.6487760149385288,
+    "excursion_ratio_5_capped": {
+      "count": 612,
+      "mean": 2.506975891705348,
+      "median": 0.8799072544875377,
+      "std": 3.225600066190275,
+      "min": 0.0,
+      "max": 10.0
+    },
+    "recommended_excursion_ratio_variant": "capped",
+    "body_atr_hold_monotonicity_ok": true,
+    "tradeable_bucket_order_ok": true,
+    "bos_same_bar_rate": 0.037337662337662336,
+    "bos_pm1_rate": 0.08441558441558442,
+    "bos_pm2_rate": 0.14935064935064934,
+    "bos_quality_same_bar_rate": 0.032467532467532464,
+    "bos_quality_pm1_rate": 0.08441558441558442,
+    "bos_quality_pm2_rate": 0.16233766233766234,
+    "bos_tradeable_same_bar_rate": 0.025974025974025976,
+    "bos_tradeable_pm1_rate": 0.05194805194805195,
+    "bos_tradeable_pm2_rate": 0.1038961038961039,
+    "choch_same_bar_rate": 0.035794183445190156,
+    "choch_pm1_rate": 0.09843400447427293,
+    "choch_pm2_rate": 0.1767337807606264,
+    "choch_quality_same_bar_rate": 0.026785714285714284,
+    "choch_quality_pm1_rate": 0.05357142857142857,
+    "choch_quality_pm2_rate": 0.13392857142857142,
+    "choch_tradeable_same_bar_rate": 0.026785714285714284,
+    "choch_tradeable_pm1_rate": 0.08035714285714286,
+    "choch_tradeable_pm2_rate": 0.14285714285714285
+  },
+  "overlap_summary": {
+    "bos": {
+      "event_count": 616,
+      "same_bar": {
+        "count": 23,
+        "rate": 0.037337662337662336
+      },
+      "pm1": {
+        "count": 52,
+        "rate": 0.08441558441558442
+      },
+      "pm2": {
+        "count": 92,
+        "rate": 0.14935064935064934
+      },
+      "top_quartile": {
+        "quality": {
+          "event_count": 154,
+          "same_bar": {
+            "count": 5,
+            "rate": 0.032467532467532464
+          },
+          "pm1": {
+            "count": 13,
+            "rate": 0.08441558441558442
+          },
+          "pm2": {
+            "count": 25,
+            "rate": 0.16233766233766234
+          },
+          "threshold": 0.5252334890964852
+        },
+        "tradeable": {
+          "event_count": 154,
+          "same_bar": {
+            "count": 4,
+            "rate": 0.025974025974025976
+          },
+          "pm1": {
+            "count": 8,
+            "rate": 0.05194805194805195
+          },
+          "pm2": {
+            "count": 16,
+            "rate": 0.1038961038961039
+          },
+          "threshold": 0.7074334195881196
+        }
+      }
+    },
+    "choch": {
+      "event_count": 447,
+      "same_bar": {
+        "count": 16,
+        "rate": 0.035794183445190156
+      },
+      "pm1": {
+        "count": 44,
+        "rate": 0.09843400447427293
+      },
+      "pm2": {
+        "count": 79,
+        "rate": 0.1767337807606264
+      },
+      "top_quartile": {
+        "quality": {
+          "event_count": 112,
+          "same_bar": {
+            "count": 3,
+            "rate": 0.026785714285714284
+          },
+          "pm1": {
+            "count": 6,
+            "rate": 0.05357142857142857
+          },
+          "pm2": {
+            "count": 15,
+            "rate": 0.13392857142857142
+          },
+          "threshold": 0.5893099903796439
+        },
+        "tradeable": {
+          "event_count": 112,
+          "same_bar": {
+            "count": 3,
+            "rate": 0.026785714285714284
+          },
+          "pm1": {
+            "count": 9,
+            "rate": 0.08035714285714286
+          },
+          "pm2": {
+            "count": 16,
+            "rate": 0.14285714285714285
+          },
+          "threshold": 0.87567963782589
+        }
+      }
+    }
+  },
+  "recommended_excursion_ratio_variant": "capped"
+}

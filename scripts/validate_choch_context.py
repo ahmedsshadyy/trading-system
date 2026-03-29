@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
 
 import pandas as pd
 
+from src.indicators._helpers.schema import normalize_candle_schema
 from src.indicators.foundation.volatility import add_atr
 from src.indicators.structure.swings import add_swings
 from src.indicators.structure.trend_state import add_trend_state
@@ -53,7 +54,7 @@ def _print_summary(value: object, *, indent: int = 0) -> None:
 
 
 def main() -> None:
-    df = pd.read_parquet(DATA_FILE)
+    df = normalize_candle_schema(pd.read_parquet(DATA_FILE), require_volume=False)
     df = df.sort_values("timestamp").reset_index(drop=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 

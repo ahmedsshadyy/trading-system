@@ -5,7 +5,7 @@
 3. Need to work on : ta_core (make sure its alright), trend, momentum,regime,session,value,volatility,volume profile,volume. 
 4. Then finalize with SMT as well, which also requires data fetching for several instruments
 5. Enhance current strategies
-
+6. do support & resistance, fibonacci and price action
 Sessions and AMD. 
 1. need for research: combinations of (up,down) x (Asia,London,NY)
 2. need for research: combinations of (A,M,D) x (Asia,London,NY)

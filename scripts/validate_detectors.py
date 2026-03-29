@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from src.indicators import build_all_indicators
+from src.indicators._helpers.schema import normalize_candle_schema
 
 
 def load_candles(instrument, timeframe, engine):
@@ -31,7 +32,7 @@ def load_candles(instrument, timeframe, engine):
         WHERE instrument = '{instrument}' AND timeframe = '{timeframe}'
         ORDER BY timestamp ASC
     """
-    return pd.read_sql(query, engine)
+    return normalize_candle_schema(pd.read_sql(query, engine), require_volume=True)
 
 
 def base_candle_chart(seg, title):

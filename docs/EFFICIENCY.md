@@ -1,0 +1,1 @@
+Most indicators are extremely slow. Need to fix them 

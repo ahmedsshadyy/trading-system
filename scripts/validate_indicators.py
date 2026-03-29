@@ -10,6 +10,8 @@ pipeline, and prints summary statistics for sanity checking.
 Usage: poetry run python scripts/validate_indicators.py
 """
 
+import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -24,6 +26,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from src.indicators import build_all_indicators
+from src.indicators._helpers.schema import normalize_candle_schema
+
+DEFAULT_LIMIT = 1500
 
 
 def load_candles(instrument: str, timeframe: str, engine) -> pd.DataFrame:
@@ -34,11 +39,26 @@ def load_candles(instrument: str, timeframe: str, engine) -> pd.DataFrame:
         WHERE instrument = '{instrument}' AND timeframe = '{timeframe}'
         ORDER BY timestamp ASC
     """
-    df = pd.read_sql(query, engine)
+    df = normalize_candle_schema(pd.read_sql(query, engine), require_volume=True)
     return df
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Summary validation for the full indicator stack."
+    )
+    parser.add_argument("--full", action="store_true", help="Load the full dataset.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=f"Trailing rows to load when --full is not set. Default: {DEFAULT_LIMIT}.",
+    )
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
+    logger = logging.getLogger("validate_indicators")
     engine = create_engine(os.getenv("DATABASE_URL"))
 
     for instrument in ["XAU_USD", "USOIL"]:
@@ -48,8 +68,11 @@ def main():
             print(f"{'='*60}")
 
             df = load_candles(instrument, tf, engine)
+            if not args.full:
+                df = df.tail(args.limit).copy()
             print(f"  Loaded {len(df):,} candles")
             print(f"  Date range: {df['timestamp'].min()} → {df['timestamp'].max()}")
+            logger.info("running stack for %s %s on %s rows", instrument, tf, len(df))
 
             # Run full pipeline (skip VP on H1 — too slow)
             include_vp = tf == "H4"

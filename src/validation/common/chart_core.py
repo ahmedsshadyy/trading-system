@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -174,8 +175,10 @@ def add_transition_markers(
 
 
 def save_figure_html(fig: go.Figure, outpath: str | Path) -> Path:
-    """Persist Plotly figure to HTML."""
+    """Persist Plotly figure to HTML using atomic rename semantics."""
     outpath = Path(outpath)
     outpath.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(str(outpath))
+    tmp_path = outpath.with_suffix(outpath.suffix + ".tmp")
+    fig.write_html(str(tmp_path))
+    os.replace(tmp_path, outpath)
     return outpath
