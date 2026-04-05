@@ -21,11 +21,16 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy import stats as _scipy_stats
 
 from src.indicators._helpers.arrays import get_atr_array
 from src.indicators._helpers.validators import require_ohlc
 
 EPS = 1e-12
+# Minimum MAE denominator for excursion ratio (prevents astronomic values when
+# price barely moves against the trade — 0.05 ATR floor is economically meaningful)
+_EXCURSION_MAE_FLOOR_ATR = 0.05
+_EXCURSION_RATIO_CAP = 20.0  # cap at 20:1 MFE/MAE
 
 # Fib ratios tracked for hit statistics (core retracement levels only)
 _TRACKED_RATIOS = (
@@ -119,7 +124,6 @@ def _extract_fib_events(df: pd.DataFrame) -> list[dict]:
     if not required.issubset(df.columns):
         return []
 
-    n = len(df)
     bull_flag = (
         pd.to_numeric(df["fib_bull_detect_flag"], errors="coerce").fillna(0).to_numpy()
     )
@@ -128,13 +132,12 @@ def _extract_fib_events(df: pd.DataFrame) -> list[dict]:
     )
 
     events = []
-    for i in range(n):
-        for direction, flag_arr, prefix in (
-            (1, bull_flag, "bull"),
-            (-1, bear_flag, "bear"),
-        ):
-            if flag_arr[i] != 1:
-                continue
+    # flatnonzero avoids scanning all n rows in Python
+    for direction, flag_arr, prefix in (
+        (1, bull_flag, "bull"),
+        (-1, bear_flag, "bear"),
+    ):
+        for i in np.flatnonzero(flag_arr == 1).tolist():
             row = df.iloc[i]
             event_id_val = row.get(f"fib_{prefix}_event_id", np.nan)
             if pd.isna(event_id_val):
@@ -226,11 +229,27 @@ def build_fibonacci_research_table(df: pd.DataFrame) -> pd.DataFrame:
     if not events:
         return pd.DataFrame(columns=FIB_RESEARCH_COLUMNS)
 
+    # Pre-extract optional context columns as arrays — avoids df.iloc[i][col] per event
+    _ctx_cols = {
+        "fib_r_trend_state_on_event": "trend_state",
+        "fib_r_session_on_event": "session",
+        "fib_r_regime_on_event": "regime",
+        "fib_r_adx_on_event": "adx_14",
+        "fib_r_rsi_on_event": "rsi_14",
+    }
+    _ctx_arrays: dict[str, object] = {}
+    for out_col, src_col in _ctx_cols.items():
+        if src_col in df.columns:
+            _ctx_arrays[out_col] = df[src_col].to_numpy()
+        else:
+            _ctx_arrays[out_col] = None
+
+    _max_h = max(_HORIZONS)  # 40 — forward window cap
+
     rows = []
     for ev in events:
         pos = ev["detect_pos"]
         direction = ev["direction"]
-        prefix = ev["prefix"]
         atr_on_detect = (
             float(atr[pos]) if np.isfinite(atr[pos]) and atr[pos] > 0 else 1.0
         )
@@ -246,72 +265,86 @@ def build_fibonacci_research_table(df: pd.DataFrame) -> pd.DataFrame:
             "fib_r_quality_score": ev["quality_score"],
         }
 
-        # Context (causal — captured at detect bar)
-        record["fib_r_trend_state_on_event"] = _get_optional_col(df, "trend_state", pos)
-        record["fib_r_session_on_event"] = _get_optional_col(df, "session", pos)
-        record["fib_r_regime_on_event"] = _get_optional_col(df, "regime", pos)
-        record["fib_r_adx_on_event"] = _get_optional_col(df, "adx_14", pos)
-        record["fib_r_rsi_on_event"] = _get_optional_col(df, "rsi_14", pos)
+        # Context (causal — array lookup, no iloc)
+        for out_col, arr in _ctx_arrays.items():
+            if arr is not None:
+                val = arr[pos]
+                record[out_col] = (
+                    None if (isinstance(val, float) and np.isnan(val)) else val
+                )
+            else:
+                record[out_col] = None
         record["fib_r_anchor_low"] = ev["anc_low"]
         record["fib_r_anchor_high"] = ev["anc_high"]
         record["fib_r_close_on_detect"] = close_on_detect
         record["fib_r_atr_on_detect"] = atr_on_detect
 
-        # Level hit/hold/break at each horizon
-        for lbl, ratio in _TRACKED_RATIOS:
+        # Slice forward window ONCE per event (vectorized touch detection)
+        fw_start = pos + 1
+        fw_end = min(fw_start + _max_h, n)
+        fw_len = fw_end - fw_start
+        tol = _TOUCH_TOL_ATR * atr_on_detect
+
+        if fw_len > 0:
+            fw_high = high[fw_start:fw_end]
+            fw_low = low[fw_start:fw_end]
+            fw_close = close[fw_start:fw_end]
+        else:
+            fw_high = fw_low = fw_close = np.empty(0)
+
+        for lbl, _ in _TRACKED_RATIOS:
             lp = ev["level_prices"].get(lbl, np.nan)
-            tol = _TOUCH_TOL_ATR * atr_on_detect
+
+            if not np.isfinite(lp) or fw_len == 0:
+                for h in _HORIZONS:
+                    record[f"fib_r_l{lbl}_reached_h{h}"] = 0
+                    record[f"fib_r_l{lbl}_held_h{h}"] = 0
+                    record[f"fib_r_l{lbl}_broken_h{h}"] = 0
+                continue
+
+            # Vectorized mask — no Python loop over bars
+            touched_mask = (fw_low <= lp + tol) & (fw_high >= lp - tol)
+            any_touched = bool(touched_mask.any())
+
+            if any_touched:
+                first_touch_rel = int(np.argmax(touched_mask))
+                touch_close_val = float(fw_close[first_touch_rel])
+                if direction == 1:
+                    first_held = 1 if touch_close_val >= lp else 0
+                else:
+                    first_held = 1 if touch_close_val <= lp else 0
+                first_broken = 1 - first_held
+            else:
+                first_touch_rel = fw_len  # sentinel: outside any window
 
             for h in _HORIZONS:
-                end = min(pos + h + 1, n)
-                future_slice = range(pos + 1, end)
-
-                reached = 0
-                held = 0
-                broken = 0
-
-                if np.isfinite(lp) and len(future_slice) > 0:
-                    for j in future_slice:
-                        # Touch: wick reaches within tolerance of level
-                        if low[j] <= lp + tol and high[j] >= lp - tol:
-                            reached = 1
-                            # Held: close stays on "correct" side
-                            if direction == 1:
-                                # Bull: level is support; correct side = close above
-                                if close[j] >= lp:
-                                    held = 1
-                                else:
-                                    broken = 1
-                            else:
-                                # Bear: level is resistance; correct side = close below
-                                if close[j] <= lp:
-                                    held = 1
-                                else:
-                                    broken = 1
-                            break  # first touch only
-
-                record[f"fib_r_l{lbl}_reached_h{h}"] = reached
-                record[f"fib_r_l{lbl}_held_h{h}"] = held
-                record[f"fib_r_l{lbl}_broken_h{h}"] = broken
-
-        # MFE / MAE
-        for h in _MFE_MAE_HORIZONS:
-            end = min(pos + h + 1, n)
-            future_slice = list(range(pos + 1, end))
-            if future_slice:
-                if direction == 1:  # bull: favorable = higher
-                    mfe = float(np.max(high[future_slice]) - close_on_detect)
-                    mae = float(close_on_detect - np.min(low[future_slice]))
+                window = min(h, fw_len)
+                if any_touched and first_touch_rel < window:
+                    record[f"fib_r_l{lbl}_reached_h{h}"] = 1
+                    record[f"fib_r_l{lbl}_held_h{h}"] = first_held
+                    record[f"fib_r_l{lbl}_broken_h{h}"] = first_broken
                 else:
-                    mfe = float(close_on_detect - np.min(low[future_slice]))
-                    mae = float(np.max(high[future_slice]) - close_on_detect)
-                mfe_atr = mfe / atr_on_detect
-                mae_atr = mae / atr_on_detect
-                exc_ratio = _safe_ratio(mfe_atr, mae_atr + EPS)
+                    record[f"fib_r_l{lbl}_reached_h{h}"] = 0
+                    record[f"fib_r_l{lbl}_held_h{h}"] = 0
+                    record[f"fib_r_l{lbl}_broken_h{h}"] = 0
+
+        # MFE / MAE (already slicing numpy arrays — just cap per horizon)
+        for h in _MFE_MAE_HORIZONS:
+            end_idx = min(h, fw_len)
+            if end_idx > 0:
+                if direction == 1:
+                    mfe = float(fw_high[:end_idx].max() - close_on_detect)
+                    mae = float(close_on_detect - fw_low[:end_idx].min())
+                else:
+                    mfe = float(close_on_detect - fw_low[:end_idx].min())
+                    mae = float(fw_high[:end_idx].max() - close_on_detect)
+                mfe_atr = max(mfe, 0.0) / atr_on_detect
+                mae_atr = max(mae, 0.0) / atr_on_detect
+                # Floor MAE to prevent astronomic ratios when price barely moves back
+                mae_floor = max(mae_atr, _EXCURSION_MAE_FLOOR_ATR)
+                exc_ratio = min(mfe_atr / mae_floor, _EXCURSION_RATIO_CAP)
             else:
-                mfe_atr = np.nan
-                mae_atr = np.nan
-                exc_ratio = np.nan
+                mfe_atr = mae_atr = exc_ratio = np.nan
 
             record[f"fib_r_mfe_{h}_atr"] = mfe_atr
             record[f"fib_r_mae_{h}_atr"] = mae_atr
@@ -321,10 +354,9 @@ def build_fibonacci_research_table(df: pd.DataFrame) -> pd.DataFrame:
         for h in _OUTCOME_HORIZONS:
             future_pos = pos + h
             if future_pos < n and np.isfinite(close[future_pos]):
-                outcome = (
+                record[f"fib_r_final_outcome_{h}"] = float(
                     (close[future_pos] - close_on_detect) * direction / atr_on_detect
                 )
-                record[f"fib_r_final_outcome_{h}"] = float(outcome)
             else:
                 record[f"fib_r_final_outcome_{h}"] = np.nan
 
@@ -342,8 +374,8 @@ def build_fibonacci_research_table(df: pd.DataFrame) -> pd.DataFrame:
 def summarize_fibonacci_research(table: pd.DataFrame) -> dict:
     """Compute aggregate statistics from the fib research table.
 
-    Returns a nested dict with per-direction, per-ratio, per-horizon hit rates
-    and mean excursion stats. Useful for calibration and reporting.
+    Returns a nested dict with per-direction, per-ratio, per-horizon hit rates,
+    conditional hold rates, IC analysis, and quality decile breakdown.
     """
     if table.empty:
         return {}
@@ -359,7 +391,7 @@ def summarize_fibonacci_research(table: pd.DataFrame) -> dict:
         count = len(sub)
         dir_stats: dict = {"count": count}
 
-        # Per-ratio hit/hold/break rates
+        # Per-ratio hit/hold/break rates + conditional hold rate
         level_stats: dict = {}
         for lbl, ratio in _TRACKED_RATIOS:
             ratio_stats: dict = {}
@@ -371,6 +403,8 @@ def summarize_fibonacci_research(table: pd.DataFrame) -> dict:
                     n_reach = int(sub[reach_col].sum())
                     n_held = int(sub[held_col].sum())
                     n_broken = int(sub[broken_col].sum())
+                    # Conditional hold rate: held / reached (the real Fib signal metric)
+                    cond_hold = round(n_held / n_reach, 4) if n_reach > 0 else np.nan
                     ratio_stats[f"h{h}"] = {
                         "reached_count": n_reach,
                         "reached_pct": (
@@ -382,6 +416,7 @@ def summarize_fibonacci_research(table: pd.DataFrame) -> dict:
                         "broken_pct": (
                             round(n_broken / count, 4) if count > 0 else np.nan
                         ),
+                        "conditional_hold_rate": cond_hold,
                     }
             level_stats[f"l{lbl}"] = ratio_stats
         dir_stats["levels"] = level_stats
@@ -418,6 +453,52 @@ def summarize_fibonacci_research(table: pd.DataFrame) -> dict:
                         "count": int(len(clean)),
                     }
         dir_stats["outcome"] = outcome_stats
+
+        # IC analysis: Spearman rank correlation of quality_score vs outcome
+        # IC > 0.05 is economically meaningful; > 0.10 is strong for price signals
+        ic_stats: dict = {}
+        qs_col = "fib_r_quality_score"
+        if qs_col in sub.columns:
+            sub[qs_col]
+            for h in _OUTCOME_HORIZONS:
+                oc = f"fib_r_final_outcome_{h}"
+                if oc in sub.columns:
+                    valid = sub[[qs_col, oc]].dropna()
+                    if len(valid) >= 10:
+                        rho, pval = _scipy_stats.spearmanr(valid[qs_col], valid[oc])
+                        ic_stats[f"h{h}"] = {
+                            "spearman_ic": round(float(rho), 4),
+                            "p_value": round(float(pval), 4),
+                            "n": int(len(valid)),
+                        }
+        dir_stats["ic"] = ic_stats
+
+        # Quality decile breakdown: does higher quality_score predict better outcomes?
+        quality_decile_stats: dict = {}
+        if qs_col in sub.columns and not sub[qs_col].dropna().empty:
+            try:
+                sub_copy = sub.copy()
+                sub_copy["_qdecile"] = pd.qcut(
+                    sub_copy[qs_col], q=10, labels=False, duplicates="drop"
+                )
+                for h in _OUTCOME_HORIZONS:
+                    oc = f"fib_r_final_outcome_{h}"
+                    if oc in sub_copy.columns:
+                        grp = (
+                            sub_copy.groupby("_qdecile")[oc]
+                            .agg(["mean", "count"])
+                            .dropna()
+                        )
+                        quality_decile_stats[f"h{h}"] = {
+                            int(d): {
+                                "mean_outcome": round(float(row["mean"]), 4),
+                                "count": int(row["count"]),
+                            }
+                            for d, row in grp.iterrows()
+                        }
+            except Exception:
+                pass
+        dir_stats["quality_deciles"] = quality_decile_stats
 
         summary[label] = dir_stats
 

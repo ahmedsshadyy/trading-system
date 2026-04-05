@@ -19,6 +19,7 @@ from typing import Any
 
 import pandas as pd
 
+from src.dag_runtime import execute_graph, GraphRunContext
 from src.indicators._helpers.schema import normalize_candle_schema
 from src.pipeline_runtime import (
     ArtifactWriteResult,
@@ -345,11 +346,31 @@ def build_live_indicators(
     DataFrame with all live-safe indicator columns added.
     """
     out = _coerce_ohlc(df)
-    for stage in _live_stages(
-        instrument=instrument, swing_window=swing_window, include_vp=include_vp
-    ):
-        out = _run_stage(out, stage, profiler=profiler)
-    return out
+    from src.dag_runtime.builtin_graphs import build_live_stage_graph
+
+    graph = build_live_stage_graph(
+        instrument=instrument,
+        swing_window=swing_window,
+        include_vp=include_vp,
+    )
+    result = execute_graph(
+        graph,
+        context=GraphRunContext(
+            graph_name=graph.graph_name,
+            symbol=instrument,
+            timeframe="graph",
+            inputs={"raw_input": out},
+            config={
+                "instrument": instrument,
+                "swing_window": swing_window,
+                "include_vp": include_vp,
+            },
+            cache_root="data/dag_cache",
+            force=True,
+            invalidate_cache=True,
+        ),
+    )
+    return result.primary_frame()
 
 
 def run_live_pipeline(

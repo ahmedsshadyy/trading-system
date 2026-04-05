@@ -46,6 +46,9 @@ than assuming every categorical regime assignment is equally stable.
 Step 6A freeze doctrine:
 
 * the canonical regime core is now considered frozen
+* the current stabilization thresholds are accepted as the freeze baseline
+  after the latest validator pass and should not be retuned unless a later
+  downstream integration failure forces it
 * richer taxonomies belong in derived layers, not this base regime module
 * future work may fix bugs or resolve downstream semantic conflicts, but
   should not expand the canonical ontology beyond the frozen three-state model
@@ -90,6 +93,8 @@ REGIME_ENTER_RANGE_MARGIN = 0.08
 REGIME_ENTER_TREND_MARGIN = 0.10
 REGIME_EXIT_EXTREME_MARGIN = 0.12
 REGIME_DIRECT_EXTREME_JUMP_MARGIN = 0.20
+REGIME_MISALIGNED_EXTREME_ENTER_MARGIN = 0.24
+REGIME_MISALIGNED_TRANSITION_EXIT_MARGIN = 0.28
 REGIME_MIN_HOLD_EXTREME = 3
 REGIME_MIN_HOLD_TRANSITIONAL = 1
 REGIME_TRANSITIONAL_EXIT_CONFIRM_BARS = 2
@@ -289,6 +294,10 @@ def _stabilize_regime(df: pd.DataFrame) -> pd.DataFrame:
     ready = pd.to_numeric(out["regime_input_ready"], errors="coerce").fillna(0).eq(1)
     raw_regime = pd.to_numeric(out["raw_regime"], errors="coerce")
     raw_margin = pd.to_numeric(out["raw_regime_margin"], errors="coerce")
+    if "trend_state" in out.columns:
+        trend_state = pd.to_numeric(out["trend_state"], errors="coerce")
+    else:
+        trend_state = pd.Series(np.nan, index=out.index, dtype=float)
 
     final_regime = pd.Series(
         pd.array([pd.NA] * len(out), dtype="Int8"), index=out.index
@@ -300,23 +309,30 @@ def _stabilize_regime(df: pd.DataFrame) -> pd.DataFrame:
 
     prev_final = np.nan
     prev_run = 0
-    prev_forced = 0
     prev_raw = np.nan
+
+    def _is_misaligned_extreme(candidate_value: int, trend_state_value: float) -> bool:
+        if not np.isfinite(trend_state_value):
+            return False
+        if candidate_value == REGIME_TRENDING:
+            return int(trend_state_value) == 0
+        if candidate_value == REGIME_RANGING:
+            return int(trend_state_value) != 0
+        return False
 
     for i in range(len(out)):
         if not ready.iloc[i]:
             prev_final = np.nan
             prev_run = 0
-            prev_forced = 0
             prev_raw = np.nan
             continue
 
         raw_value = raw_regime.iloc[i]
         raw_margin_i = raw_margin.iloc[i]
+        trend_state_i = trend_state.iloc[i]
         if not np.isfinite(raw_value):
             prev_final = np.nan
             prev_run = 0
-            prev_forced = 0
             prev_raw = np.nan
             continue
 
@@ -327,6 +343,8 @@ def _stabilize_regime(df: pd.DataFrame) -> pd.DataFrame:
             prev_final_int = int(prev_final)
         else:
             prev_final_int = None
+
+        candidate_is_misaligned = _is_misaligned_extreme(candidate, trend_state_i)
 
         if (
             candidate == REGIME_TRENDING
@@ -339,6 +357,15 @@ def _stabilize_regime(df: pd.DataFrame) -> pd.DataFrame:
             candidate == REGIME_RANGING
             and prev_final_int != REGIME_RANGING
             and raw_margin_i < REGIME_ENTER_RANGE_MARGIN
+        ):
+            candidate = REGIME_TRANSITIONAL
+            forced_transitional[i] = 1
+
+        if (
+            candidate in (REGIME_RANGING, REGIME_TRENDING)
+            and prev_final_int != candidate
+            and candidate_is_misaligned
+            and raw_margin_i < REGIME_MISALIGNED_EXTREME_ENTER_MARGIN
         ):
             candidate = REGIME_TRANSITIONAL
             forced_transitional[i] = 1
@@ -356,9 +383,15 @@ def _stabilize_regime(df: pd.DataFrame) -> pd.DataFrame:
                 candidate in (REGIME_RANGING, REGIME_TRENDING)
                 and candidate != prev_final_int
             ):
+                jump_margin_threshold = REGIME_DIRECT_EXTREME_JUMP_MARGIN
+                if candidate_is_misaligned:
+                    jump_margin_threshold = max(
+                        jump_margin_threshold,
+                        REGIME_MISALIGNED_EXTREME_ENTER_MARGIN,
+                    )
                 if (
                     prev_run < REGIME_MIN_HOLD_EXTREME
-                    or raw_margin_i < REGIME_DIRECT_EXTREME_JUMP_MARGIN
+                    or raw_margin_i < jump_margin_threshold
                 ):
                     candidate = REGIME_TRANSITIONAL
                     forced_transitional[i] = 1
@@ -368,7 +401,13 @@ def _stabilize_regime(df: pd.DataFrame) -> pd.DataFrame:
             REGIME_RANGING,
             REGIME_TRENDING,
         ):
-            if raw_margin_i < REGIME_DIRECT_EXTREME_JUMP_MARGIN and (
+            exit_margin_threshold = REGIME_DIRECT_EXTREME_JUMP_MARGIN
+            if candidate_is_misaligned:
+                exit_margin_threshold = max(
+                    exit_margin_threshold,
+                    REGIME_MISALIGNED_TRANSITION_EXIT_MARGIN,
+                )
+            if raw_margin_i < exit_margin_threshold and (
                 prev_run < REGIME_TRANSITIONAL_EXIT_CONFIRM_BARS
                 or not (np.isfinite(prev_raw) and int(prev_raw) == candidate)
             ):
@@ -390,7 +429,7 @@ def _stabilize_regime(df: pd.DataFrame) -> pd.DataFrame:
         else:
             prev_run = 1
         prev_final = float(candidate)
-        prev_forced = int(forced_transitional[i])
+        int(forced_transitional[i])
         prev_raw = float(raw_value_int)
     out["regime"] = final_regime
     out["regime_label"] = final_label

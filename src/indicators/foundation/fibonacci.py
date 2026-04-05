@@ -74,9 +74,8 @@ Public API
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -106,11 +105,24 @@ FIB_STATE_ACTIVE = 1
 FIB_STATE_EXPIRED = 2
 FIB_STATE_INVALIDATED = 3
 
+# Per-level touch outcome states (sticky: first touch determines final state)
+FIB_LEVEL_STATE_UNTOUCHED = 1
+FIB_LEVEL_STATE_HELD = 2  # price reached, closed on the correct side
+FIB_LEVEL_STATE_BROKEN = 3  # price reached, closed through the level
+
 FIB_DIR_BULL = 1
 FIB_DIR_BEAR = -1
 
-# Hard expiry default (bars after activation)
-DEFAULT_MAX_AGE_BARS = 200
+# Hard expiry default (bars after activation).
+# H4: 150 bars ≈ 25 trading days.  Caller may override per timeframe.
+DEFAULT_MAX_AGE_BARS = 150
+# Maximum simultaneous active structures per direction.
+# Default is 1: each new confirmed swing supersedes the previous structure
+# ("latest always wins"). Raise only when studying multi-structure overlap.
+DEFAULT_MAX_CONCURRENT_PER_DIR = 1
+# Minimum impulse size in ATR units.  Structures with a smaller range are
+# rejected as noise — they don't represent meaningful price structure.
+DEFAULT_MIN_RANGE_ATR = 1.5
 # ATR buffer beyond 1.0 level before structure is invalidated
 DEFAULT_INVALIDATION_BUFFER_ATR = 0.10
 # ATR multiple for touch / zone detection
@@ -162,6 +174,14 @@ for _d in ("bull", "bear"):
         f"fib_{_d}_anchor_high",
         f"fib_{_d}_structure_age_bars",
         f"fib_{_d}_quality_score",
+    ] + [f"fib_{_d}_l{lbl}_state" for lbl in _RATIO_LBLS]
+
+# Final per-level states stamped at detect_idx after the full forward pass.
+# These are RESEARCH-ONLY (forward-looking from detect bar) — do NOT use live.
+FIB_LEVEL_FINAL_STATE_COLUMNS: list[str] = []
+for _d in ("bull", "bear"):
+    FIB_LEVEL_FINAL_STATE_COLUMNS += [
+        f"fib_{_d}_l{lbl}_state_final" for lbl in _RATIO_LBLS
     ]
 
 FIB_CANONICAL_COLUMNS: list[str] = FIB_EVENT_COLUMNS + FIB_DENSE_COLUMNS
@@ -195,6 +215,8 @@ class FibStructure:
     # mutable lifecycle
     state: int = field(default=FIB_STATE_INACTIVE)
     age_bars: int = field(default=0)
+    # per-level touch outcome (1=UNTOUCHED, 2=HELD, 3=BROKEN) — sticky
+    level_states: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +270,8 @@ def _validate_parameters(
     *,
     atr_length: int,
     max_age_bars: int,
+    max_concurrent_per_dir: int,
+    min_range_atr: float,
     touch_tol_atr: float,
     invalidation_buffer_atr: float,
 ) -> None:
@@ -255,6 +279,10 @@ def _validate_parameters(
         raise ValueError("atr_length must be > 0")
     if max_age_bars <= 0:
         raise ValueError("max_age_bars must be > 0")
+    if max_concurrent_per_dir < 1:
+        raise ValueError("max_concurrent_per_dir must be >= 1")
+    if min_range_atr < 0:
+        raise ValueError("min_range_atr must be >= 0")
     if touch_tol_atr < 0:
         raise ValueError("touch_tol_atr must be >= 0")
     if invalidation_buffer_atr < 0:
@@ -278,6 +306,8 @@ def add_fibonacci_levels(
     *,
     atr_length: int = DEFAULT_ATR_LENGTH,
     max_age_bars: int = DEFAULT_MAX_AGE_BARS,
+    max_concurrent_per_dir: int = DEFAULT_MAX_CONCURRENT_PER_DIR,
+    min_range_atr: float = DEFAULT_MIN_RANGE_ATR,
     touch_tol_atr: float = DEFAULT_TOUCH_TOL_ATR,
     invalidation_buffer_atr: float = DEFAULT_INVALIDATION_BUFFER_ATR,
 ) -> pd.DataFrame:
@@ -295,6 +325,15 @@ def add_fibonacci_levels(
         ATR period for normalization.
     max_age_bars:
         Hard expiry: structures expire this many bars after detection.
+        H4 default = 150 bars ≈ 25 trading days.
+    max_concurrent_per_dir:
+        Maximum simultaneous active structures per direction.  When a new
+        structure would exceed this cap the active structure with the lowest
+        quality_score is retired before the new one is admitted.  Prevents
+        unbounded chart clutter and keeps projection columns meaningful.
+    min_range_atr:
+        Minimum impulse size (anchor_high - anchor_low) in ATR units.
+        Structures below this threshold are rejected as noise.
     touch_tol_atr:
         ATR multiple for fib zone touch detection.
     invalidation_buffer_atr:
@@ -308,6 +347,8 @@ def add_fibonacci_levels(
     _validate_parameters(
         atr_length=atr_length,
         max_age_bars=max_age_bars,
+        max_concurrent_per_dir=max_concurrent_per_dir,
+        min_range_atr=min_range_atr,
         touch_tol_atr=touch_tol_atr,
         invalidation_buffer_atr=invalidation_buffer_atr,
     )
@@ -432,21 +473,30 @@ def add_fibonacci_levels(
     bear_age_arr = np.full(n, np.nan)
     bull_quality_arr = np.full(n, np.nan)
     bear_quality_arr = np.full(n, np.nan)
+    # Per-level state arrays: 0=no active structure, 1=UNTOUCHED, 2=HELD, 3=BROKEN
+    bull_level_state_arrs: dict[str, np.ndarray] = {
+        lbl: np.zeros(n, dtype=np.int8) for lbl in FIB_RATIO_LABELS
+    }
+    bear_level_state_arrs: dict[str, np.ndarray] = {
+        lbl: np.zeros(n, dtype=np.int8) for lbl in FIB_RATIO_LABELS
+    }
 
     # --- tracking state ---
+    # Use registry + active_set so the lifecycle loop only iterates ACTIVE
+    # structures (O(active) ≤ max_age_bars) rather than the ever-growing list.
     allocator = SequentialEventIdAllocator(start=1)
-    bull_structures: list[FibStructure] = []
-    bear_structures: list[FibStructure] = []
+    bull_registry: dict[int, FibStructure] = {}
+    active_bull_ids: set[int] = set()
+    bear_registry: dict[int, FibStructure] = {}
+    active_bear_ids: set[int] = set()
 
     # Track last confirmed swing in each direction for anchor detection
     last_sh_confirm_idx: int = -1
     last_sh_confirm_price: float = np.nan
-    last_sh_origin_idx: int = -1
     last_sh_strength: float = np.nan
 
     last_sl_confirm_idx: int = -1
     last_sl_confirm_price: float = np.nan
-    last_sl_origin_idx: int = -1
     last_sl_strength: float = np.nan
 
     # ---------------------------------------------------------------------------
@@ -478,11 +528,6 @@ def add_fibonacci_levels(
                 and np.isfinite(last_sl_confirm_price)
             ):
                 anchor_a_price = last_sl_confirm_price
-                anchor_a_idx = (
-                    last_sl_origin_idx
-                    if last_sl_origin_idx >= 0
-                    else last_sl_confirm_idx
-                )
                 anchor_a_strength = last_sl_strength
                 anchor_b_price = sh_p
                 anchor_b_strength = sh_strength_arr[i]
@@ -493,49 +538,66 @@ def add_fibonacci_levels(
 
                 if rng > 0 and np.isfinite(anchor_a_price):
                     rng_atr = rng / atr_i
-                    delay = i - last_sl_confirm_idx
-                    qscore = _compute_quality_score(
-                        rng_atr, anchor_a_strength, anchor_b_strength, delay
-                    )
-                    level_prices = _compute_level_prices(
-                        anchor_low, anchor_high, FIB_DIR_BULL
-                    )
+                    # Reject impulses too small to be meaningful
+                    if rng_atr < min_range_atr:
+                        pass  # skip — handled by outer if block continuing
+                    else:
+                        delay = i - last_sl_confirm_idx
+                        qscore = _compute_quality_score(
+                            rng_atr, anchor_a_strength, anchor_b_strength, delay
+                        )
+                        level_prices = _compute_level_prices(
+                            anchor_low, anchor_high, FIB_DIR_BULL
+                        )
 
-                    struct = FibStructure(
-                        structure_id=allocator.allocate(),
-                        direction=FIB_DIR_BULL,
-                        anchor_low=anchor_low,
-                        anchor_high=anchor_high,
-                        anchor_a_price=anchor_a_price,
-                        anchor_b_price=anchor_b_price,
-                        origin_idx=last_sl_confirm_idx,
-                        detect_idx=i,
-                        origin_ts=timestamps[last_sl_confirm_idx],
-                        detect_ts=timestamps[i],
-                        detect_delay=delay,
-                        quality_score=qscore,
-                        range_atr=rng_atr,
-                        level_prices=level_prices,
-                        state=FIB_STATE_ACTIVE,
-                        age_bars=0,
-                    )
-                    bull_structures.append(struct)
+                        # Enforce concurrent cap: latest always wins — retire all
+                        # existing structures before admitting the new one.
+                        while len(active_bull_ids) >= max_concurrent_per_dir:
+                            retire_id = next(iter(active_bull_ids))
+                            bull_registry[retire_id].state = FIB_STATE_EXPIRED
+                            active_bull_ids.discard(retire_id)
 
-                    # Stamp sparse event columns
-                    bull_detect_flag[i] = 1
-                    bull_event_id[i] = float(struct.structure_id)
-                    bull_detect_idx_arr[i] = float(i)
-                    bull_detect_ts_arr[i] = timestamps[i]
-                    bull_origin_idx_arr[i] = float(last_sl_confirm_idx)
-                    bull_origin_ts_arr[i] = timestamps[last_sl_confirm_idx]
-                    bull_anchor_a_arr[i] = anchor_a_price
-                    bull_anchor_b_arr[i] = anchor_b_price
-                    bull_range_arr[i] = rng
-                    bull_range_atr_arr[i] = rng_atr
-                    bull_delay_arr[i] = float(delay)
-                    bull_quality_detect_arr[i] = qscore
-                    for lbl, lp in level_prices.items():
-                        bull_level_arrs[lbl][i] = lp
+                        if len(active_bull_ids) < max_concurrent_per_dir:
+                            struct = FibStructure(
+                                structure_id=allocator.allocate(),
+                                direction=FIB_DIR_BULL,
+                                anchor_low=anchor_low,
+                                anchor_high=anchor_high,
+                                anchor_a_price=anchor_a_price,
+                                anchor_b_price=anchor_b_price,
+                                origin_idx=last_sl_confirm_idx,
+                                detect_idx=i,
+                                origin_ts=timestamps[last_sl_confirm_idx],
+                                detect_ts=timestamps[i],
+                                detect_delay=delay,
+                                quality_score=qscore,
+                                range_atr=rng_atr,
+                                level_prices=level_prices,
+                                state=FIB_STATE_ACTIVE,
+                                age_bars=0,
+                                level_states={
+                                    lbl: FIB_LEVEL_STATE_UNTOUCHED
+                                    for lbl in FIB_RATIO_LABELS
+                                },
+                            )
+                            bull_registry[struct.structure_id] = struct
+                            active_bull_ids.add(struct.structure_id)
+
+                            # Stamp sparse event columns (only for admitted structures)
+                            bull_detect_flag[i] = 1
+                            bull_event_id[i] = float(struct.structure_id)
+                            bull_detect_idx_arr[i] = float(i)
+                            bull_detect_ts_arr[i] = timestamps[i]
+                            bull_origin_idx_arr[i] = float(last_sl_confirm_idx)
+                            bull_origin_ts_arr[i] = timestamps[last_sl_confirm_idx]
+                            bull_anchor_a_arr[i] = anchor_a_price
+                            bull_anchor_b_arr[i] = anchor_b_price
+                            bull_range_arr[i] = rng
+                            bull_range_atr_arr[i] = rng_atr
+                            bull_delay_arr[i] = float(delay)
+                            bull_quality_detect_arr[i] = qscore
+                            for lbl, lp in level_prices.items():
+                                bull_level_arrs[lbl][i] = lp
 
         # Swing low confirm → creates a BEAR fib structure
         # (retracement of the bearish leg: swing high → swing low)
@@ -554,11 +616,6 @@ def add_fibonacci_levels(
                 and np.isfinite(last_sh_confirm_price)
             ):
                 anchor_a_price = last_sh_confirm_price
-                anchor_a_idx = (
-                    last_sh_origin_idx
-                    if last_sh_origin_idx >= 0
-                    else last_sh_confirm_idx
-                )
                 anchor_a_strength = last_sh_strength
                 anchor_b_price = sl_p
                 anchor_b_strength = sl_strength_arr[i]
@@ -569,57 +626,69 @@ def add_fibonacci_levels(
 
                 if rng > 0 and np.isfinite(anchor_a_price):
                     rng_atr = rng / atr_i
-                    delay = i - last_sh_confirm_idx
-                    qscore = _compute_quality_score(
-                        rng_atr, anchor_a_strength, anchor_b_strength, delay
-                    )
-                    level_prices = _compute_level_prices(
-                        anchor_low, anchor_high, FIB_DIR_BEAR
-                    )
+                    if rng_atr >= min_range_atr:
+                        delay = i - last_sh_confirm_idx
+                        qscore = _compute_quality_score(
+                            rng_atr, anchor_a_strength, anchor_b_strength, delay
+                        )
+                        level_prices = _compute_level_prices(
+                            anchor_low, anchor_high, FIB_DIR_BEAR
+                        )
 
-                    struct = FibStructure(
-                        structure_id=allocator.allocate(),
-                        direction=FIB_DIR_BEAR,
-                        anchor_low=anchor_low,
-                        anchor_high=anchor_high,
-                        anchor_a_price=anchor_a_price,
-                        anchor_b_price=anchor_b_price,
-                        origin_idx=last_sh_confirm_idx,
-                        detect_idx=i,
-                        origin_ts=timestamps[last_sh_confirm_idx],
-                        detect_ts=timestamps[i],
-                        detect_delay=delay,
-                        quality_score=qscore,
-                        range_atr=rng_atr,
-                        level_prices=level_prices,
-                        state=FIB_STATE_ACTIVE,
-                        age_bars=0,
-                    )
-                    bear_structures.append(struct)
+                        # Enforce concurrent cap: latest always wins — retire all
+                        # existing structures before admitting the new one.
+                        while len(active_bear_ids) >= max_concurrent_per_dir:
+                            retire_id = next(iter(active_bear_ids))
+                            bear_registry[retire_id].state = FIB_STATE_EXPIRED
+                            active_bear_ids.discard(retire_id)
 
-                    bear_detect_flag[i] = 1
-                    bear_event_id[i] = float(struct.structure_id)
-                    bear_detect_idx_arr[i] = float(i)
-                    bear_detect_ts_arr[i] = timestamps[i]
-                    bear_origin_idx_arr[i] = float(last_sh_confirm_idx)
-                    bear_origin_ts_arr[i] = timestamps[last_sh_confirm_idx]
-                    bear_anchor_a_arr[i] = anchor_a_price
-                    bear_anchor_b_arr[i] = anchor_b_price
-                    bear_range_arr[i] = rng
-                    bear_range_atr_arr[i] = rng_atr
-                    bear_delay_arr[i] = float(delay)
-                    bear_quality_detect_arr[i] = qscore
-                    for lbl, lp in level_prices.items():
-                        bear_level_arrs[lbl][i] = lp
+                        if len(active_bear_ids) < max_concurrent_per_dir:
+                            struct = FibStructure(
+                                structure_id=allocator.allocate(),
+                                direction=FIB_DIR_BEAR,
+                                anchor_low=anchor_low,
+                                anchor_high=anchor_high,
+                                anchor_a_price=anchor_a_price,
+                                anchor_b_price=anchor_b_price,
+                                origin_idx=last_sh_confirm_idx,
+                                detect_idx=i,
+                                origin_ts=timestamps[last_sh_confirm_idx],
+                                detect_ts=timestamps[i],
+                                detect_delay=delay,
+                                quality_score=qscore,
+                                range_atr=rng_atr,
+                                level_prices=level_prices,
+                                state=FIB_STATE_ACTIVE,
+                                age_bars=0,
+                                level_states={
+                                    lbl: FIB_LEVEL_STATE_UNTOUCHED
+                                    for lbl in FIB_RATIO_LABELS
+                                },
+                            )
+                            bear_registry[struct.structure_id] = struct
+                            active_bear_ids.add(struct.structure_id)
+
+                            bear_detect_flag[i] = 1
+                            bear_event_id[i] = float(struct.structure_id)
+                            bear_detect_idx_arr[i] = float(i)
+                            bear_detect_ts_arr[i] = timestamps[i]
+                            bear_origin_idx_arr[i] = float(last_sh_confirm_idx)
+                            bear_origin_ts_arr[i] = timestamps[last_sh_confirm_idx]
+                            bear_anchor_a_arr[i] = anchor_a_price
+                            bear_anchor_b_arr[i] = anchor_b_price
+                            bear_range_arr[i] = rng
+                            bear_range_atr_arr[i] = rng_atr
+                            bear_delay_arr[i] = float(delay)
+                            bear_quality_detect_arr[i] = qscore
+                            for lbl, lp in level_prices.items():
+                                bear_level_arrs[lbl][i] = lp
 
         # Update last-seen confirmed swings AFTER creating structures for this bar
         # (so same-bar swing high and swing low don't reference each other as anchors)
         if sh_flag[i] == 1 and np.isfinite(sh_price[i]):
             last_sh_confirm_idx = i
             last_sh_confirm_price = float(sh_price[i])
-            last_sh_origin_idx = (
-                int(sh_origin_arr[i]) if np.isfinite(sh_origin_arr[i]) else i
-            )
+            (int(sh_origin_arr[i]) if np.isfinite(sh_origin_arr[i]) else i)
             last_sh_strength = (
                 float(sh_strength_arr[i]) if np.isfinite(sh_strength_arr[i]) else np.nan
             )
@@ -627,53 +696,75 @@ def add_fibonacci_levels(
         if sl_flag[i] == 1 and np.isfinite(sl_price[i]):
             last_sl_confirm_idx = i
             last_sl_confirm_price = float(sl_price[i])
-            last_sl_origin_idx = (
-                int(sl_origin_arr[i]) if np.isfinite(sl_origin_arr[i]) else i
-            )
+            (int(sl_origin_arr[i]) if np.isfinite(sl_origin_arr[i]) else i)
             last_sl_strength = (
                 float(sl_strength_arr[i]) if np.isfinite(sl_strength_arr[i]) else np.nan
             )
 
-        # --- Step 2: lifecycle update for all structures ---
-        # Only update structures that activated on a PREVIOUS bar
+        # --- Step 2: lifecycle update (active set only — O(active) not O(total)) ---
         active_bulls: list[FibStructure] = []
         active_bears: list[FibStructure] = []
+        _bull_terminate: list[int] = []
+        _bear_terminate: list[int] = []
 
-        for struct in bull_structures:
-            if struct.state != FIB_STATE_ACTIVE:
-                continue
+        tol_i = touch_tol_atr * atr_i
+
+        for sid in active_bull_ids:
+            struct = bull_registry[sid]
             if struct.detect_idx >= i:
-                # Not yet available for lifecycle interaction (still on detect bar)
-                # We DO count it as "active" for projection though
                 active_bulls.append(struct)
                 continue
-            # Advance age
             struct.age_bars += 1
-            # Hard expiry
             if struct.age_bars >= max_age_bars:
                 struct.state = FIB_STATE_EXPIRED
+                _bull_terminate.append(sid)
                 continue
-            # Invalidation: close below anchor_low with buffer
             if cl < struct.anchor_low - invalidation_buffer_atr * atr_i:
                 struct.state = FIB_STATE_INVALIDATED
+                _bull_terminate.append(sid)
                 continue
+            # Per-level touch state (sticky — first touch wins)
+            for lbl, lp in struct.level_prices.items():
+                if (
+                    struct.level_states.get(lbl, FIB_LEVEL_STATE_UNTOUCHED)
+                    == FIB_LEVEL_STATE_UNTOUCHED
+                ):
+                    if lo <= lp + tol_i and hi >= lp - tol_i:
+                        # Level touched this bar — close determines held/broken
+                        struct.level_states[lbl] = (
+                            FIB_LEVEL_STATE_HELD if cl >= lp else FIB_LEVEL_STATE_BROKEN
+                        )
             active_bulls.append(struct)
+        for sid in _bull_terminate:
+            active_bull_ids.discard(sid)
 
-        for struct in bear_structures:
-            if struct.state != FIB_STATE_ACTIVE:
-                continue
+        for sid in active_bear_ids:
+            struct = bear_registry[sid]
             if struct.detect_idx >= i:
                 active_bears.append(struct)
                 continue
             struct.age_bars += 1
             if struct.age_bars >= max_age_bars:
                 struct.state = FIB_STATE_EXPIRED
+                _bear_terminate.append(sid)
                 continue
-            # Invalidation: close above anchor_high with buffer
             if cl > struct.anchor_high + invalidation_buffer_atr * atr_i:
                 struct.state = FIB_STATE_INVALIDATED
+                _bear_terminate.append(sid)
                 continue
+            # Per-level touch state (sticky — first touch wins)
+            for lbl, lp in struct.level_prices.items():
+                if (
+                    struct.level_states.get(lbl, FIB_LEVEL_STATE_UNTOUCHED)
+                    == FIB_LEVEL_STATE_UNTOUCHED
+                ):
+                    if lo <= lp + tol_i and hi >= lp - tol_i:
+                        struct.level_states[lbl] = (
+                            FIB_LEVEL_STATE_HELD if cl <= lp else FIB_LEVEL_STATE_BROKEN
+                        )
             active_bears.append(struct)
+        for sid in _bear_terminate:
+            active_bear_ids.discard(sid)
 
         # --- Step 3: project dense columns ---
         bull_count_arr[i] = len(active_bulls)
@@ -714,6 +805,11 @@ def add_fibonacci_levels(
             near_bull_sid[i] = float(sel_bull.structure_id)
             inside_bull_zone[i] = np.int8(1) if in_zone else np.int8(0)
             golden_bull_dist[i] = golden_dist
+            # Stamp per-level state from selected structure
+            for lbl in FIB_RATIO_LABELS:
+                bull_level_state_arrs[lbl][i] = np.int8(
+                    sel_bull.level_states.get(lbl, FIB_LEVEL_STATE_UNTOUCHED)
+                )
 
         if active_bears:
             sel_bear = max(active_bears, key=lambda s: s.quality_score)
@@ -746,6 +842,11 @@ def add_fibonacci_levels(
             near_bear_sid[i] = float(sel_bear.structure_id)
             inside_bear_zone[i] = np.int8(1) if in_zone else np.int8(0)
             golden_bear_dist[i] = golden_dist
+            # Stamp per-level state from selected structure
+            for lbl in FIB_RATIO_LABELS:
+                bear_level_state_arrs[lbl][i] = np.int8(
+                    sel_bear.level_states.get(lbl, FIB_LEVEL_STATE_UNTOUCHED)
+                )
 
     # ---------------------------------------------------------------------------
     # Write arrays to output DataFrame
@@ -805,5 +906,10 @@ def add_fibonacci_levels(
     out["fib_bear_anchor_high"] = bear_anchor_high_arr
     out["fib_bear_structure_age_bars"] = bear_age_arr
     out["fib_bear_quality_score"] = bear_quality_arr
+
+    # Per-level state columns (0=no struct, 1=UNTOUCHED, 2=HELD, 3=BROKEN)
+    for lbl in FIB_RATIO_LABELS:
+        out[f"fib_bull_l{lbl}_state"] = bull_level_state_arrs[lbl]
+        out[f"fib_bear_l{lbl}_state"] = bear_level_state_arrs[lbl]
 
     return out

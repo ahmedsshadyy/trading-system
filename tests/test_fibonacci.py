@@ -21,13 +21,12 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from src.indicators.foundation.fibonacci import (
-    FIB_RATIOS,
-    FIB_RATIO_LABELS,
+    FIB_LEVEL_STATE_UNTOUCHED,
+    FIB_LEVEL_STATE_HELD,
+    FIB_LEVEL_STATE_BROKEN,
     add_fibonacci_levels,
-    FIB_CANONICAL_COLUMNS,
 )
 
 # ---------------------------------------------------------------------------
@@ -387,8 +386,8 @@ def test_nearest_level_projection_is_causal() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_multiple_concurrent_structures_selects_highest_quality() -> None:
-    """When multiple bull structures are active, the highest quality score is selected."""
+def test_latest_structure_supersedes_previous() -> None:
+    """Latest-wins: new bull structure retires the previous one immediately."""
     # Create two bull structures at different times
     n = 15
     rows = [
@@ -405,17 +404,17 @@ def test_multiple_concurrent_structures_selects_highest_quality() -> None:
     sh_strength_list = [None] * n
     sl_strength_list = [None] * n
 
-    # Structure 1: small range (lower quality)
+    # Structure 1: detected at row 3
     sl_conf[1] = 1
     sl_price_list[1] = 100.0
     sl_origin_list[1] = 0
     sl_strength_list[1] = 0.5
     sh_conf[3] = 1
-    sh_price_list[3] = 101.0
+    sh_price_list[3] = 102.0
     sh_origin_list[3] = 2
-    sh_strength_list[3] = 0.5  # range = 1.0 ATR
+    sh_strength_list[3] = 0.5  # range = 2.0 ATR (above min_range_atr=1.5)
 
-    # Structure 2: larger range (higher quality)
+    # Structure 2: larger range — detected at row 8, should supersede structure 1
     sl_conf[5] = 1
     sl_price_list[5] = 102.0
     sl_origin_list[5] = 4
@@ -439,11 +438,10 @@ def test_multiple_concurrent_structures_selects_highest_quality() -> None:
     )
     result = add_fibonacci_levels(df, max_age_bars=100)
 
-    # At row 9 onwards, both structures should be active
-    # The selected one (fib_bull_quality_score) should be from structure 2 (higher quality)
-    assert result.loc[9, "fib_active_bull_count"] >= 2
-    # Structure 2 has range_atr = 8.0, structure 1 has range_atr = 1.0
-    # Quality is primarily driven by range, so structure 2 should win
+    # max_concurrent=1 (default): latest always wins, so count is always <= 1
+    assert result.loc[9, "fib_active_bull_count"] == 1
+    # Structure 2 was detected at row 8 and replaced structure 1 — quality from struct 2
+    # (range_atr = 8.0 vs 2.0, so struct 2 has higher quality)
     assert (
         result.loc[9, "fib_bull_quality_score"]
         > result.loc[4, "fib_bull_quality_score"]
@@ -501,8 +499,8 @@ def test_inside_bull_zone_flag_set_when_price_within_tolerance() -> None:
             golden_level,
             golden_level + 1.0,
             golden_level - 0.1,
-            golden_level + 0.5,
-        ),  # 5: clearly at level
+            golden_level + 0.10,
+        ),  # 5: close = golden_level + 0.10 → 0.10 ATR from level, within 0.20 tolerance
         (107.0, 108.0, 106.0, 107.0),  # 6: far from any level
     ]
     df = _make_fib_df(
@@ -523,3 +521,56 @@ def test_inside_bull_zone_flag_set_when_price_within_tolerance() -> None:
     # Row 6: close = 107.0, nearest level check
     # Levels: 0.236 = 107.64, 0.382 = 106.18 → nearest is 0.236 at distance 0.64 > 0.20
     assert result.loc[6, "fib_inside_bull_zone"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Per-level state tracking
+# ---------------------------------------------------------------------------
+
+
+def test_per_level_state_tracks_held_and_broken() -> None:
+    """Level states update to HELD/BROKEN on first touch, then remain sticky."""
+    anchor_low = 100.0
+    anchor_high = 110.0
+    # 0.382 level = 110 - 0.382 * 10 = 106.18
+    # 0.618 level = 110 - 0.618 * 10 = 103.82
+
+    rows = [
+        (100.0, 101.0, 100.0, 100.5),  # 0
+        (100.5, 105.0, 100.0, 102.0),  # 1: swing low confirm
+        (102.0, 110.0, 101.0, 108.0),  # 2
+        (108.0, 111.0, 107.0, 109.5),  # 3: bull detect (struct active from row 4+)
+        # Row 4: price touches 0.618=103.82, close=105.0 (above level) → HELD
+        (109.5, 106.0, 103.5, 105.0),  # 4: low=103.5 < 103.82+tol, close=105.0 > 103.82
+        # Row 5: price touches 0.382=106.18, close=105.5 (below level) → BROKEN
+        (105.0, 107.0, 105.8, 105.5),  # 5: low touches 0.382 zone, close below
+        (105.5, 106.0, 105.0, 105.8),  # 6: no new touch
+    ]
+    df = _make_fib_df(
+        rows,
+        sl_conf=[0, 1, 0, 0, 0, 0, 0],
+        sl_price=[None, anchor_low, None, None, None, None, None],
+        sl_origin=[None, 0, None, None, None, None, None],
+        sh_conf=[0, 0, 0, 1, 0, 0, 0],
+        sh_price=[None, None, None, anchor_high, None, None, None],
+        sh_origin=[None, None, None, 1, None, None, None],
+        atr_values=[1.0] * 7,
+    )
+    result = add_fibonacci_levels(df, touch_tol_atr=0.20)
+
+    # At detect row (3), level state columns exist but structure not yet in lifecycle
+    # From row 4 onwards, per-level states are stamped from selected structure
+
+    # 0.618 level touched at row 4, close=105.0 > 103.82 → HELD
+    assert result.loc[4, "fib_bull_l0618_state"] == FIB_LEVEL_STATE_HELD
+    # State is sticky — remains HELD at row 6
+    assert result.loc[6, "fib_bull_l0618_state"] == FIB_LEVEL_STATE_HELD
+
+    # 0.382 level also touched at row 4 (high=106.0 >= 105.98, lo=103.5 within zone)
+    # close=105.0 < 106.18 → BROKEN
+    assert result.loc[4, "fib_bull_l0382_state"] == FIB_LEVEL_STATE_BROKEN
+    # Sticky — still BROKEN at row 6
+    assert result.loc[6, "fib_bull_l0382_state"] == FIB_LEVEL_STATE_BROKEN
+
+    # 0.000 level (=110.0, anchor_high) far above — never touched → UNTOUCHED throughout
+    assert result.loc[6, "fib_bull_l0000_state"] == FIB_LEVEL_STATE_UNTOUCHED

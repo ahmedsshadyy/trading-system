@@ -32,26 +32,17 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from src.dag_runtime import GraphRunContext, execute_graph
+from src.dag_runtime.builtin_graphs import get_builtin_graph
 from src.indicators.foundation.sr_levels import (
     SR_SIDE_SUPPORT,
     SR_STATE_ACTIVE,
     SR_STATE_INVALIDATED,
     SR_STATE_RETIRED,
-    build_sr_level_registry,
-    project_sr_context,
-    update_sr_lifecycle,
 )
-from src.indicators._helpers.schema import normalize_candle_schema
-from src.indicators.foundation.volatility import add_atr
-from src.indicators.structure.swings import add_swings
-from src.indicators.smc.equal_hl import add_equal_hl
-from src.indicators.foundation.value import (
-    add_prev_day_hl,
-    add_prev_week_hl,
+from src.validation.common import (
+    cleanup_validation_artifacts,
 )
-from src.indicators.foundation.session import add_session_features
-from src.indicators.foundation.volume_profile import add_volume_profile
-from src.validation.indicators.sr_levels import summarize_sr_levels
 
 # ---------------------------------------------------------------------------
 # Config
@@ -59,6 +50,8 @@ from src.validation.indicators.sr_levels import summarize_sr_levels
 
 DATE_FROM = "2026-01-10"
 OUT_DIR = Path("notebooks/foundation")
+CACHE_ROOT = Path("data/validation_cache")
+VALIDATOR_NAME = "validate_sr_levels"
 RUNS = (("XAU_USD", "H4"),)
 
 _SUP_SOLID = "rgba(30, 110, 255, 0.90)"
@@ -182,7 +175,6 @@ def _build_sr_chart(
         color = (_SUP_TMPL if is_sup else _RES_TMPL).format(a=alpha)
         is_dead = lev.state in (SR_STATE_INVALIDATED, SR_STATE_RETIRED)
         dash = "dot" if is_dead else "solid"
-        side_lbl = "Sup" if is_sup else "Res"
 
         fig.add_trace(
             go.Scatter(
@@ -389,14 +381,25 @@ def main() -> None:
         description="Validate S/R levels and optionally produce an HTML chart."
     )
     parser.add_argument(
-        "--no-chart",
+        "--html",
         action="store_true",
-        help="Print numeric summary only — skip HTML chart generation.",
+        help="Generate the HTML chart. Default run prints summary only.",
     )
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--invalidate-cache", action="store_true")
+    parser.add_argument("--cleanup-stale", action="store_true")
+    parser.add_argument("--max-artifact-age-days", type=int, default=30)
     args = parser.parse_args()
-    include_chart = not args.no_chart
+    include_chart = args.html
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    if args.cleanup_stale:
+        removed = cleanup_validation_artifacts(
+            cache_root=CACHE_ROOT,
+            max_age_days=args.max_artifact_age_days,
+            report_roots=[OUT_DIR],
+        )
+        print(f"cleanup_removed: {len(removed)}")
 
     for instrument, timeframe in RUNS:
         data_file = Path(f"data/raw/{instrument}_{timeframe}.parquet")
@@ -409,40 +412,39 @@ def main() -> None:
         print(f"{'=' * 60}")
 
         raw = pd.read_parquet(data_file)
+        graph = get_builtin_graph(
+            "validate_sr_levels",
+            instrument=instrument,
+            timeframe=timeframe,
+        )
+        context = GraphRunContext(
+            graph_name=graph.graph_name,
+            symbol=instrument,
+            timeframe=timeframe,
+            inputs={"raw_input": raw},
+            config={"html": include_chart, "out_dir": str(OUT_DIR)},
+            cache_root=CACHE_ROOT,
+            force=args.force,
+            invalidate_cache=args.invalidate_cache,
+        )
+        graph_result = execute_graph(
+            graph, context=context, target="sr_validation_bundle"
+        )
+        result = graph_result.output().payload
 
-        # Minimal pipeline — only the columns SR levels actually needs.
-        # Skips fvg_stack, trend_state, bos, choch, regime, etc. (~15s saved).
-        enriched = normalize_candle_schema(raw, require_volume=True)
-        enriched = add_atr(enriched)
-        enriched = add_swings(enriched)
-        enriched = add_equal_hl(enriched)
-        enriched = add_prev_day_hl(enriched)
-        enriched = add_prev_week_hl(enriched)
-        enriched = add_session_features(enriched)
-        enriched = add_volume_profile(enriched)
-
-        # Single lifecycle pass: build registry then project — avoids the
-        # duplicate run that add_sr_levels + update_sr_lifecycle would cause.
-        registry = build_sr_level_registry(enriched)
-        live_df = project_sr_context(enriched, registry)  # mutates registry in place
-
-        print(f"  Total bars: {len(live_df)}")
-
-        title = f"S/R Levels — {instrument} {timeframe}  |  {DATE_FROM} → end"
-
-        # Numerics: full dataset
-        summary = summarize_sr_levels(live_df, registry, live_df=live_df)
+        print(f"  Total bars: {result['row_count']}")
         print()
-        _print_summary(summary)
+        _print_summary(result["summary"])
 
-        # Chart: 2026-01-10 → end
-        if include_chart:
-            fig = _build_sr_chart(enriched, live_df, registry, title=title)
-            html_path = OUT_DIR / f"sr_levels_validation_{instrument}_{timeframe}.html"
-            fig.write_html(str(html_path))
-            print(f"\n  Chart saved → {html_path}")
+        if include_chart and result["html_path"] is not None:
+            print(f"\n  Chart saved → {result['html_path']}")
         else:
-            print("\n  [chart skipped — pass without --no-chart to generate HTML]")
+            print("\n  [chart skipped — pass --html to generate HTML]")
+        profile_path = (
+            CACHE_ROOT / VALIDATOR_NAME / instrument / timeframe / "run-summary.json"
+        )
+        graph_result.profiler.write_json(profile_path)
+        print(f"  Profiler summary → {profile_path}")
 
 
 if __name__ == "__main__":

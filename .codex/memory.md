@@ -3,18 +3,16 @@
 ## Project State
 
 - Repository: `trading-system`
-- Current roadmap position: Phase 3 addendum, SMC layer.
+- Current roadmap position: Phase 3 addendum, frozen `trend_state` overlay complete; canonical `regime` freeze accepted; move to the next subsystem.
 - Finished and frozen upstream SMC work before this session pass:
   - FVG and related work complete.
   - Displacement frozen.
   - Equal H/L frozen.
-- Current roadmap thread when this memory was written:
-  - working through the sweeps roadmap
-  - specifically Step 4: finalize session and calendar liquidity references
-- Next expected order after sessions:
-  - volume-related subjects
-  - regime
-  - support & resistance
+- Current roadmap thread when this memory was last updated:
+  - `trend_state` freeze completed
+  - stale-neutral live overlay accepted
+  - `regime` freeze accepted
+  - next immediate focus: next subsystem
 
 ## Core Doctrine
 
@@ -896,6 +894,34 @@ Interpretation:
 - mismatch did not disappear, which is acceptable because Step 6B was meant to
   harden trend semantics first rather than force regime/trend agreement
 
+## Accepted regime freeze snapshot
+
+- Freeze decision:
+  - current canonical `regime` engine accepted as frozen for now
+  - do not add new research diagnostics
+  - do not add new columns
+  - do not retune further unless a downstream integration failure forces it
+- Validation commands accepted for this freeze:
+  - `poetry run pytest tests/indicators/foundation/test_regime.py -q`
+  - `poetry run python scripts/validate_regime.py`
+- Accepted latest validation snapshot:
+  - H1:
+    - `trending_with_neutral_trend_state_rate_pct: 27.03`
+    - `ranging_with_directional_trend_state_rate_pct: 26.95`
+    - `single_bar_segment_rate_pct: 10.82`
+    - `two_bar_segment_rate_pct: 12.09`
+    - `direct_extreme_jump_count: 666`
+  - H4:
+    - `trending_with_neutral_trend_state_rate_pct: 27.36`
+    - `ranging_with_directional_trend_state_rate_pct: 29.27`
+    - `single_bar_segment_rate_pct: 10.21`
+    - `two_bar_segment_rate_pct: 11.33`
+    - `direct_extreme_jump_count: 162`
+- Freeze status:
+  - H1 acceptable
+  - H4 borderline but acceptable
+  - overall accepted as freezeable; move on
+
 # Step 6B: Trend-State Hardening
 
 ## Files touched
@@ -1118,24 +1144,32 @@ Important outcome:
 Stable post-backout reference:
 - H1:
   - strict-state shares:
-    - bearish `26.07%`
-    - neutral `46.03%`
-    - bullish `27.90%`
-  - transition count: `6744`
-  - single-bar segments: `4.20%`
-  - two-bar segments: `8.17%`
-  - `neutral_in_trend_rows: 8111`
+    - bearish `25.98%`
+    - neutral `46.18%`
+    - bullish `27.84%`
+  - transition count: `6748`
+  - single-bar segments: `4.13%`
+  - two-bar segments: `8.24%`
+  - `neutral_in_trend_rows: 8201`
   - `directional_in_range_rows: 6778`
 - H4:
   - strict-state shares:
-    - bearish `26.36%`
-    - neutral `44.20%`
-    - bullish `29.44%`
-  - transition count: `1830`
-  - single-bar segments: `4.15%`
-  - two-bar segments: `6.61%`
-  - `neutral_in_trend_rows: 2347`
+    - bearish `26.31%`
+    - neutral `44.22%`
+    - bullish `29.47%`
+  - transition count: `1838`
+  - single-bar segments: `3.97%`
+  - two-bar segments: `6.37%`
+  - `neutral_in_trend_rows: 2356`
   - `directional_in_range_rows: 1935`
+- Additional stale-neutral diagnostics were kept, but remain audit-only:
+  - `old_neutral_strong_env_audit`
+  - `stale_neutral_promotion_candidate_audit`
+  - `mature_directional_in_range_decay_audit`
+- Step 6C.2 stale-neutral re-promotion did not ship:
+  - the engine path was removed
+  - the validator surface was retained
+  - shipped code is the stable Step 6C.1 assignment logic plus richer audits
 
 Doctrine after this session:
 - confidence semantics are fixed and should not be retuned again casually
@@ -1704,3 +1738,1698 @@ Reason:
 If I had to compress this session into one sentence:
 
 I completed the canonical persistence migration by introducing artifact-managed live/research materialization, made live persistence frontier-only and atomic, kept research persistence centralized but full-rebuild-on-change for semantic safety, added end-to-end persistence proofs, and documented the remaining intentionally non-incremental paths.
+
+# Trend State Freeze
+
+## Canonical doctrine now frozen
+
+- `trend_state` is the canonical strict structural state.
+- `trend_bias_state` is the inherited/decaying bias state.
+- `stale_neutral_promo_side` is a downstream execution overlay only.
+- `effective_trend_state` is the live-consumption output:
+  - it equals `trend_state` on non-neutral rows
+  - it may promote stale neutral rows only when canonical `trend_state == 0`
+- the overlay never mutates canonical `trend_state`
+- no more `trend_state` experimentation or promotion-variant expansion should be done from this point
+
+## Research work completed before freeze
+
+The validator research pass was completed far enough to establish:
+
+- stale neutral is a real structural phenomenon on both H1 and H4
+- naive “old neutral in strong environment => promote now” is not justified
+- confirmed-input-only promotion is feasible using current-row live-safe fields only
+- the accepted production overlay was chosen from the robust region, not from tiny-sample leaders
+
+Research/validator sections added during this phase included:
+
+- stale-neutral structure / contradiction / commit-mass / conflict-signature audits
+- clean asymmetry audits
+- live-safety audit for promotion inputs
+- confirmed-input promotion prototype sweep
+
+That research phase is complete and should not be expanded further unless a new roadmap item explicitly reopens it.
+
+## Accepted stale-neutral overlay
+
+The accepted live overlay is implemented in:
+
+- `src/indicators/structure/trend_state.py`
+
+Frozen thresholds:
+
+- `trend_state == 0`
+- `bars_in_trend_state >= 15`
+- `trend_commit_gap >= 0.10`
+- `trend_directional_evidence_score >= 0.22`
+- `(trend_bull_commit_score + trend_bear_commit_score) <= 0.40`
+- `trend_conf_contradiction_penalty <= 0.50`
+
+Side selection:
+
+- bullish when `trend_bull_commit_score > trend_bear_commit_score`
+- bearish when `trend_bear_commit_score > trend_bull_commit_score`
+- otherwise no promotion
+
+Implementation constraints that were intentionally kept:
+
+- canonical `trend_state` unchanged
+- canonical `trend_bias_state` unchanged
+- canonical `trend_confidence` unchanged
+- canonical strength outputs unchanged
+- no regime gate
+- no persistence gate
+- no structure-continuity gate
+- no validator-only or forward-looking fields
+- no extra research columns
+
+## Canonical outputs added
+
+Exactly two new canonical downstream columns were added:
+
+- `stale_neutral_promo_side`
+- `effective_trend_state`
+
+No other canonical `trend_state` outputs were added in this freeze.
+
+## Minimal validator proof
+
+The validator now has a minimal mode:
+
+- `poetry run python scripts/validate_trend_state.py --minimal`
+
+This prints only the stale-neutral live overlay proof and avoids the giant research dump.
+
+Accepted checks for the frozen overlay:
+
+- `promoted_row_count > 0`
+- `effective_state_diff_count == promoted_row_count`
+- `nonneutral_diff_count == 0`
+- `invalid_promo_on_nondirectional_count == 0`
+- `canonical_trend_state_unchanged == True`
+
+Observed accepted proof counts:
+
+- H1:
+  - `promoted_row_count = 992`
+  - `promoted_bull_count = 517`
+  - `promoted_bear_count = 475`
+  - `effective_state_diff_count = 992`
+  - `nonneutral_diff_count = 0`
+  - `invalid_promo_on_nondirectional_count = 0`
+  - `canonical_trend_state_unchanged = True`
+- H4:
+  - `promoted_row_count = 288`
+  - `promoted_bull_count = 161`
+  - `promoted_bear_count = 127`
+  - `effective_state_diff_count = 288`
+  - `nonneutral_diff_count = 0`
+  - `invalid_promo_on_nondirectional_count = 0`
+  - `canonical_trend_state_unchanged = True`
+
+## Files changed during the trend_state freeze
+
+- `src/indicators/structure/trend_state.py`
+- `src/validation/indicators/trend_state.py`
+- `scripts/validate_trend_state.py`
+- `tests/test_indicators.py`
+
+## Commands successfully used during this phase
+
+- `poetry run python -m py_compile src/indicators/structure/trend_state.py scripts/validate_trend_state.py src/validation/indicators/trend_state.py tests/test_indicators.py`
+- `poetry run pytest tests/test_indicators.py -k "validator_exposes_trend_regime_interaction_sections" -q`
+- `poetry run python scripts/validate_trend_state.py --minimal`
+
+## Next move
+
+- Stop work on `trend_state`
+- Do not add more promotion variants
+- Do not add more stale-neutral research diagnostics
+- Keep `regime` frozen unless downstream integration exposes a real failure
+- Move to the next subsystem
+
+# Step 8 Freeze Track: Range Boundaries
+
+## Range-boundary ontology now implemented
+
+- Step 8 is the causal range-boundary subsystem.
+- A confirmed range exposes exactly two sweepable level sources:
+  - upper boundary = `range_high`
+  - lower boundary = `range_low`
+- Boundaries are level sources, not zones.
+- Confirmed geometry is immutable after confirm.
+- A materially different box creates a new range event instead of mutating the old one.
+- Lifecycle semantics remain frozen:
+  - `0 none`
+  - `1 active_intact`
+  - `2 active_weakened`
+  - `3 broken_unaccepted`
+  - `4 accepted_breakout`
+  - `5 invalidated`
+  - `6 expired`
+  - `7 superseded`
+- Same-bar timing doctrine remains frozen:
+  - no active range before confirm
+  - range becomes active on the confirm row
+  - no same-bar breakout-pending / interaction mechanics on the confirm row
+
+## Step 8 implementation files
+
+- `src/indicators/foundation/range_boundaries.py`
+- `src/validation/indicators/range_boundaries.py`
+- `scripts/validate_range_boundaries.py`
+- `tests/indicators/foundation/test_range_boundaries.py`
+- `src/indicators/foundation/__init__.py`
+
+## Step 8A outcome
+
+Step 8A was the first surgical repair of confirmation and viability.
+
+What changed in that phase:
+
+- confirmation became `minimum dwell + maturity + viability`
+- viability metrics were added
+- strength was split into:
+  - `range_strength_formation`
+  - `range_strength_viability`
+  - final `range_strength`
+- confirm-time viability gating became live-safe and explicit
+- validator gained:
+  - funnel diagnostics
+  - reclaim stats
+  - confirm timing
+  - archetype comparison
+  - forensic CSV exports
+
+What Step 8A proved:
+
+- causal integrity was acceptable
+- the architecture was plausible
+- the detector could filter obvious fragile promotions
+
+What Step 8A did not solve:
+
+- coverage became too sparse
+- viability raw inputs were still misaligned with durable-vs-fragile archetypes
+- final strength remained misaligned
+
+## Step 8B outcome
+
+Step 8B was the metric-alignment phase.
+
+Doctrine frozen from that phase:
+
+- do not redesign Step 8
+- do not change ontology, lifecycle, source exposure, or funnel architecture
+- audit misaligned viability metrics one at a time
+- only promote a metric if it improves archetype alignment without breaking synthetic tests
+
+Important findings from Step 8B:
+
+- `range_strength_viability` briefly had directional signal
+- raw viability inputs were still weak or misaligned:
+  - `range_recent_pressure_imbalance`
+  - `range_recent_equilibrium_score`
+  - `range_recent_two_sided_freshness_score`
+- final `range_strength` still overvalued formation neatness relative to durability
+
+An audit-only pressure metric candidate was introduced:
+
+- `pressure_imbalance_v2 = (1 - close_position_span) * (0.5 + 0.5 * max(mean_edge_bias, last_edge_bias))`
+
+That audit path was useful, but once Step 8C widened the detector materially, the same metric family no longer aligned cleanly on the widened dataset archetypes.
+
+## Step 8C outcome
+
+Step 8C was the raw-coverage recovery pass.
+
+This phase is now the current stable Step 8 baseline.
+
+### Core Step 8C decisions implemented
+
+- Raw candidate generation is now multi-window:
+  - `candidate_lookback_bars = (5, 8, 12, 16)`
+- Raw eligibility defaults in the current stable detector:
+  - `max_width_atr = 3.5`
+  - `edge_tolerance_atr = 0.20`
+  - `min_upper_touches = 2`
+  - `min_lower_touches = 2`
+  - `min_close_inside_frac = 0.50`
+  - `allowed_wick_overshoot_atr = 1.25`
+  - `max_drift_frac = 0.85`
+- Maturity / confirm defaults in the current stable detector:
+  - `min_confirm_bars = 2`
+  - `min_candidate_dwell_bars = 2`
+  - `boundary_stability_tolerance_atr = 0.35`
+  - `lineage_grace_bars = 1`
+- Same-lineage continuation rule is live:
+  - one-bar grace only
+  - requires interval overlap `>= 0.75`
+  - requires width change `<= 0.35 ATR`
+  - otherwise lineage resets
+- Viability is intentionally coverage-safe:
+  - hard veto only: `recent_expansion_veto_flag`
+  - soft score inputs:
+    - pressure imbalance
+    - equilibrium
+    - two-sided freshness
+  - confirm gate:
+    - maturity pass
+    - no hard expansion veto
+    - `range_strength_viability >= 0.58`
+- Confirm-time duplicate suppression across lookbacks is live:
+  - compare to confirmed events within the last `4` bars
+  - suppress as duplicate when all hold:
+    - interval overlap fraction `>= 0.85`
+    - mid-distance `<= 0.35 ATR`
+    - width ratio `>= 0.75`
+  - duplicate precedence:
+    1. higher `range_strength_viability`
+    2. higher `range_strength_formation`
+    3. narrower `width_atr`
+    4. shorter `candidate_lookback_bars`
+    5. newer `confirm_idx`
+- Nested boxes that fail the duplicate conditions survive as separate events.
+
+### Current validator capabilities
+
+The validator now reports:
+
+- overall funnel:
+  - raw
+  - maturity
+  - viability
+  - confirmed
+- funnel split by `candidate_lookback_bars`
+- counts per calendar year for all four stages
+- maturity rejection breakdown:
+  - failed dwell
+  - failed boundary stability
+  - failed same-lineage continuation
+  - failed candidate eligibility before maturity
+- viability rejection breakdown:
+  - expansion veto
+  - pressure
+  - equilibrium
+  - freshness
+  - score threshold
+  - multiple reasons
+- archetype comparison:
+  - short-lived high-strength
+  - long-lived medium-strength
+- viability alignment audit
+- pressure imbalance audit
+- forensic CSV exports
+- candidate-stage CSV export
+
+### Current synthetic test coverage
+
+The Step 8 test suite now covers:
+
+- confirm activation timing
+- no pre-confirm activation
+- false-break reclaim
+- close-based accepted breakout
+- expiry
+- overlap / supersession
+- causal source metadata
+- soft viability gating
+- hard expansion veto reject
+- lineage grace preserve
+- lineage grace reset
+- multi-window raw formation:
+  - fixture confirms on `lookback=5` but not `lookback=12`
+- duplicate suppression:
+  - overlapping confirms across two lookbacks collapse into one event
+- nested preservation:
+  - materially different inner/outer boxes from different lookbacks both survive
+- production pressure metric equality:
+  - live `range_recent_pressure_imbalance` matches the current promoted v2 formula on a fixed fixture
+
+## Current stable reference-run result
+
+Reference command:
+
+- `poetry run python scripts/validate_range_boundaries.py --instrument XAU_USD --timeframe H4 --date-from 2026-01-01 --plot-rows 250`
+
+Current stable Step 8C reference-run result on `XAU_USD H4`:
+
+- selected rung: `base`
+- selected params:
+  - `candidate_lookback_bars = (5, 8, 12, 16)`
+  - `min_confirm_bars = 2`
+  - `min_candidate_dwell_bars = 2`
+  - `boundary_stability_tolerance_atr = 0.35`
+  - `lineage_grace_bars = 1`
+  - `max_width_atr = 3.5`
+  - `edge_tolerance_atr = 0.2`
+  - `min_upper_touches = 2`
+  - `min_lower_touches = 2`
+  - `min_close_inside_frac = 0.5`
+  - `allowed_wick_overshoot_atr = 1.25`
+  - `max_drift_frac = 0.85`
+  - `viability_lookback_bars = 3`
+
+Coverage result:
+
+- `confirmed_ranges = 699`
+- `active_rows = 3512`
+- funnel:
+  - `4280 raw`
+  - `1942 maturity`
+  - `1140 viability`
+  - `699 confirmed`
+
+Per-lookback confirmed counts:
+
+- `5 -> 228`
+- `8 -> 202`
+- `12 -> 148`
+- `16 -> 139`
+
+This means the Step 8C pass succeeded on its primary objective:
+
+- the severe sparsity problem is fixed
+- coverage is now inside the target `400-700` band
+- active-row coverage is well above `1000`
+
+## Current stable quality profile
+
+Important current stable numeric facts from the widened detector:
+
+- `width_atr mean = 2.164`
+- `strength mean = 0.500`
+- `close_inside_frac mean = 0.937`
+- `duration median = 4`
+- `bars_to_first_breach median = 2`
+- `bars_to_breakout_accept median = 3`
+- `reclaim_rate_given_break_pending = 0.581`
+- `overlap_rate = 0.033`
+
+Regime-conditioned confirm counts:
+
+- `0 -> 337`
+- `1 -> 157`
+- `2 -> 199`
+- `NaN -> 6`
+
+## Current stable causal checks
+
+These are all passing on the stable Step 8C baseline:
+
+- `no_active_before_first_confirm = True`
+- `no_same_bar_break_pending_on_confirm_rows = True`
+- `detect_rows_are_active = True`
+- `source_idx_matches_confirm_idx_on_active_rows = True`
+- `range_strength_in_unit_interval = True`
+- `range_width_atr_positive_on_detect_rows = True`
+- `no_flat_or_inverted_geometry_on_detect_rows = True`
+
+## Current unresolved blocker
+
+Coverage is fixed, but quality alignment is not frozen.
+
+On the current stable Step 8C widened dataset, the archetype audits remain misaligned for:
+
+- `range_recent_pressure_imbalance`
+- `range_recent_equilibrium_score`
+- `range_recent_two_sided_freshness_score`
+- `range_strength_viability`
+- final `strength`
+
+Current archetype comparison on the widened stable baseline:
+
+- short-lived high-strength cohort:
+  - `rows = 10`
+  - `duration mean = 1.0`
+  - `strength mean = 0.5955`
+  - `range_strength_viability mean = 0.6897`
+- long-lived medium-strength cohort:
+  - `rows = 10`
+  - `duration mean = 19.7`
+  - `strength mean = 0.5049`
+  - `range_strength_viability mean = 0.6467`
+
+So the remaining Step 8 problem is no longer raw coverage.
+The remaining Step 8 problem is quality alignment / ranking.
+
+## What is frozen now
+
+Treat the following as the current stable Step 8 baseline unless a real bug appears:
+
+- Step 8 ontology
+- Step 8 lifecycle states and timing law
+- immutable confirmed geometry
+- boundary-source semantics
+- multi-window raw candidate family:
+  - `(5, 8, 12, 16)`
+- current maturity / lineage-grace structure
+- current duplicate-suppression structure
+- current validator structure
+- current candidate / event / forensic exports
+- current synthetic fixtures and their semantics
+
+## What is not frozen yet
+
+Do not treat the following as settled:
+
+- final viability metric formulas
+- final viability aggregate composition
+- final `range_strength` composition
+- quality ranking doctrine on the widened detector
+
+If Step 8 is reopened, the next pass should be:
+
+- quality/alignment only
+- no more widening unless a real regression is discovered
+- no ontology or lifecycle redesign
+
+## Step 8 commands that were successfully used
+
+- `poetry run pytest tests/indicators/foundation/test_range_boundaries.py -q`
+- `poetry run ruff check src/indicators/foundation/range_boundaries.py src/validation/indicators/range_boundaries.py scripts/validate_range_boundaries.py tests/indicators/foundation/test_range_boundaries.py`
+- `poetry run python scripts/validate_range_boundaries.py --instrument XAU_USD --timeframe H4 --date-from 2026-01-01 --plot-rows 250`
+
+## Step 8 generated artifacts
+
+- `notebooks/foundation/range_boundaries_validation_XAU_USD_H4.html`
+- `notebooks/foundation/range_boundaries_events_XAU_USD_H4.csv`
+- `notebooks/foundation/range_boundaries_candidates_XAU_USD_H4.csv`
+- `notebooks/foundation/range_boundaries_shortest_lived_XAU_USD_H4.csv`
+- `notebooks/foundation/range_boundaries_longest_lived_XAU_USD_H4.csv`
+- `notebooks/foundation/range_boundaries_strongest_XAU_USD_H4.csv`
+- `notebooks/foundation/range_boundaries_weakest_XAU_USD_H4.csv`
+- `notebooks/foundation/range_boundaries_ranging_short_lived_XAU_USD_H4.csv`
+- `notebooks/foundation/range_boundaries_short_lived_high_strength_XAU_USD_H4.csv`
+- `notebooks/foundation/range_boundaries_long_lived_medium_strength_XAU_USD_H4.csv`
+
+## Step 8E continuation status
+
+After the initial Step 8E implementation, the contract search still had no valid rung:
+
+- best reporting rung was `step8e_b/mid_c`
+- `confirmed_ranges = 190`
+- `active_rows = 1128`
+- `confirm_latency median = 3`
+- short-lived high-strength `duration mean = 1.4`
+- final `strength` still too inverted
+
+Follow-up retune that moved the detector forward:
+
+- reduced touch neatness dominance inside formation:
+  - `touch_quality = clip01((min_touches - 1.0) / 4.0)`
+  - formation weights were shifted away from touch quality and toward containment / width / stability
+  - formation boost changed from `0.82 + 0.18 * touch_quality` to `0.92 + 0.08 * touch_quality`
+- strengthened the Step 8E-B anti-micro-box viability mix:
+  - `viability_pressure_weight = 0.42`
+  - `viability_equilibrium_weight = 0.12`
+  - `viability_freshness_weight = 0.00`
+  - `viability_expansion_pressure_weight = 0.36`
+  - `viability_expansion_veto_weight = 0.10`
+- strengthened final strength dependence for the Step 8E-B retune search:
+  - `final_strength_formation_base = 0.40`
+  - `final_strength_viability_scale = 0.60`
+
+This produced a valid contract rung on the reference run:
+
+- selected valid rung: `step8e_b/mid_c`
+- `confirmed_ranges = 181`
+- `active_rows = 1097`
+- `confirm_latency median = 3.0`
+- short-lived high-strength `duration mean = 1.8`
+- short-lived high-strength `strength mean = 0.6132`
+- long-lived medium-strength `strength mean = 0.5785`
+- `strength_not_badly_inverted = True`
+- `coverage_in_band = True`
+- `active_in_band = True`
+- `plausibility_aligned = True`
+- `monitor_aligned = True`
+- `micro_box_ok = True`
+- `valid = True`
+
+Important nuance:
+
+- on this valid rung, contract metrics are good enough for selection
+- `range_strength_viability` for the selected top short-vs-long cohorts was still slightly inverted
+- this means Step 8 is now usable under the contract gates, but ranking semantics are not globally "finished"
+
+Current Step 8 interpretation after the continuation pass:
+
+- coverage is no longer the main blocker
+- the system now has a valid middle regime
+- remaining future work, if reopened, should be:
+  - ranking refinement only
+  - especially viability semantics vs final strength semantics
+  - no more widening / coverage recovery unless a regression appears
+
+---
+
+# Validation Cache Runtime And Artifact Discipline Rollout
+
+Date:
+
+- 2026-04-01
+
+Objective:
+
+- reduce repeated validation recomputation and repeated notebook artifact rewrites
+- preserve existing indicator / validator / debug-table semantics
+- keep canonical live/research persistence separate from validation caches
+
+## What was implemented
+
+### 1. Shared validation cache/runtime layer
+
+Added:
+
+- `src/validation/common/cache_runtime.py`
+
+This module now provides:
+
+- `validation_cache_key(...)`
+- `validation_cache_dir(...)`
+- `load_or_build_context(...)`
+- `load_or_build_stage_artifact(...)`
+- `load_or_build_validation_result(...)`
+- `load_or_skip_report(...)`
+- `cleanup_validation_artifacts(...)`
+- `write_csv_atomic(...)`
+- `write_text_atomic(...)`
+
+Behavior:
+
+- validation caches live under `data/validation_cache/...`
+- cache keys include validator, symbol, timeframe, stage, input fingerprint, config fingerprint, upstream fingerprint, time range, schema version, feature contract version, and runtime version
+- cached context frames are written atomically as parquet
+- cached validation results can store:
+  - JSON payload
+  - one or more parquet frames
+- report writes are skipped when report fingerprint is unchanged
+- stale validation cache files can be pruned explicitly
+
+Important:
+
+- this cache layer is for validation/runtime artifacts only
+- it does not touch canonical live or research feature stores
+- it does not change validator math
+
+### 2. Validation common exports
+
+Updated:
+
+- `src/validation/common/__init__.py`
+
+So scripts can import the new validation runtime helpers directly.
+
+### 3. `validate_range_boundaries.py` heavy-first migration
+
+Updated:
+
+- `scripts/validate_range_boundaries.py`
+
+What changed:
+
+- added staged validation flow:
+  - raw/input load
+  - context resolution
+  - rung/debug resolution
+  - selection cache
+  - optional report persistence
+- added cache-backed context loading with:
+  - safe canonical live feature reuse when canonical live rows match raw OHLC rows exactly
+  - fallback to cached raw rebuild when canonical live is missing or not aligned
+- cached each ladder rung separately using:
+  - context fingerprint
+  - rung params fingerprint
+- cached selection payload separately
+- switched report/artifact persistence to opt-in flags
+- added report fingerprint checks so unchanged HTML/CSV/MD outputs are not rewritten
+- added atomic CSV and text writes for validation artifacts
+- added explicit cleanup path for stale validation cache/report artifacts
+- added profiler summary output under:
+  - `data/validation_cache/validate_range_boundaries/{symbol}/{timeframe}/run-summary.json`
+
+New CLI flags:
+
+- `--html`
+- `--write-csv`
+- `--force`
+- `--invalidate-cache`
+- `--cleanup-stale`
+- `--max-artifact-age-days`
+- `--tail-rows`
+- `--full`
+
+Current default behavior:
+
+- still computes the same validation logic
+- does not write HTML unless `--html`
+- does not write CSV / memo artifacts unless `--write-csv`
+- reuses cached context and cached rung results when inputs/params are unchanged
+
+Semantics preserved:
+
+- `_build_context(...)` logic unchanged
+- `_run_debug_with_params(...)` logic unchanged
+- `collect_range_boundary_debug_tables(...)` usage unchanged
+- rung assessment and selection logic unchanged
+- validation summaries and debug tables are derived from the same underlying functions
+
+### 4. `validate_regime.py` cache + report discipline
+
+Updated:
+
+- `scripts/validate_regime.py`
+
+What changed:
+
+- added CLI flags for:
+  - `--html`
+  - `--tail-rows`
+  - `--full`
+  - `--force`
+  - `--invalidate-cache`
+  - `--cleanup-stale`
+  - `--max-artifact-age-days`
+- added cached context resolution for:
+  - live regime context
+  - research regime context
+- added safe canonical live/research reuse if canonical rows match raw OHLC rows
+- default run now prints summary without rewriting HTML
+- HTML generation is now opt-in and fingerprint-aware
+- profiler summary written under:
+  - `data/validation_cache/validate_regime/{symbol}/{timeframe}/run-summary.json`
+
+Semantics preserved:
+
+- `_build_context(...)` logic unchanged
+- `validate_regime(...)` logic unchanged
+- only orchestration and persistence discipline changed
+
+### 5. `validate_trend_state.py` cache + report discipline
+
+Updated:
+
+- `scripts/validate_trend_state.py`
+
+What changed:
+
+- added CLI flags for:
+  - `--html`
+  - `--tail-rows`
+  - `--full`
+  - `--force`
+  - `--invalidate-cache`
+  - `--cleanup-stale`
+  - `--max-artifact-age-days`
+- added cached context resolution for:
+  - minimal trend-state context
+  - full validation context
+- added safe canonical live reuse when canonical rows match raw OHLC rows
+- default run now prints summary without rewriting HTML
+- HTML generation is opt-in and fingerprint-aware
+- profiler summary written under:
+  - `data/validation_cache/validate_trend_state/{symbol}/{timeframe}/run-summary.json`
+
+Semantics preserved:
+
+- `_build_context(...)` unchanged
+- `_build_trend_state_context(...)` unchanged
+- `validate_trend_state(...)` usage unchanged
+
+### 6. `validate_sr_levels.py` first-pass cache/report discipline
+
+Updated:
+
+- `scripts/validate_sr_levels.py`
+
+What changed:
+
+- default behavior now prints numeric summary only
+- HTML generation moved behind `--html`
+- HTML writes now use report fingerprint skipping
+- added stale cleanup / force / invalidate-cache flags
+- added cached enriched SR context:
+  - normalized candles
+  - ATR
+  - swings
+  - equal highs/lows
+  - previous day/week levels
+  - session features
+  - volume profile
+- profiler summary written under:
+  - `data/validation_cache/validate_sr_levels/{symbol}/{timeframe}/run-summary.json`
+
+Important limitation:
+
+- SR registry/project lifecycle itself is still recomputed each run after the cached enriched context is loaded
+- this is already better than rebuilding the upstream enrichment stack every run, but it is not yet as granular as the range-boundaries migration
+
+## What is now cached
+
+### Context cache
+
+For migrated validators:
+
+- full upstream context frames are cached as parquet under `data/validation_cache`
+
+### Stage/debug cache
+
+For range boundaries:
+
+- each ladder rung result is cached separately
+- cached result includes:
+  - `frame`
+  - `event_table`
+  - `candidate_table`
+  - summary payload
+
+### Selection cache
+
+For range boundaries:
+
+- the rung assessment / selected rung payload is cached separately from rung execution
+
+### Report cache
+
+For migrated validators:
+
+- HTML/CSV/MD writes are skipped when the report fingerprint is unchanged
+
+## What still intentionally remains full-compute
+
+- range-boundaries full ladder still computes all rung candidates on the first uncached run
+- `validate_sr_levels.py` still recomputes registry projection after loading cached enriched context
+- research canonical feature materialization on changed input is still intentionally full rebuild by design
+- validators not yet migrated in this pass may still rebuild context from raw
+
+## What was intentionally not changed
+
+- no threshold changes
+- no causal timing changes
+- no event timing changes
+- no indicator math changes
+- no validator summary math changes
+- no debug-table schema changes were intentionally introduced
+- no canonical feature persistence semantics were changed in this pass
+
+## Tests and verification run
+
+Syntax:
+
+- `python3 -m py_compile src/validation/common/cache_runtime.py scripts/validate_range_boundaries.py scripts/validate_regime.py scripts/validate_trend_state.py scripts/validate_sr_levels.py`
+
+New cache/runtime coverage:
+
+- `poetry run pytest tests/validation/test_cache_runtime.py tests/indicators/foundation/test_validate_range_boundaries.py -q`
+- result: `11 passed`
+
+Existing regime validator coverage:
+
+- `poetry run pytest tests/indicators/foundation/test_regime.py -q`
+- result: `16 passed`
+
+Trend-state targeted test query:
+
+- `poetry run pytest tests/test_indicators.py -k "validate_trend_state" -q`
+- result: no matching tests selected (`126 deselected`)
+
+## Notes about repo state
+
+- the worktree already contained many unrelated modified files before this pass
+- I did not revert or normalize unrelated changes
+- this pass changed only the validation runtime / validation script surfaces listed above plus the new cache tests and this memory note
+
+## Next recommended follow-up
+
+If continuing this validation-cache rollout, the next highest-value steps are:
+
+- migrate `validate_volatility.py` and remaining structure validators onto the same context/result cache API
+- split `validate_sr_levels.py` further so registry/project results are cacheable, not just enriched input context
+- add script-level end-to-end cache tests for:
+  - unchanged rerun cache hit
+  - changed params invalidating only the affected debug stage
+  - unchanged report skipping rewrite
+
+---
+
+# DAG Runtime Rollout
+
+Date:
+
+- 2026-04-01
+
+Objective:
+
+- introduce a manifest-driven DAG runtime for canonical pipelines and heavy validation flows
+- preserve indicator and validator semantics
+- make orchestration, dependency invalidation, and node-level profiling explicit
+
+## What was added
+
+### New runtime package
+
+Added:
+
+- `src/dag_runtime/contracts.py`
+- `src/dag_runtime/node.py`
+- `src/dag_runtime/fingerprints.py`
+- `src/dag_runtime/artifacts.py`
+- `src/dag_runtime/profiling.py`
+- `src/dag_runtime/cache_store.py`
+- `src/dag_runtime/graph.py`
+- `src/dag_runtime/executor.py`
+- `src/dag_runtime/validation.py`
+- `src/dag_runtime/builtin_graphs.py`
+- `src/dag_runtime/__init__.py`
+
+This runtime now provides:
+
+- node manifests with:
+  - node kind
+  - semantic class
+  - cache policy
+  - validation policy
+  - replay/frontier policy
+  - mutable scope
+  - failure-recovery policy
+- graph manifests and dependency closure resolution
+- content-addressed node fingerprints
+- graph execution with cache reuse and node artifact materialization
+- explain mode for invalidation / rerun inspection
+- graph-level profiler output
+- node cache invalidation helpers
+- graph parity helpers
+
+### New CLI entrypoint
+
+Added:
+
+- `scripts/run_graph.py`
+
+Current supported built-in graph families:
+
+- `live_pipeline`
+- `research_pipeline`
+- `validate_range_boundaries`
+- `validate_regime`
+- `validate_trend_state`
+- `validate_sr_levels`
+
+Current CLI capabilities:
+
+- run a graph target
+- explain which nodes would execute
+- invalidate selected node caches
+
+Example:
+
+- `poetry run python scripts/run_graph.py --graph live_pipeline --symbol XAU_USD --timeframe H4 --raw-path data/raw/XAU_USD_H4.parquet --explain`
+
+## What changed in pipelines
+
+### Live pipeline
+
+Updated:
+
+- `src/indicators/pipelines/build_live.py`
+
+Change:
+
+- `build_live_indicators(...)` now executes through the DAG runtime using the built-in `live_pipeline` graph instead of hardcoding stage chaining directly inside that function
+
+Important:
+
+- the graph still reuses the exact existing stage functions from `_live_stages(...)`
+- no indicator math was changed
+- no stage order was changed
+- `run_live_pipeline(...)` and `materialize_live_features(...)` still preserve their existing incremental, frontier merge, and persistence behavior
+
+### Research pipeline
+
+Updated:
+
+- `src/indicators/pipelines/build_research.py`
+
+Change:
+
+- `build_research_indicators(...)` now executes through the DAG runtime using the built-in `research_pipeline` graph
+
+Important:
+
+- the graph still reuses the exact existing stage functions from `_research_stages(...)`
+- research no-op / incremental orchestration and canonical persistence behavior remain as before
+
+## Built-in graph coverage
+
+### Live / research
+
+Built-in graphs currently model:
+
+- raw input node
+- sequential stage nodes
+- explicit stage metadata such as replay class and semantic class
+
+The canonical live/research materialization APIs remain the source of truth for persistence. This rollout formalizes compute orchestration first while preserving current persistence semantics.
+
+### Range boundaries
+
+Built-in graph currently models:
+
+- `range_context`
+- lightweight rung debug nodes for all Step 8E-A and Step 8E-B rung families
+- `range_selected_rung`
+- `range_selected_debug`
+- `range_forensics`
+- `range_geometry_audit`
+- `range_active_truth_audit`
+- `range_coverage_regime_report`
+- `range_ranking_bundle`
+- `range_downstream_usefulness`
+- `range_main_chart`
+
+Important design improvement:
+
+- lightweight rung nodes materialize only summary + `event_table` + `candidate_table`
+- they do not cache full-frame copies for every rung
+- only the `range_selected_debug` node materializes the full selected debug frame
+
+This was the key DAG-level correction to the previous cache strategy, which had been writing large full-frame artifacts for multiple retune rungs.
+
+### Regime / trend-state / SR levels
+
+Built-in graphs currently expose:
+
+- regime:
+  - live context
+  - research context
+  - summary node
+- trend-state:
+  - minimal overlay context
+  - full context
+  - summary node
+- SR levels:
+  - enriched context
+  - registry
+  - projected context
+  - summary node
+
+These graph definitions reuse the existing validator helpers and do not alter their internal semantics.
+
+## New docs
+
+Updated:
+
+- `docs/contracts/pipeline_runtime_contracts.md`
+
+Added:
+
+- `docs/NODE_VALIDATION_CONVENTION.md`
+
+The new convention doc defines:
+
+- what a DAG node is in this repo
+- required node contract fields
+- validation levels:
+  - unit
+  - node parity
+  - graph parity
+  - incremental/frontier
+  - report/render
+- mandatory checks on every iteration
+- when full rebuild comparison is required
+- approval rules for frontier-safe incremental execution
+- merge gate for no-semantic-drift changes
+- profiling evidence expectations
+- acceptance template for future nodes
+
+## Validation and test coverage
+
+New tests added:
+
+- `tests/dag_runtime/test_dag_runtime.py`
+
+What these tests cover:
+
+- cached node reuse on second execution
+- explain mode behavior
+- live built-in stage graph parity against the manual stage chain
+
+Regression tests run successfully:
+
+- `poetry run pytest tests/dag_runtime/test_dag_runtime.py tests/test_pipeline_incremental.py tests/test_pipeline_persistence.py -q`
+- result: `12 passed`
+
+- `poetry run pytest tests/validation/test_cache_runtime.py tests/indicators/foundation/test_validate_range_boundaries.py tests/indicators/foundation/test_regime.py -q`
+- result: `28 passed`
+
+CLI smoke check:
+
+- `poetry run python scripts/run_graph.py --graph live_pipeline --symbol XAU_USD --timeframe H4 --raw-path data/raw/XAU_USD_H4.parquet --explain`
+
+This returned the expected node list with cache-hit / would-execute reporting.
+
+## Semantics preserved
+
+The following were intentionally preserved:
+
+- indicator formulas
+- stage ordering
+- causal timing
+- event timing
+- canonical live/research output contracts
+- frontier partition persistence behavior
+- existing validation helper math
+
+This rollout changes orchestration, node contracts, cache addressing, and graph inspection. It does not intentionally change trading or validation logic.
+
+## Current limitations
+
+- live/research materialization nodes are not yet first-class DAG nodes; canonical persistence still runs through the existing materialization functions
+- built-in validation graphs exist, but the legacy validator scripts are still the primary operational interfaces for now
+- not every heavy validator has been migrated into a graph family yet
+- report-bundle coverage for range boundaries is not complete at the same granularity as the graph summary/analytics nodes yet
+
+## Recommended next follow-up
+
+If continuing this DAG rollout, the highest-value next steps are:
+
+- add first-class DAG materialization nodes for canonical live and research persistence
+- route `validate_range_boundaries.py` main execution through the built-in graph targets instead of parallel script-side orchestration
+- expand range-boundary graph terminal nodes to the full report bundle set
+- migrate the remaining structure validators (`bos`, `choch`, `swings`, `structure_context`, `volatility`, `volume_profile`) into built-in graph families
+
+# Validation DAG Integration Wave
+
+## Objective of this wave
+
+- Move validation entrypoints onto DAG orchestration without changing validation logic, indicator math, event timing, schema semantics, or report meaning.
+- Keep existing `scripts/validate_*.py` files as stable compatibility wrappers.
+- Remove script-owned orchestration where built-in graph families already exist.
+- Keep report generation terminal-only and graph-driven.
+
+## Files changed in this wave
+
+- `src/dag_runtime/builtin_graphs.py`
+- `scripts/validate_range_boundaries.py`
+- `scripts/validate_regime.py`
+- `scripts/validate_trend_state.py`
+- `scripts/validate_sr_levels.py`
+- `docs/VALIDATION_DAG_MIGRATION_STATUS.md`
+- `.codex/memory.md`
+
+## What was implemented
+
+### Range boundaries DAG completion
+
+The `validate_range_boundaries` graph was extended so the DAG now owns the heavy validation path rather than stopping at partial analytics.
+
+Added or completed nodes:
+- `range_context`
+- `range_rung_debug__step8e_a__*`
+- `range_rung_debug__step8e_b__*`
+- `range_selected_rung`
+- `range_selected_debug`
+- `range_forensics`
+- `range_geometry_audit`
+- `range_active_truth_audit`
+- `range_coverage_regime_report`
+- `range_ranking_bundle`
+- `range_downstream_usefulness`
+- `range_diagnostics_bundle`
+- `range_main_chart`
+- `range_geometry_chart_pack`
+- `range_refresh_chart_pack`
+- `range_downstream_chart_pack`
+- `range_csv_bundle`
+- `range_validation_bundle`
+
+Important implementation details:
+- `range_forensics` now preserves the old script semantics by adding Path C2 candidate scoring before contract-bucket labeling.
+- Lightweight rung nodes still materialize only:
+  - `event_table`
+  - `candidate_table`
+  - summary payload
+- The full selected debug frame remains isolated to `range_selected_debug`.
+- Post-selection analytics that were still script-local were moved into DAG aggregate nodes.
+- Chart packs and CSV/memo bundles are now terminal report nodes.
+- `scripts/validate_range_boundaries.py` no longer owns ladder orchestration, selection, downstream analytics, or report writing.
+
+### Thin wrapper cutovers
+
+The following validators now execute through built-in DAG targets rather than hybrid script orchestration:
+
+- `scripts/validate_range_boundaries.py`
+  - primary target: `range_validation_bundle`
+- `scripts/validate_regime.py`
+  - primary target: `regime_validation_bundle`
+- `scripts/validate_trend_state.py`
+  - primary target: `trend_state_validation_bundle`
+  - `--minimal` target: `trend_state_minimal_overlay_context`
+- `scripts/validate_sr_levels.py`
+  - primary target: `sr_validation_bundle`
+
+Wrapper doctrine used:
+- parse CLI args
+- build `GraphRunContext`
+- execute the correct DAG target
+- print summaries and artifact paths
+- write graph profiler output to the existing validation-cache location
+
+### Canonical context reuse preserved
+
+To avoid a performance regression from the migration itself:
+- `validate_range_boundaries` DAG context keeps preferring canonical live features when available.
+- `validate_regime` DAG context now prefers canonical live/research stores when they match raw input.
+- `validate_trend_state` DAG context now prefers canonical live features when they match raw input.
+
+This preserved the old fast path while moving orchestration into the DAG runtime.
+
+## Validation migration inventory
+
+Added:
+- `docs/VALIDATION_DAG_MIGRATION_STATUS.md`
+
+This file records:
+- fully DAG-backed wrappers
+- remaining legacy procedural validators
+- next recommended migration order
+
+Current fully DAG-backed wrappers:
+- `validate_range_boundaries`
+- `validate_regime`
+- `validate_trend_state`
+- `validate_sr_levels`
+
+## Verification completed
+
+### Compile checks
+
+- `python3 -m py_compile src/dag_runtime/builtin_graphs.py scripts/validate_range_boundaries.py scripts/validate_regime.py scripts/validate_trend_state.py scripts/validate_sr_levels.py`
+
+### Targeted tests
+
+- `poetry run pytest tests/dag_runtime/test_dag_runtime.py tests/validation/test_cache_runtime.py tests/indicators/foundation/test_validate_range_boundaries.py tests/indicators/foundation/test_regime.py -q`
+- result: `31 passed`
+
+### Real wrapper smoke checks
+
+Executed successfully on real data:
+- `poetry run python scripts/validate_regime.py`
+- `poetry run python scripts/validate_trend_state.py --minimal`
+- `poetry run python scripts/validate_sr_levels.py`
+
+Observed notes:
+- pyarrow emitted the same sandbox `sysctlbyname` warnings seen earlier; these were environmental and non-blocking.
+- `validate_range_boundaries.py` was started through the new wrapper path, but it remained computationally heavy enough that it did not finish within the bounded tool wait used in-session. That points to remaining compute cost in the underlying heavy analytics path, not to a wrapper crash.
+
+## Semantics preserved
+
+Explicitly preserved in this wave:
+- no indicator logic changes
+- no event timing changes
+- no schema reinterpretation
+- no report meaning changes
+- no selected-rung selection rule changes
+- no live/research causal contract changes
+
+This wave changes orchestration only:
+- graph ownership of compute/report stages
+- cache/invalidation routing
+- wrapper execution path
+- profiler ownership
+
+## Remaining work after this wave
+
+Not yet migrated to DAG-backed wrappers:
+- structure validators:
+  - `validate_structure_context.py`
+  - `validate_swings.py`
+  - `validate_bos.py`
+  - `validate_bos_context.py`
+  - `validate_choch.py`
+  - `validate_choch_context.py`
+- remaining medium-priority validators:
+  - `validate_volatility.py`
+  - `validate_volume_profile.py`
+  - `validate_volume.py`
+  - `validate_fvg.py`
+  - `validate_equal_hl.py`
+  - `validate_displacement.py`
+  - `validate_avwap.py`
+  - `validate_session.py`
+  - `validate_sweeps.py`
+  - `validate_wedges.py`
+  - `validate_fibonacci.py`
+  - `validate_ob.py`
+  - `validate_amd.py`
+- low-priority or broad aggregate surfaces:
+  - `validate_indicators.py`
+  - `validate_detectors.py`
+
+Next recommended order remains:
+1. `validate_structure_context.py`
+2. `validate_swings.py`
+3. `validate_bos.py`
+4. `validate_bos_context.py`
+5. `validate_choch.py`
+6. `validate_choch_context.py`
+7. `validate_volatility.py`
+8. `validate_volume_profile.py`
+
+# Validator Parity Hardening
+
+## Objective
+
+Add explicit legacy-vs-DAG parity coverage for the migrated validators so the new wrapper path is not only smoke-tested but compared against the old helper-driven execution path.
+
+## Files changed
+
+- `src/dag_runtime/builtin_graphs.py`
+- `tests/dag_runtime/test_validation_graph_parity.py`
+- `.codex/memory.md`
+
+## Important fix discovered during parity work
+
+The original DAG version of `validate_range_boundaries` had a semantic risk:
+- Step 8E-B retune rung nodes were being included in selection even when Step 8E-A already had a valid rung.
+
+Why this mattered:
+- it could change selected-rung behavior relative to the legacy script
+- it also forced unnecessary heavy retune compute on ordinary runs
+
+Fix applied:
+- added `range_retune_gate`
+- Step 8E-B rung nodes now depend on the retune gate
+- when Step 8E-A already yields a valid rung:
+  - Step 8E-B rung compute returns a skipped payload immediately
+  - Step 8E-B heavy `_run_debug_with_params(...)` work is not executed
+- `range_selected_rung` now matches legacy semantics:
+  - assess Step 8E-A first
+  - only use Step 8E-B assessments when Step 8E-A has no valid rung
+
+This was both a parity fix and the first concrete performance fix.
+
+## New parity tests added
+
+Added:
+- `tests/dag_runtime/test_validation_graph_parity.py`
+
+Coverage added:
+- `regime` DAG bundle vs direct helper-driven summary
+- `trend_state` DAG bundle vs direct helper-driven summary
+- `sr_levels` DAG bundle vs direct helper-driven summary
+- `range_boundaries` retune-gating behavior
+- `range_boundaries` DAG bundle vs legacy helper-driven selection and downstream summaries
+
+Range-boundary parity surface currently checked:
+- `reporting_label`
+- `selected_label`
+- `used_retune`
+- selected summary payload
+- downstream summary payload
+- diagnostics payload
+- ranking-repair recommendation
+- report nodes remain no-op when `html=False` and `write_csv=False`
+
+## Verification completed
+
+### New parity suite
+
+- `poetry run pytest tests/dag_runtime/test_validation_graph_parity.py -q`
+- result: `5 passed`
+
+### Combined targeted suite
+
+- `poetry run pytest tests/dag_runtime/test_dag_runtime.py tests/dag_runtime/test_validation_graph_parity.py tests/validation/test_cache_runtime.py tests/indicators/foundation/test_validate_range_boundaries.py tests/indicators/foundation/test_regime.py -q`
+- result: `36 passed`
+
+### Compile checks
+
+- `python3 -m py_compile src/dag_runtime/builtin_graphs.py tests/dag_runtime/test_validation_graph_parity.py`
+
+## Updated confidence statement
+
+After this hardening pass:
+- there is still no absolute mathematical guarantee of zero drift across every validator and every mode
+- but the migrated validator wave now has explicit DAG-vs-legacy parity coverage
+- the heaviest migrated path, `validate_range_boundaries`, now has coverage for both:
+  - selection semantics
+  - the key downstream bundle summaries
+
+## Concrete performance findings for range boundaries
+
+The existing profiler evidence for `validate_range_boundaries` shows the main cost is still rung recomputation, not wrapper overhead.
+
+Representative heavy stages from `data/validation_cache/validate_range_boundaries/XAU_USD/H4/run-summary.json`:
+- `step8e_a__mid_a`: about `50.43s`
+- `step8e_a__mid_b`: about `40.70s`
+- `step8e_a__mid_c`: about `23.23s`
+- `step8e_a__mid_d`: about `19.98s`
+- `step8e_a__mid_e`: about `24.39s`
+- `step8e_a__mid_f`: about `23.52s`
+- `step8e_b__mid_a`: about `41.29s`
+- `step8e_b__mid_b`: about `37.90s`
+- `step8e_b__mid_c`: about `21.43s`
+- `step8e_b__mid_d`: about `17.48s`
+- `step8e_b__mid_e`: about `22.63s`
+- `step8e_b__mid_f`: about `21.45s`
+
+Total captured run time there was about `352.23s`.
+
+Immediate conclusions:
+- wrapper overhead is negligible
+- heavy cost is the ladder itself
+- the old cache artifacts also show large write amplification from full-frame rung persistence
+
+Most important safe next optimizations:
+1. keep the new retune gate so Step 8E-B is skipped unless needed
+2. ensure production runs use the DAG rung nodes rather than the older full-frame validation-result cache path
+3. avoid materializing full selected-debug frame unless a downstream node truly needs it
+4. add finer-grained target routing so “specific area” requests execute only the needed downstream node family
+5. later, investigate reducing repeated full-context passes inside `_run_debug_with_params(...)` without changing semantics
+
+## Validation command contract and no-drift gate rollout
+
+Implemented the next depth-first range-boundary iteration layer on top of the DAG runtime.
+
+### New documentation
+
+Added:
+- `docs/VALIDATION_COMMAND_CONTRACT.md`
+
+Purpose:
+- freeze the official validation CLI contract
+- make validator wrappers the supported interface
+- define required flags for migrated validators
+- define which command classes are diagnostic-only, report-writing, or full validation
+- define exact target mapping for `validate_range_boundaries.py`
+
+Also extended:
+- `docs/NODE_VALIDATION_CONVENTION.md`
+
+New hard gate content added:
+- validator-family changes are blocked unless node parity, graph parity, command-contract verification, and profiler sanity checks all pass
+- `range_boundaries` has an additional hard gate:
+  - selected rung unchanged
+  - retune usage unchanged
+  - selected summary unchanged
+  - downstream summary unchanged
+  - diagnostics bundle unchanged
+  - report targets remain terminal only
+
+Also updated:
+- `docs/VALIDATION_DAG_MIGRATION_STATUS.md`
+
+Added there:
+- explicit range-boundaries command targets and resolved DAG target map
+
+### DAG/runtime changes
+
+Extended `src/dag_runtime/executor.py`:
+- `explain_graph_run(...)` now accepts invalidation context
+- explanation output now includes:
+  - `upstream_nodes`
+  - `reason`
+
+Current explain reasons:
+- `cache-hit`
+- `invalidated-node`
+- `force`
+- `invalidate-cache`
+- `source-input`
+- `cache-miss`
+
+Extended `src/dag_runtime/builtin_graphs.py` with explicit range-boundary user-facing bundles:
+- `range_selection_bundle`
+- `range_analysis_bundle`
+- `range_chart_bundle`
+
+Updated `range_validation_bundle` to compose from these bundle nodes instead of directly listing all low-level nodes.
+
+This keeps the graph node family intact but makes command routing cleaner and iteration-safe.
+
+### `validate_range_boundaries.py` wrapper contract
+
+Refactored the wrapper to support stable target-based execution.
+
+Added:
+- `--target`
+- `--explain`
+
+Implemented stable targets:
+- `selection` -> `range_selection_bundle`
+- `selected-debug` -> `range_selected_debug`
+- `forensics` -> `range_forensics`
+- `geometry` -> `range_geometry_audit`
+- `active-truth` -> `range_active_truth_audit`
+- `coverage` -> `range_coverage_regime_report`
+- `ranking` -> `range_ranking_bundle`
+- `downstream` -> `range_downstream_usefulness`
+- `diagnostics` -> `range_diagnostics_bundle`
+- `charts` -> `range_chart_bundle`
+- `csv` -> `range_csv_bundle`
+- `full` -> `range_validation_bundle`
+
+Behavior now enforced:
+- `--target selection` executes only the selection closure
+- `--target geometry` executes only the geometry closure plus true upstream dependencies
+- `--target charts` resolves to chart-only terminal nodes
+- `--target csv` resolves to CSV/memo terminal nodes
+- `--explain` prints the resolved target, node plan, cache-hit state, and reason codes instead of executing the graph
+
+The full wrapper still prints the legacy high-value summary for `--target full`.
+Targeted commands return early after printing target-specific output so diagnose/patch loops do not pay for unrelated reporting.
+
+### New tests added
+
+Added:
+- `tests/validation/test_validate_range_boundaries_command_contract.py`
+
+Coverage:
+- `--target selection` resolves to `range_selection_bundle`
+- `--target geometry` resolves to `range_geometry_audit`
+- `--target charts --html` resolves to `range_chart_bundle`
+- `--target csv --write-csv` resolves to `range_csv_bundle`
+- `--explain` emits the resolved target and per-node reasons
+
+### Verification completed
+
+Compile:
+- `python3 -m py_compile src/dag_runtime/executor.py src/dag_runtime/builtin_graphs.py scripts/validate_range_boundaries.py tests/validation/test_validate_range_boundaries_command_contract.py`
+- result: passed
+
+Wrapper contract tests:
+- `poetry run pytest tests/validation/test_validate_range_boundaries_command_contract.py -q`
+- result: `5 passed`
+
+Combined targeted suite:
+- `poetry run pytest tests/dag_runtime/test_dag_runtime.py tests/dag_runtime/test_validation_graph_parity.py tests/validation/test_validate_range_boundaries_command_contract.py tests/validation/test_cache_runtime.py tests/indicators/foundation/test_validate_range_boundaries.py tests/indicators/foundation/test_regime.py -q`
+- result: `41 passed, 28 warnings`
+
+### What this gives operationally
+
+For current range-boundary diagnose -> patch -> rerun work:
+- use `--target selection` when changing rung selection logic
+- use `--target geometry` when changing geometry diagnostics
+- use `--target active-truth` for active-truth auditing only
+- use `--target downstream` for downstream usefulness only
+- use `--target charts --html` to regenerate only chart bundles
+- use `--target csv --write-csv` to regenerate only CSV/memo artifacts
+- use `--explain` first to see exactly what will rerun and why
+
+This is the first reproducible validator command contract over the DAG runtime and is intended to be copied across the remaining validator families after `range_boundaries`.
+
+## Range boundaries performance freeze pass
+
+Implemented the final hard-gated freeze pass for `range_boundaries`.
+
+### What changed
+
+#### 1. Sub-stage profiling added to the heavy rung path
+
+Instrumented `_run_debug_with_params(...)` in `scripts/validate_range_boundaries.py`.
+
+Added stable sub-stage timings:
+- `debug_collect`
+- `pressure_imbalance_legacy`
+- `pressure_imbalance_v2`
+- `contract_scores`
+- `summary_build`
+
+The function now returns observational profiler metadata under:
+- `profile_details.substage_seconds`
+
+No return payload semantics changed.
+
+#### 2. DAG runtime now carries node profile details
+
+Updated:
+- `src/dag_runtime/node.py`
+- `src/dag_runtime/cache_store.py`
+- `src/dag_runtime/executor.py`
+
+Changes:
+- `NodeOutput` now carries `profile_details`
+- cached nodes persist and reload profiler details
+- `GraphRunResult` now exposes:
+  - `executed_nodes`
+  - `closure_nodes`
+- profiler records now include node detail payloads
+- materialized nodes record `cache_write_seconds`
+- `range_selected_debug` additionally records:
+  - `selected_debug_cache_write`
+
+This made the freeze evidence machine-readable instead of console-only.
+
+#### 3. Range-boundary graph now emits freeze-grade details
+
+Updated `src/dag_runtime/builtin_graphs.py` so:
+- every `range_rung_debug__*` node exposes:
+  - rung label
+  - `skipped`
+  - sub-stage timings
+- skipped Step 8E-B nodes expose zeroed sub-stage timings
+- `range_selected_debug` exposes the same sub-stage structure
+
+#### 4. Fixed the real cache invalidation bug blocking freeze
+
+The new real-data target-mode tests exposed a genuine orchestration bug:
+- toggling `html` or `write_csv` was still invalidating upstream compute nodes
+
+Root cause:
+- source-node and compute-node fingerprints were still influenced by broad runtime config in places where they should have been config-insensitive
+
+Fix:
+- `_source_node(...)` now strips runtime config from source-node fingerprints
+- range-boundary compute/aggregate/selection nodes now use explicit config-scoped fingerprint functions
+- chart nodes fingerprint only:
+  - `html`
+  - `date_from`
+  - `plot_rows`
+  - `full`
+  - `out_dir`
+- csv node fingerprints only:
+  - `write_csv`
+  - `out_dir`
+- full validation bundle fingerprints only the report-relevant wrapper config
+
+This was a real performance bug fix, not just extra testing.
+
+Result:
+- report-only flags no longer bust upstream compute cache
+
+### New freeze tests added
+
+Added:
+- `tests/dag_runtime/test_range_boundaries_freeze.py`
+
+Coverage added:
+
+#### Profiling instrumentation
+- rung nodes expose stable sub-stage timing keys
+- skipped Step 8E-B nodes expose `skipped=True` and zero timings
+- `range_selected_debug` exposes cache-write timing
+
+#### Real-data target-mode hardening
+- `selection` rerun uses cache and excludes post-selection analytics
+- `geometry` after warm-up executes only geometry closure
+- `active-truth` after warm-up executes only active-truth closure
+- `downstream` after warm-up executes only downstream closure
+- `charts --html` after warm-up does not recompute upstream compute nodes
+- `csv --write-csv` after warm-up does not execute chart nodes
+
+These tests assert against:
+- `GraphRunResult.executed_nodes`
+- `GraphRunResult.closure_nodes`
+- DAG profiler artifact records
+
+### Documentation updated
+
+Updated:
+- `docs/VALIDATION_COMMAND_CONTRACT.md`
+- `docs/NODE_VALIDATION_CONVENTION.md`
+- `docs/VALIDATION_DAG_MIGRATION_STATUS.md`
+
+New state recorded:
+- `range_boundaries` is now marked `performance freeze complete`
+- the freeze checklist and canonical validation commands are documented
+- the performance freeze gate is now part of the node validation doctrine
+
+### Verification completed
+
+Compile:
+- `python3 -m py_compile src/dag_runtime/node.py src/dag_runtime/cache_store.py src/dag_runtime/executor.py src/dag_runtime/builtin_graphs.py scripts/validate_range_boundaries.py tests/dag_runtime/test_range_boundaries_freeze.py`
+- result: passed
+
+Freeze suite:
+- `poetry run pytest tests/dag_runtime/test_range_boundaries_freeze.py -q`
+- result: `7 passed`
+
+Combined suite:
+- `poetry run pytest tests/dag_runtime/test_dag_runtime.py tests/dag_runtime/test_validation_graph_parity.py tests/dag_runtime/test_range_boundaries_freeze.py tests/validation/test_validate_range_boundaries_command_contract.py tests/validation/test_cache_runtime.py tests/indicators/foundation/test_validate_range_boundaries.py tests/indicators/foundation/test_regime.py -q`
+- result: `48 passed, 28 warnings`
+
+### Freeze decision
+
+Current decision:
+- the orchestration and performance-hardening layer for `range_boundaries` is frozen
+
+Meaning:
+- targeted validator commands are stable
+- report-only flags no longer trigger upstream compute recompute
+- sub-stage profiler evidence exists for the heavy rung path
+- target closures are proven on real data
+- no-drift parity gates remain green
+
+Deferred work, explicitly not part of this freeze:
+- deeper algorithmic optimization inside `collect_range_boundary_debug_tables(...)`
+- reducing intrinsic rung compute cost beyond orchestration and cache discipline
+- broader validator-family rollout of the same freeze pattern
+
+So `range_boundaries` is now in the right state for continued feature and diagnostic work on top of a frozen performance/orchestration contract.
+
+## Range-boundary rollout docs and handoff artifacts
+
+Added two docs to make the range-boundary work reusable and easy to hand off:
+
+- `docs/PERFORMANCE_ENHANCEMENT_OUTLINE.md`
+- `docs/RANGE_BOUNDARIES_AGENT_HANDOFF.md`
+
+### `PERFORMANCE_ENHANCEMENT_OUTLINE.md`
+
+Purpose:
+- reusable step-by-step outline for applying the same performance rollout to every indicator / validator family
+- explicitly sequences the work so algorithmic optimization is the final step, not the first
+
+Main structure:
+- freeze wrapper command contract
+- move orchestration into DAG nodes
+- add no-drift parity
+- add target-based execution
+- add node-level profiler evidence
+- add heavy-path sub-stage profiling
+- harden real-data target closure
+- fix fingerprint-scope invalidation bugs
+- close the performance freeze gate
+- only then do algorithmic optimization
+
+### `RANGE_BOUNDARIES_AGENT_HANDOFF.md`
+
+Purpose:
+- exact handoff for the agent doing range-boundary logic / diagnostics / analysis work
+- documents:
+  - what changed
+  - what is frozen
+  - what commands to use
+  - what not to break
+  - what is still deferred
+
+Important included content:
+- full wrapper target map
+- recommended CLI commands
+- retune gate rule
+- profiler details added
+- report-only invalidation rule
+- safe / unsafe modification boundaries
+- paste-ready summary at the bottom

@@ -25,13 +25,13 @@ from plotly.subplots import make_subplots
 from src.indicators.foundation.fibonacci import (
     FIB_RATIOS,
     FIB_RATIO_LABELS,
-    FIB_DIR_BULL,
-    FIB_DIR_BEAR,
+    FIB_LEVEL_STATE_UNTOUCHED,
+    FIB_LEVEL_STATE_HELD,
+    FIB_LEVEL_STATE_BROKEN,
 )
 from src.indicators.research.fibonacci_research import (
     build_fibonacci_research_table,
     summarize_fibonacci_research,
-    FIB_RESEARCH_COLUMNS,
 )
 
 # ---------------------------------------------------------------------------
@@ -89,6 +89,128 @@ def _add_candlestick(fig: go.Figure, df: pd.DataFrame, row: int, col: int = 1) -
     )
 
 
+# State-based color overrides (override the ratio color when level was touched)
+_STATE_COLOR_HELD = (
+    "rgba(0, 210, 100, 0.80)"  # green — level held as support/resistance
+)
+_STATE_COLOR_BROKEN = "rgba(140, 140, 140, 0.35)"  # faded grey — level broken through
+
+
+def _collect_fib_level_shapes(
+    df: pd.DataFrame,
+    *,
+    direction: str,
+    yref: str,
+    xref: str = "x",
+    max_lines: int = MAX_LEVEL_LINES,
+    max_age_bars: int = 150,
+) -> tuple[list[dict], int]:
+    """Build a list of Plotly shape dicts for Fibonacci levels — no figure writes.
+
+    Line color reflects per-level touch state:
+    - UNTOUCHED  → ratio-based color (blue/red gradient)
+    - HELD       → green
+    - BROKEN     → faded grey (still visible but de-emphasized)
+
+    Batching all shapes into a single ``fig.update_layout(shapes=[...])`` call
+    is orders of magnitude faster than calling ``fig.add_shape()`` once per line
+    because each ``add_shape()`` triggers a full Plotly layout revalidation.
+
+    Returns (shapes, n_drawn).
+    """
+    prefix = direction
+    colors = _RATIO_COLORS_BULL if direction == "bull" else _RATIO_COLORS_BEAR
+    detect_col = f"fib_{prefix}_detect_flag"
+    if detect_col not in df.columns:
+        return [], 0
+
+    x_col = df["timestamp"] if "timestamp" in df.columns else df.index
+    detect_positions = np.flatnonzero(
+        pd.to_numeric(df[detect_col], errors="coerce").fillna(0).to_numpy() == 1
+    )
+
+    # Pre-fetch level arrays and final state arrays as numpy for fast scalar access
+    lbl_arrays: list[tuple[str, float, np.ndarray | None, np.ndarray | None]] = []
+    for lbl, ratio in zip(FIB_RATIO_LABELS, FIB_RATIOS):
+        col_name = f"fib_{prefix}_l{lbl}"
+        arr = df[col_name].to_numpy(dtype=float) if col_name in df.columns else None
+        state_col = f"fib_{prefix}_l{lbl}_state"
+        state_arr = (
+            df[state_col].to_numpy(dtype=np.int8) if state_col in df.columns else None
+        )
+        lbl_arrays.append((lbl, ratio, arr, state_arr))
+
+    event_id_arr = (
+        df[f"fib_{prefix}_event_id"].to_numpy()
+        if f"fib_{prefix}_event_id" in df.columns
+        else None
+    )
+
+    x_end = x_col.iloc[-1]
+    chart_end_pos = len(df) - 1
+    shapes: list[dict] = []
+    n_drawn = 0
+
+    for pos in reversed(detect_positions.tolist()):
+        if n_drawn >= max_lines:
+            break
+        # Skip structures that have definitely expired by the chart end
+        if (chart_end_pos - pos) > max_age_bars:
+            continue
+        if event_id_arr is not None and np.isnan(float(event_id_arr[pos])):
+            continue
+
+        x_start = x_col.iloc[pos]
+
+        for lbl, ratio, arr, state_arr in lbl_arrays:
+            if arr is None:
+                continue
+            lp = float(arr[pos])
+            if not np.isfinite(lp):
+                continue
+
+            # Determine color from level state (use last-known state = chart_end_pos)
+            level_state = (
+                int(state_arr[chart_end_pos])
+                if state_arr is not None
+                else FIB_LEVEL_STATE_UNTOUCHED
+            )
+            if level_state == FIB_LEVEL_STATE_HELD:
+                color = _STATE_COLOR_HELD
+                width = 1.5
+                dash = "solid"
+            elif level_state == FIB_LEVEL_STATE_BROKEN:
+                color = _STATE_COLOR_BROKEN
+                width = 0.75
+                dash = "dot"
+            else:
+                # UNTOUCHED — use ratio-based color
+                color = colors.get(
+                    lbl, _BULL_SOLID if direction == "bull" else _BEAR_SOLID
+                )
+                is_golden = lbl == "0618"
+                width = 2.0 if is_golden else 1.0
+                dash = "solid" if is_golden else "dot"
+
+            shapes.append(
+                dict(
+                    type="line",
+                    xref=xref,
+                    yref=yref,
+                    x0=x_start,
+                    x1=x_end,
+                    y0=lp,
+                    y1=lp,
+                    line=dict(color=color, width=width, dash=dash),
+                )
+            )
+            n_drawn += 1
+            if n_drawn >= max_lines:
+                break
+
+    return shapes, n_drawn
+
+
 def _draw_fib_levels(
     fig: go.Figure,
     df: pd.DataFrame,
@@ -96,64 +218,20 @@ def _draw_fib_levels(
     row: int,
     direction: str,
     max_lines: int = MAX_LEVEL_LINES,
+    max_age_bars: int = 150,
 ) -> int:
-    """Draw horizontal Fibonacci level lines for one direction.
-
-    Returns the number of lines drawn.
-    """
-    prefix = direction  # "bull" or "bear"
-    colors = _RATIO_COLORS_BULL if direction == "bull" else _RATIO_COLORS_BEAR
-    detect_col = f"fib_{prefix}_detect_flag"
-    if detect_col not in df.columns:
-        return 0
-
-    x_col = df["timestamp"] if "timestamp" in df.columns else df.index
-    detect_positions = np.flatnonzero(
-        pd.to_numeric(df[detect_col], errors="coerce").fillna(0).to_numpy() == 1
+    """Add Fibonacci level shapes to ``fig`` via a single batched layout update."""
+    yref = "y" if row == 1 else f"y{row}"
+    shapes, n_drawn = _collect_fib_level_shapes(
+        df,
+        direction=direction,
+        yref=yref,
+        max_lines=max_lines,
+        max_age_bars=max_age_bars,
     )
-
-    n_drawn = 0
-    # Draw most recent structures first (cap by max_lines)
-    for pos in reversed(detect_positions):
-        if n_drawn >= max_lines:
-            break
-        row_data = df.iloc[int(pos)]
-
-        # Check expiry: approximate by checking if quality_score_on_detect is present
-        event_id_val = row_data.get(f"fib_{prefix}_event_id", np.nan)
-        if pd.isna(event_id_val):
-            continue
-
-        x_start = x_col.iloc[int(pos)]
-
-        for lbl, ratio in zip(FIB_RATIO_LABELS, FIB_RATIOS):
-            col_name = f"fib_{prefix}_l{lbl}"
-            if col_name not in df.columns:
-                continue
-            lp = row_data.get(col_name, np.nan)
-            if not np.isfinite(float(lp)):
-                continue
-
-            color = colors.get(lbl, _BULL_SOLID if direction == "bull" else _BEAR_SOLID)
-            label_str = f"{ratio:.3f}"
-            is_golden = lbl == "0618"
-            width = 2.0 if is_golden else 1.0
-            dash = "solid" if is_golden else "dot"
-
-            fig.add_shape(
-                type="line",
-                x0=x_start,
-                x1=x_col.iloc[-1],
-                y0=float(lp),
-                y1=float(lp),
-                line=dict(color=color, width=width, dash=dash),
-                row=row,
-                col=1,
-            )
-            n_drawn += 1
-            if n_drawn >= max_lines:
-                break
-
+    if shapes:
+        existing = list(fig.layout.shapes) if fig.layout.shapes else []
+        fig.update_layout(shapes=existing + shapes)
     return n_drawn
 
 

@@ -1,0 +1,16 @@
+{
+  "config_fingerprint": "3f961a05d1b50f1da1e2ddfae9aebf280be766e65128255b6ebff3e69c5a444d:b8514754d1ae465dec0f249c5b63ae81fe413173d6fb6be55004d85e9ffa15f8:ranking_bundle",
+  "engine_version": "1",
+  "extra": {
+    "report_path": "notebooks/foundation/range_boundaries_ranking_bundle_XAU_USD_H4.csv"
+  },
+  "feature_contract_version": 1,
+  "input_fingerprint": "3f961a05d1b50f1da1e2ddfae9aebf280be766e65128255b6ebff3e69c5a444d:b8514754d1ae465dec0f249c5b63ae81fe413173d6fb6be55004d85e9ffa15f8:ranking_bundle",
+  "last_processed_ts": null,
+  "metadata_version": 1,
+  "pipeline": "range_boundaries_ranking_bundle_XAU_USD_H4",
+  "schema_version": 1,
+  "symbol": "report",
+  "timeframe": "report",
+  "updated_at": null
+}

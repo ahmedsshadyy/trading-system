@@ -102,3 +102,52 @@ Current conservative replay defaults are encoded in the pipeline stage specs:
 - `volume_profile`: 140 bars
 
 These are safety margins, not proofs. If a stage is tightened later, parity tests must demonstrate no semantic drift.
+
+## DAG Runtime Contract
+
+- Graph execution is now described through manifest-driven nodes under `src/dag_runtime`.
+- A node contract must freeze:
+  - node kind
+  - semantic class
+  - upstream dependencies
+  - cache policy
+  - replay/frontier policy where relevant
+  - validation level
+- Node fingerprints must include:
+  - graph name
+  - node name
+  - schema version
+  - feature contract version
+  - engine version
+  - runtime config
+  - direct source-input fingerprints
+  - explicit upstream node fingerprints
+- Report nodes are terminal consumers. They must not be used as upstream dependencies for canonical compute nodes.
+- Graph invalidation is dependency-driven. A node reruns only if:
+  - its own fingerprint changes, or
+  - it is explicitly invalidated, or
+  - a downstream target depends on an upstream node whose fingerprint changed
+
+## Built-In Graph Families
+
+- `live_pipeline`
+  - source raw frame
+  - causal stage chain
+  - target is the final live-safe feature frame
+- `research_pipeline`
+  - source raw frame
+  - research stage chain
+  - target is the final research feature frame
+- `validate_range_boundaries`
+  - source raw frame
+  - context node
+  - lightweight rung debug nodes
+  - selected-rung node
+  - selected full debug node
+  - downstream analytics nodes
+  - terminal report node(s)
+- `validate_regime`
+- `validate_trend_state`
+- `validate_sr_levels`
+
+The current DAG rollout intentionally preserves indicator and validator semantics by reusing existing compute helpers as node compute functions rather than rewriting the math.

@@ -17,6 +17,13 @@ Separates:
    - dies fast on contradiction or TTL expiry
    - never gets refreshed by partial events while strict state is neutral
 
+3. live-consumption overlay
+   - ``stale_neutral_promo_side`` = +1 / -1 / 0
+   - applies only when canonical ``trend_state == 0``
+   - promotes old neutral rows using current-row live-safe commit evidence only
+   - never mutates canonical ``trend_state``
+   - ``effective_trend_state`` = canonical ``trend_state`` plus this overlay
+
 Also exposes:
 - directional structural pressure / strength
 - decomposed confidence components
@@ -29,6 +36,10 @@ Canonical doctrine:
 - ``trend_state`` is strict structure, not soft direction or inherited bias
 - ``trend_bias_state`` may disagree with ``trend_state`` during neutral or
   weakening structure, but never replaces it
+- ``effective_trend_state`` is the live overlay output for consumption layers
+- stale-neutral promotion is downstream-only and applies only when
+  ``trend_state == 0``
+- canonical ``trend_state`` itself is never mutated by the overlay
 - ``trend_strength`` measures directional evidence magnitude
 - ``trend_confidence`` measures trustworthiness / coherence of the assignment
 - neutral rows may retain meaningful confidence in neutrality; confidence is
@@ -47,13 +58,12 @@ TREND_COMMIT_ENTRY_MIN = 0.62
 TREND_COMMIT_OPPOSITE_MAX = 0.38
 TREND_COMMIT_GAP_MIN = 0.18
 TREND_DIRECTIONAL_EVIDENCE_HIGH = 0.65
-STALE_NEUTRAL_MIN_BARS = 6
-STALE_NEUTRAL_COMMIT_GAP_MIN = 0.18
-STALE_NEUTRAL_COMMIT_GAP_PERSIST_MIN = 0.12
-STALE_NEUTRAL_STRONG_ENV_ADX_MIN = 0.70
-STALE_NEUTRAL_STRONG_ENV_SLOPE_MIN = 0.70
-STALE_NEUTRAL_STRONG_ENV_CONTINUITY_MIN = 0.70
-STALE_NEUTRAL_STRONG_ENV_COMPRESSION_MAX = 0.30
+
+STALE_NEUTRAL_PROMO_MIN_AGE = 15
+STALE_NEUTRAL_PROMO_MIN_GAP = 0.10
+STALE_NEUTRAL_PROMO_MIN_EVIDENCE = 0.22
+STALE_NEUTRAL_PROMO_MAX_TOTAL_MASS = 0.40
+STALE_NEUTRAL_PROMO_MAX_CONTRADICTION = 0.50
 
 
 def _clip01(value: float) -> float:
@@ -152,7 +162,17 @@ def add_trend_state(
     emerging_strength_threshold: float = 0.12,
     structure_loss_strength_threshold: float = 0.08,
 ) -> pd.DataFrame:
-    """Build causal structural trend state from swing confirmation events."""
+    """Build causal structural trend state from swing confirmation events.
+
+    Contract:
+    - ``trend_state`` is the canonical strict structural state
+    - ``trend_bias_state`` is the inherited/decaying bias state
+    - ``stale_neutral_promo_side`` is a downstream execution overlay for old
+      neutral rows only
+    - ``effective_trend_state`` is the live-consumption output that combines
+      canonical ``trend_state`` with the stale-neutral overlay
+    - the overlay never mutates canonical ``trend_state``
+    """
     out = df.copy()
 
     require_columns(
@@ -302,8 +322,6 @@ def add_trend_state(
 
     curr_state = 0
     curr_state_age = 0
-    curr_state_run_age = 0
-
     curr_bias = 0
     curr_bias_age = 0
     curr_bias_mag = 0.0
@@ -318,39 +336,6 @@ def add_trend_state(
 
     bias_decay = 0.5 ** (1.0 / max(bias_half_life_bars, 1))
     strength_decay = 0.5 ** (1.0 / max(strength_decay_half_life_bars, 1))
-
-    adx_strength_src = (
-        out["adx_strength"].to_numpy(dtype=float)
-        if "adx_strength" in out.columns
-        else (
-            np.clip((out["adx_14"].to_numpy(dtype=float) - 20.0) / 15.0, 0.0, 1.0)
-            if "adx_14" in out.columns
-            else np.full(n, np.nan)
-        )
-    )
-    ema_slope_strength_src = (
-        out["ema_slope_strength"].to_numpy(dtype=float)
-        if "ema_slope_strength" in out.columns
-        else np.full(n, np.nan)
-    )
-    compression_score_src = (
-        out["compression_score"].to_numpy(dtype=float)
-        if "compression_score" in out.columns
-        else (
-            np.clip(
-                1.0 - out["bb_width_pct_rank_100"].to_numpy(dtype=float),
-                0.0,
-                1.0,
-            )
-            if "bb_width_pct_rank_100" in out.columns
-            else np.full(n, np.nan)
-        )
-    )
-    structure_continuity_src = (
-        out["structure_continuity"].to_numpy(dtype=float)
-        if "structure_continuity" in out.columns
-        else np.full(n, np.nan)
-    )
 
     def _cmp(new: float, old: float, tol: float) -> int:
         if not np.isfinite(new) or not np.isfinite(old):
@@ -697,40 +682,9 @@ def add_trend_state(
         gap_window = np.abs(balance_window)
         bull_dominant_2_of_3 = int(np.count_nonzero(dom_window == 1) >= 2)
         bear_dominant_2_of_3 = int(np.count_nonzero(dom_window == -1) >= 2)
-        bull_gap_persist_3 = float(np.nanmean(np.maximum(balance_window, 0.0)))
-        bear_gap_persist_3 = float(np.nanmean(np.maximum(-balance_window, 0.0)))
         commit_gap_persist_3 = float(np.nanmean(gap_window))
 
-        adx_strength_i = (
-            float(adx_strength_src[i]) if np.isfinite(adx_strength_src[i]) else 0.0
-        )
-        ema_slope_strength_i = (
-            float(ema_slope_strength_src[i])
-            if np.isfinite(ema_slope_strength_src[i])
-            else _clip01(
-                abs(0.65 * ema20_slope_atr_src[i] + 0.35 * ema50_slope_atr_src[i])
-                / 0.25
-            )
-        )
-        structure_continuity_i = (
-            float(structure_continuity_src[i])
-            if np.isfinite(structure_continuity_src[i])
-            else _clip01(max(curr_hh, curr_ll) / 3.0)
-        )
-        compression_score_i = (
-            float(compression_score_src[i])
-            if np.isfinite(compression_score_src[i])
-            else 1.0
-        )
-        strong_environment = bool(
-            adx_strength_i >= STALE_NEUTRAL_STRONG_ENV_ADX_MIN
-            and ema_slope_strength_i >= STALE_NEUTRAL_STRONG_ENV_SLOPE_MIN
-            and structure_continuity_i >= STALE_NEUTRAL_STRONG_ENV_CONTINUITY_MIN
-            and compression_score_i <= STALE_NEUTRAL_STRONG_ENV_COMPRESSION_MAX
-        )
-
         prev_state = curr_state
-        prev_state_run_age = curr_state_run_age
 
         new_state = 0
         bull_override = False
@@ -744,7 +698,6 @@ def add_trend_state(
             bear_bias_carry = curr_bias == -1 or inherited_bias_dir == -1
             fresh_bearish_contradiction = bool(event_dir == -1 or bear_recent_component)
             fresh_bullish_contradiction = bool(event_dir == 1 or bull_recent_component)
-            neutral_run_age_if_stay = prev_state_run_age + 1 if prev_state == 0 else 1
 
             if (
                 bull_commit_score >= TREND_COMMIT_ENTRY_MIN
@@ -766,36 +719,6 @@ def add_trend_state(
             ):
                 new_state = -1
                 bear_override = True
-            elif (
-                prev_state == 0
-                and curr_bias == 0
-                and neutral_run_age_if_stay >= STALE_NEUTRAL_MIN_BARS
-                and strong_environment
-                and bull_commit_score > bear_commit_score
-                and commit_dominant_side == 1
-                and bull_dominant_2_of_3 == 1
-                and commit_gap >= STALE_NEUTRAL_COMMIT_GAP_MIN
-                and bull_gap_persist_3 >= STALE_NEUTRAL_COMMIT_GAP_PERSIST_MIN
-                and event_dir == 1
-                and bull_recent_component
-                and not fresh_bearish_contradiction
-            ):
-                new_state = 1
-            elif (
-                prev_state == 0
-                and curr_bias == 0
-                and neutral_run_age_if_stay >= STALE_NEUTRAL_MIN_BARS
-                and strong_environment
-                and bear_commit_score > bull_commit_score
-                and commit_dominant_side == -1
-                and bear_dominant_2_of_3 == 1
-                and commit_gap >= STALE_NEUTRAL_COMMIT_GAP_MIN
-                and bear_gap_persist_3 >= STALE_NEUTRAL_COMMIT_GAP_PERSIST_MIN
-                and event_dir == -1
-                and bear_recent_component
-                and not fresh_bullish_contradiction
-            ):
-                new_state = -1
 
         if new_state != curr_state:
             trend_state_changed[i] = 1
@@ -803,10 +726,8 @@ def add_trend_state(
             trend_state_to[i] = new_state
             curr_state = new_state
             curr_state_age = 1 if curr_state != 0 else 0
-            curr_state_run_age = 1
         else:
             curr_state_age = curr_state_age + 1 if curr_state != 0 else 0
-            curr_state_run_age += 1
 
         prev_bias = curr_bias
 
@@ -1128,5 +1049,52 @@ def add_trend_state(
     out["trend_emerging_bear"] = trend_emerging_bear
     out["trend_regime_phase"] = trend_regime_phase
     out = _add_trend_transition_contract(out)
+    canonical_trend_state_pre_overlay = out["trend_state"].copy()
+
+    # trend_state remains the canonical structural state. stale_neutral_promo_side
+    # is an execution overlay for aged neutral rows, and effective_trend_state
+    # combines the canonical state with that overlay without mutating trend_state.
+    trend_state_live = (
+        pd.to_numeric(out["trend_state"], errors="coerce").fillna(0).astype(int)
+    )
+    bars_in_state = pd.to_numeric(out["bars_in_trend_state"], errors="coerce").fillna(0)
+    bull_commit = pd.to_numeric(out["trend_bull_commit_score"], errors="coerce").fillna(
+        0.0
+    )
+    bear_commit = pd.to_numeric(out["trend_bear_commit_score"], errors="coerce").fillna(
+        0.0
+    )
+    commit_gap_live = pd.to_numeric(out["trend_commit_gap"], errors="coerce").fillna(
+        0.0
+    )
+    directional_evidence_live = pd.to_numeric(
+        out["trend_directional_evidence_score"], errors="coerce"
+    ).fillna(0.0)
+    contradiction_penalty_live = pd.to_numeric(
+        out["trend_conf_contradiction_penalty"], errors="coerce"
+    ).fillna(0.0)
+    total_commit_mass = bull_commit + bear_commit
+
+    promo_fire = (
+        trend_state_live.eq(0)
+        & bars_in_state.ge(STALE_NEUTRAL_PROMO_MIN_AGE)
+        & commit_gap_live.ge(STALE_NEUTRAL_PROMO_MIN_GAP)
+        & directional_evidence_live.ge(STALE_NEUTRAL_PROMO_MIN_EVIDENCE)
+        & total_commit_mass.le(STALE_NEUTRAL_PROMO_MAX_TOTAL_MASS)
+        & contradiction_penalty_live.le(STALE_NEUTRAL_PROMO_MAX_CONTRADICTION)
+    )
+    stale_neutral_promo_side = pd.Series(0, index=out.index, dtype=np.int8)
+    stale_neutral_promo_side.loc[promo_fire & bull_commit.gt(bear_commit)] = 1
+    stale_neutral_promo_side.loc[promo_fire & bear_commit.gt(bull_commit)] = -1
+
+    effective_trend_state = trend_state_live.astype(np.int8)
+    neutral_mask = trend_state_live.eq(0)
+    effective_trend_state.loc[neutral_mask] = stale_neutral_promo_side.loc[neutral_mask]
+
+    out["stale_neutral_promo_side"] = stale_neutral_promo_side
+    out["effective_trend_state"] = effective_trend_state.astype(np.int8)
+    out.attrs["canonical_trend_state_unchanged"] = bool(
+        canonical_trend_state_pre_overlay.equals(out["trend_state"])
+    )
 
     return out

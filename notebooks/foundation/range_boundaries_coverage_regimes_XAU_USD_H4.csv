@@ -1,0 +1,13 @@
+rung_id,confirmed_count,active_rows,median_confirm_latency,durable_plausible_count,fragile_plausible_count,weak_false_positive_count,strong_false_positive_count,plausible_total,false_positive_total,strong_false_positive_share,durable_plausible_share,strength_alignment_status,viability_alignment_status,chart_review_status,valid_contract_rung
+step8e_a/mid_a,367,2050,2.0,34,131,144,104,165,248,0.41935483870967744,0.09264305177111716,ok,ok,too_noisy,False
+step8e_a/mid_b,340,1875,2.0,30,123,130,90,153,220,0.4090909090909091,0.08823529411764706,ok,ok,too_noisy,False
+step8e_a/mid_c,191,1182,3.0,30,61,55,41,91,96,0.4270833333333333,0.15706806282722513,ok,ok,too_sparse_or_misaligned,False
+step8e_a/mid_d,165,996,3.0,25,52,52,34,77,86,0.3953488372093023,0.15151515151515152,ok,ok,too_sparse_or_misaligned,False
+step8e_a/mid_e,202,1213,3.0,29,65,52,43,94,95,0.45263157894736844,0.14356435643564355,ok,ok,too_sparse_or_misaligned,False
+step8e_a/mid_f,191,1182,3.0,30,61,55,41,91,96,0.4270833333333333,0.15706806282722513,ok,ok,too_sparse_or_misaligned,False
+step8e_b/mid_a,350,1905,2.0,28,119,143,96,147,239,0.401673640167364,0.08,ok,ok,too_noisy,False
+step8e_b/mid_b,319,1748,2.0,24,108,128,85,132,213,0.39906103286384975,0.07523510971786834,ok,ok,too_noisy,False
+step8e_b/mid_c,181,1095,3.0,24,57,52,43,81,95,0.45263157894736844,0.13259668508287292,ok,ok,recommended_diagnostic_regime,True
+step8e_b/mid_d,148,877,3.0,18,47,47,34,65,81,0.41975308641975306,0.12162162162162163,ok,ok,recommended_diagnostic_regime,True
+step8e_b/mid_e,189,1114,3.0,23,57,54,45,80,99,0.45454545454545453,0.12169312169312169,ok,ok,recommended_diagnostic_regime,True
+step8e_b/mid_f,181,1095,3.0,24,57,52,43,81,95,0.45263157894736844,0.13259668508287292,ok,ok,recommended_diagnostic_regime,True

@@ -366,6 +366,8 @@ class TestTrend:
         assert "trend_state" in result.columns
         assert "trend_bias_state" in result.columns
         assert "trend_confidence" in result.columns
+        assert "stale_neutral_promo_side" in result.columns
+        assert "effective_trend_state" in result.columns
         assert "trend_bull_ready" in result.columns
         assert "trend_bear_ready" in result.columns
         assert "trend_bias_score_live" in result.columns
@@ -675,8 +677,25 @@ class TestTrendStateBehavior:
             "trend_pressure_bear_raw",
             "trend_strength_raw",
             "trend_strength_ema",
+            "stale_neutral_promo_side",
+            "effective_trend_state",
         }
         assert expected.issubset(df.columns)
+
+    def test_effective_trend_state_overlay_contract(self):
+        df = _run_trend_state(
+            [100, 102, 101, 104, 103, 106, 105, 103, 104, 102, 101, 99]
+        )
+
+        promo = pd.to_numeric(df["stale_neutral_promo_side"], errors="coerce").fillna(0)
+        trend = pd.to_numeric(df["trend_state"], errors="coerce").fillna(0)
+        effective = pd.to_numeric(df["effective_trend_state"], errors="coerce").fillna(
+            0
+        )
+
+        assert promo[trend != 0].eq(0).all()
+        assert effective[trend != 0].eq(trend[trend != 0]).all()
+        assert effective[trend == 0].eq(promo[trend == 0]).all()
 
     def test_bullish_strict_state_can_form(self):
         # Rising / pullback / rising sequence that should produce HH + HL
@@ -1096,6 +1115,30 @@ class TestTrendStateBehavior:
         assert "neutral_confidence_audit" in summary
         assert "neutral_in_trend_audit" in summary
         assert "directional_in_range_audit" in summary
+        assert "old_neutral_strong_env_audit" in summary
+        assert "stale_neutral_neutral_env_split" in summary
+        assert "stale_neutral_candidate_forward_audit" in summary
+        assert "stale_neutral_gap_age_grid" in summary
+        assert "candidate_vs_range_decay_comparison" in summary
+        assert "stale_neutral_commit_structure_audit" in summary
+        assert "stale_neutral_commit_component_audit" in summary
+        assert "stale_neutral_commit_mass_vs_resolution_audit" in summary
+        assert "stale_neutral_weak_side_survival_audit" in summary
+        assert "stale_neutral_strength_vs_resolution_audit" in summary
+        assert "stale_neutral_conflict_signature_audit" in summary
+        assert "clean_asymmetry_candidate_audit" in summary
+        assert "clean_asymmetry_age_audit" in summary
+        assert "clean_asymmetry_env_audit" in summary
+        assert "clean_asymmetry_transition_risk_proxy" in summary
+        assert "clean_asymmetry_vs_bias_rows_audit" in summary
+        assert "promotion_input_live_safety_audit" in summary
+        assert "confirmed_input_promotion_prototype_sweep" in summary
+        assert "stale_neutral_event_recency_audit" in summary
+        assert "stale_neutral_contradiction_audit" in summary
+        assert "stale_neutral_dual_commit_grid" in summary
+        assert "strict_neutral_anomaly_bucket" in summary
+        assert "stale_neutral_promotion_candidate_audit" in summary
+        assert "mature_directional_in_range_decay_audit" in summary
         assert "neutral_with_directional_bias_audit" in summary
         assert "commit_gap_audit" in summary
         assert "neutral_age_audit" in summary

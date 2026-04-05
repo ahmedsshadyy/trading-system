@@ -41,6 +41,10 @@ from src.indicators.foundation.volume import (
 )
 from src.indicators.foundation.session import add_session_features, add_time_features
 from src.indicators.foundation.regime import add_regime
+from src.indicators.foundation.range_boundaries import (
+    add_range_boundaries,
+    collect_range_boundary_debug_tables,
+)
 from src.indicators.foundation.value import (
     compute_anchored_vwap,
     add_anchored_vwap,
@@ -113,6 +117,8 @@ __all__ = [
     "add_session_features",
     "add_time_features",
     "add_regime",
+    "add_range_boundaries",
+    "collect_range_boundary_debug_tables",
     "compute_anchored_vwap",
     "add_anchored_vwap",
     "add_avwap_from_last_swing",

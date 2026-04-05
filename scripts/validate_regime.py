@@ -10,6 +10,8 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 import numpy as np
 
+from src.dag_runtime import GraphRunContext, execute_graph
+from src.dag_runtime.builtin_graphs import get_builtin_graph
 from src.indicators.foundation.adx import add_adx
 from src.indicators.foundation.ema import add_emas
 from src.indicators.foundation.regime import add_regime
@@ -17,9 +19,18 @@ from src.indicators.foundation.session import add_session_features
 from src.indicators.foundation.volatility import add_atr, add_bb_width
 from src.indicators.structure.swings import add_swings
 from src.indicators.structure.trend_state import add_trend_state
-from src.validation.indicators.regime import validate_regime
+from src.pipeline_runtime import (
+    dataframe_fingerprint,
+    load_partitioned_dataset,
+)
+from src.validation.common import (
+    cleanup_validation_artifacts,
+)
 
 OUT_DIR = Path("notebooks/foundation")
+CACHE_ROOT = Path("data/validation_cache")
+FEATURES_ROOT = Path("data/features")
+VALIDATOR_NAME = "validate_regime"
 PLOT_ROWS = 300
 RUNS = (
     ("XAU_USD", "H1"),
@@ -164,6 +175,36 @@ def _build_context(df: pd.DataFrame, *, include_research_only: bool) -> pd.DataF
     return out
 
 
+def _load_canonical_context(
+    raw: pd.DataFrame,
+    *,
+    instrument: str,
+    timeframe: str,
+    dataset: str,
+) -> pd.DataFrame | None:
+    canonical = load_partitioned_dataset(
+        FEATURES_ROOT,
+        dataset=dataset,
+        symbol=instrument,
+        timeframe=timeframe,
+    )
+    if canonical.empty:
+        return None
+    raw_view = raw.loc[:, ["timestamp", "open", "high", "low", "close"]].reset_index(
+        drop=True
+    )
+    canonical_view = canonical.loc[
+        :, ["timestamp", "open", "high", "low", "close"]
+    ].reset_index(drop=True)
+    if len(raw_view) != len(canonical_view):
+        return None
+    if dataframe_fingerprint(raw_view, strategy="content") != dataframe_fingerprint(
+        canonical_view, strategy="content"
+    ):
+        return None
+    return canonical.reset_index(drop=True)
+
+
 def _print_validation_sections(summary: dict[str, object]) -> None:
     ordered_keys = [
         "current_regime_snapshot",
@@ -201,31 +242,69 @@ def _print_validation_sections(summary: dict[str, object]) -> None:
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--html", action="store_true")
+    parser.add_argument("--tail-rows", type=int, default=PLOT_ROWS)
+    parser.add_argument("--full", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--invalidate-cache", action="store_true")
+    parser.add_argument("--cleanup-stale", action="store_true")
+    parser.add_argument("--max-artifact-age-days", type=int, default=30)
+    args = parser.parse_args()
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    if args.cleanup_stale:
+        removed = cleanup_validation_artifacts(
+            cache_root=CACHE_ROOT,
+            max_age_days=args.max_artifact_age_days,
+            report_roots=[OUT_DIR],
+        )
+        print(f"cleanup_removed: {len(removed)}")
     synthetic_summary = _synthetic_fixture_summary()
 
     for instrument, timeframe in RUNS:
         data_file = Path(f"data/raw/{instrument}_{timeframe}.parquet")
         raw = pd.read_parquet(data_file)
-
-        live_df = _build_context(raw, include_research_only=False)
-        research_df = _build_context(raw, include_research_only=True)
-        plot_df = research_df.tail(PLOT_ROWS).copy()
-
-        html_path = OUT_DIR / f"regime_validation_{instrument}_{timeframe}.html"
-        result = validate_regime(
-            plot_df,
-            summary_df=research_df,
-            live_df=live_df,
-            research_df=research_df,
-            outpath=html_path,
-            title=f"Regime Validation — {instrument} {timeframe}",
-            synthetic_summary=synthetic_summary,
+        graph = get_builtin_graph(
+            "validate_regime",
+            instrument=instrument,
+            timeframe=timeframe,
         )
+        context = GraphRunContext(
+            graph_name=graph.graph_name,
+            symbol=instrument,
+            timeframe=timeframe,
+            inputs={"raw_input": raw},
+            config={
+                "plot_rows": args.tail_rows,
+                "full": args.full,
+                "html": args.html,
+                "out_dir": str(OUT_DIR),
+                "synthetic_summary": synthetic_summary,
+            },
+            cache_root=CACHE_ROOT,
+            features_root=FEATURES_ROOT,
+            force=args.force,
+            invalidate_cache=args.invalidate_cache,
+        )
+        graph_result = execute_graph(
+            graph, context=context, target="regime_validation_bundle"
+        )
+        result = graph_result.output().payload
 
         print(f"\n=== REGIME SUMMARY: {instrument} {timeframe} ===")
         _print_validation_sections(result["summary"])
-        print(f"Wrote chart to: {result['html_path']}")
+        if args.html and result["html_path"] is not None:
+            print(f"Wrote chart to: {result['html_path']}")
+        else:
+            print("HTML output skipped. Pass --html to generate charts.")
+        profile_path = (
+            CACHE_ROOT / VALIDATOR_NAME / instrument / timeframe / "run-summary.json"
+        )
+        graph_result.profiler.write_json(profile_path)
+        print(f"Profiler summary: {profile_path}")
 
 
 if __name__ == "__main__":
