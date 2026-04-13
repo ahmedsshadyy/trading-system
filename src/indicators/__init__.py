@@ -88,9 +88,7 @@ from src.indicators.pipelines.build_live import (
     materialize_live_features,
     run_live_pipeline,
 )
-
-# SMT deferred
-# from src.indicators.smt import add_smt_divergence
+from src.indicators.smt import add_smt_divergence
 
 __all__ = [
     # Foundation
@@ -156,4 +154,5 @@ __all__ = [
     "materialize_research_features",
     "run_live_pipeline",
     "run_research_pipeline",
+    "add_smt_divergence",
 ]

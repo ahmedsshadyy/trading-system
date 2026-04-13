@@ -1,88 +1,129 @@
+from __future__ import annotations
+
+import argparse
 import os
 import sys
 from pathlib import Path
+
 import pyarrow.parquet as pq
-from sqlalchemy import create_engine
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-load_dotenv(Path(__file__).parent.parent / ".env")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+load_dotenv(ROOT / ".env")
 
 from src.indicators._helpers.schema import normalize_candle_schema
 
-engine = create_engine(os.getenv("DATABASE_URL"))
+DATA_DIR = ROOT / "data" / "raw"
+TIMEFRAME_MAP = {"D": "D", "H4": "H4", "H1": "H1", "M15": "M15"}
 
-DATA_DIR = Path(__file__).parent.parent / "data" / "raw"
 
-# Map filename prefix to instrument name
-INSTRUMENT_MAP = {
-    "XAU_USD": "XAU_USD",
-    "USOIL": "USOIL",
-    "EUR_USD": "EUR_USD",
-    "USD_JPY": "USD_JPY",
-}
+def parse_parquet_identity(path: Path) -> tuple[str, str]:
+    stem = path.stem
+    instrument, separator, tf_key = stem.rpartition("_")
+    if not separator or not instrument:
+        raise ValueError(f"Could not parse instrument/timeframe from {path.name}")
 
-TIMEFRAME_MAP = {
-    "D": "D",
-    "H4": "H4",
-    "H1": "H1",
-    "M15": "M15",
-}
+    timeframe = TIMEFRAME_MAP.get(tf_key)
+    if timeframe is None:
+        raise ValueError(f"Unsupported timeframe suffix in {path.name}")
 
-parquet_files = sorted(DATA_DIR.glob("*.parquet"))
+    return instrument, timeframe
 
-with tqdm(total=len(parquet_files), desc="Loading candles", unit="file") as bar:
-    for f in parquet_files:
-        # Parse instrument and timeframe from filename e.g. XAU_USD_H4.parquet
-        stem = f.stem  # e.g. XAU_USD_H4
 
-        # Find matching instrument
-        instrument = None
-        timeframe = None
-        for inst_key in INSTRUMENT_MAP:
-            if stem.startswith(inst_key):
-                instrument = INSTRUMENT_MAP[inst_key]
-                tf_key = stem[len(inst_key) + 1 :]  # everything after instrument_
-                timeframe = TIMEFRAME_MAP.get(tf_key)
-                break
+def prepare_candle_frame(raw_path: Path, *, instrument: str, timeframe: str):
+    df = pq.read_table(raw_path).to_pandas()
+    df = normalize_candle_schema(df, require_volume=True)
+    out = df[["timestamp", "open", "high", "low", "close", "volume", "spread"]].copy()
+    out["instrument"] = instrument
+    out["timeframe"] = timeframe
+    out = out.dropna(subset=["volume"])
+    out["volume"] = out["volume"].astype(int)
+    return out
 
-        if not instrument or not timeframe:
-            tqdm.write(f"Skipping {f.name} — could not parse instrument/timeframe")
-            bar.update(1)
+
+def select_parquet_files(
+    *,
+    data_dir: Path = DATA_DIR,
+    instruments: set[str] | None = None,
+) -> list[Path]:
+    parquet_files: list[Path] = []
+    for path in sorted(
+        path
+        for path in data_dir.glob("*.parquet")
+        if path.is_file() and "_fetch_audit" not in path.parts
+    ):
+        instrument, _ = parse_parquet_identity(path)
+        if instruments is not None and instrument not in instruments:
             continue
+        parquet_files.append(path)
+    return parquet_files
 
-        df = pq.read_table(f).to_pandas()
 
-        df = normalize_candle_schema(df, require_volume=True)
+def load_all_candles(
+    *, data_dir: Path = DATA_DIR, instruments: set[str] | None = None
+) -> None:
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL must be set in .env")
 
-        # Keep only schema columns
-        df = df[
-            ["timestamp", "open", "high", "low", "close", "volume", "spread"]
-        ].copy()
+    engine = create_engine(database_url)
+    parquet_files = select_parquet_files(data_dir=data_dir, instruments=instruments)
 
-        # Add instrument and timeframe columns
-        df["instrument"] = instrument
-        df["timeframe"] = timeframe
+    with tqdm(total=len(parquet_files), desc="Loading candles", unit="file") as bar:
+        for path in parquet_files:
+            try:
+                instrument, timeframe = parse_parquet_identity(path)
+                frame = prepare_candle_frame(
+                    path, instrument=instrument, timeframe=timeframe
+                )
 
-        # Drop rows with null volume
-        df = df.dropna(subset=["volume"])
-        df["volume"] = df["volume"].astype(int)
+                with engine.begin() as connection:
+                    connection.execute(
+                        text("""
+                            DELETE FROM candles
+                            WHERE instrument = :instrument AND timeframe = :timeframe
+                            """),
+                        {"instrument": instrument, "timeframe": timeframe},
+                    )
+                    frame.to_sql(
+                        "candles",
+                        connection,
+                        if_exists="append",
+                        index=False,
+                        method="multi",
+                        chunksize=1000,
+                    )
+                tqdm.write(f"✓ {path.name}: {len(frame):,} rows loaded")
+            except Exception as exc:
+                tqdm.write(f"✗ {path.name}: {exc}")
+            bar.update(1)
 
-        # Load to PostgreSQL — skip duplicates via on_conflict
-        try:
-            df.to_sql(
-                "candles",
-                engine,
-                if_exists="append",
-                index=False,
-                method="multi",
-                chunksize=1000,
-            )
-            tqdm.write(f"✓ {f.name}: {len(df):,} rows loaded")
-        except Exception as e:
-            tqdm.write(f"✗ {f.name}: {e}")
+    print("\nDone.")
 
-        bar.update(1)
 
-print("\nDone.")
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Load parquet candle files into the candles table."
+    )
+    parser.add_argument(
+        "--instrument",
+        action="append",
+        dest="instruments",
+        help="Canonical instrument name to load. Repeat for multiple instruments.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    instruments = set(args.instruments) if args.instruments else None
+    load_all_candles(instruments=instruments)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
