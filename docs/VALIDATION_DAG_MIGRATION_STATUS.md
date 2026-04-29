@@ -12,6 +12,8 @@ These scripts now act as CLI compatibility wrappers over built-in DAG targets. T
 | `scripts/validate_regime.py` | `validate_regime` | `regime_validation_bundle` | Live/research context reuse preserved. HTML remains terminal-only. |
 | `scripts/validate_trend_state.py` | `validate_trend_state` | `trend_state_validation_bundle` and `trend_state_minimal_overlay_context` | `--minimal` now targets the dedicated minimal-overlay node. |
 | `scripts/validate_sr_levels.py` | `validate_sr_levels` | `sr_validation_bundle` | Summary-first default preserved. HTML remains terminal-only. |
+| `scripts/validate_structure_context.py` | `validate_structure_context` | `structure_context_validation_bundle` | Default behavior preserved; plot-start trimming and HTML generation are now report-scoped. |
+| `scripts/validate_swings.py` | `validate_swings` | `swings_validation_bundle` | Summary, sampled event windows, and HTML report now route through DAG nodes. |
 
 ### Legacy procedural validators still pending DAG migration
 
@@ -19,8 +21,6 @@ These scripts still own their orchestration path and remain the next migration s
 
 | Script | Planned Graph Family | Priority |
 | --- | --- | --- |
-| `scripts/validate_structure_context.py` | `validate_structure_context` | High |
-| `scripts/validate_swings.py` | `validate_swings` | High |
 | `scripts/validate_bos.py` | `validate_bos` | High |
 | `scripts/validate_bos_context.py` | `validate_bos_context` | High |
 | `scripts/validate_choch.py` | `validate_choch` | High |
@@ -90,12 +90,10 @@ Freeze evidence now in place:
 
 ## Next Recommended Order
 
-1. `validate_structure_context.py`
-2. `validate_swings.py`
-3. `validate_bos.py`
-4. `validate_bos_context.py`
-5. `validate_choch.py`
-6. `validate_choch_context.py`
-7. `validate_volatility.py`
-8. `validate_volume_profile.py`
-9. Remaining medium-priority validators
+1. `validate_bos.py`
+2. `validate_bos_context.py`
+3. `validate_choch.py`
+4. `validate_choch_context.py`
+5. `validate_volatility.py`
+6. `validate_volume_profile.py`
+7. Remaining medium-priority validators

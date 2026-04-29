@@ -1,6 +1,34 @@
 """
 Canonical causal range boundary detector.
 
+.. deprecated::
+    **Range boundaries are excluded from production sweep source families
+    in v1.** The unified liquidity source framework
+    (:mod:`src.indicators.sweeps_v2.unified_sources`) and the final sweeps
+    detector (:mod:`src.indicators.sweeps_v2.final_sweeps`) do **not**
+    consume any column produced by this module. The code is preserved for
+    research backtests and chart audits only.
+
+    Production sweep source families (frozen for v1):
+
+    1. confirmed swings, 2. equal highs/lows, 3. support/resistance,
+    4. session highs/lows, 5. previous day high/low,
+    6. previous week high/low.
+
+    Re-introducing range_boundary as a sweep source requires:
+
+    * promoting the family in
+      :data:`src.indicators.sweeps_v2.unified_sources.LIQ_SOURCE_FAMILIES`,
+    * removing it from
+      :data:`src.indicators.sweeps_v2.unified_sources.LIQ_DEPRECATED_FAMILIES`,
+    * adding an explicit precedence rank, and
+    * updating the SweepsPlan doctrine.
+
+    Until then, the framework will hard-fail if a row tagged with the
+    family ``range_boundary_high``/``range_boundary_low`` reaches it — see
+    :func:`src.indicators.sweeps_v2.unified_sources._cluster_sources` for
+    the runtime guard.
+
 Doctrine
 --------
 - Purpose: detect bounded consolidation envelopes and expose their upper/lower
@@ -71,6 +99,19 @@ from src.indicators._helpers.arrays import get_atr_array
 from src.indicators._helpers.validators import require_columns
 
 EPS = 1e-12
+
+#: Module-level deprecation flag. Read by the sweeps v1 framework to confirm
+#: the family is *not* a production sweep source. Do not flip without first
+#: updating ``src/indicators/sweeps_v2/unified_sources.py`` and the SweepsPlan.
+RANGE_BOUNDARY_DEPRECATED_FOR_SWEEPS: bool = True
+
+#: Reason string returned by introspection helpers.
+RANGE_BOUNDARY_DEPRECATION_REASON: str = "range_boundary_obsolete_for_v1_sweeps"
+
+#: Convenience flag mirrored on every emitted row by :func:`add_range_boundaries`
+#: for downstream filtering. Set as a column in :func:`add_range_boundaries` so
+#: any consumer can trivially exclude range_boundary rows.
+RANGE_BOUNDARY_SOURCE_ENABLED_FOR_SWEEPS: bool = False
 
 RANGE_STATE_NONE = 0
 RANGE_STATE_ACTIVE_INTACT = 1

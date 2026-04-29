@@ -87,16 +87,26 @@ def load_cached_node(
         return None
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     frame_paths = payload.get("__frame_paths__", {})
+    frame_dtypes = payload.get("__frame_dtypes__", {})
     artifact_paths = {
         name: Path(path) for name, path in payload.get("__artifact_paths__", {}).items()
     }
     for rel_path in frame_paths.values():
         if not (payload_path.parent / rel_path).exists():
             return None
-    frames = {
-        name: pd.read_parquet(payload_path.parent / rel_path).reset_index(drop=True)
-        for name, rel_path in frame_paths.items()
-    }
+    frames: dict[str, pd.DataFrame] = {}
+    for name, rel_path in frame_paths.items():
+        frame = pd.read_parquet(payload_path.parent / rel_path).reset_index(drop=True)
+        dtype_map = frame_dtypes.get(name, {})
+        for column, dtype_name in dtype_map.items():
+            if column not in frame.columns:
+                continue
+            if dtype_name == "object":
+                restored = frame[column].astype(object)
+                frame[column] = restored.where(pd.notna(restored), None)
+            elif dtype_name.startswith("string"):
+                frame[column] = frame[column].astype("string")
+        frames[name] = frame
     return NodeExecutionResult(
         manifest=manifest,
         output=NodeOutput(
@@ -133,13 +143,26 @@ def save_cached_node(
     )
     payload_path.parent.mkdir(parents=True, exist_ok=True)
     frame_paths: dict[str, str] = {}
+    frame_dtypes: dict[str, dict[str, str]] = {}
     for name, frame in output.frames.items():
+        normalized = frame.reset_index(drop=True).copy()
+        for column in normalized.columns:
+            if str(normalized[column].dtype) != "object":
+                continue
+            normalized[column] = normalized[column].where(
+                pd.notna(normalized[column]), None
+            )
+        output.frames[name] = normalized
         frame_path = payload_path.parent / f"{fingerprint}.{name}.parquet"
-        write_parquet_atomic(frame.reset_index(drop=True), frame_path)
+        write_parquet_atomic(normalized, frame_path)
         frame_paths[name] = frame_path.name
+        frame_dtypes[name] = {
+            column: str(dtype) for column, dtype in normalized.dtypes.items()
+        }
     serializable = {
         **_jsonify(output.payload),
         "__frame_paths__": frame_paths,
+        "__frame_dtypes__": frame_dtypes,
         "__artifact_paths__": {
             name: str(path) for name, path in output.artifacts.items()
         },

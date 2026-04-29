@@ -69,6 +69,27 @@ def test_write_parquet_atomic(tmp_path):
     assert result.bytes_written > 0
 
 
+def test_write_parquet_atomic_drops_unsupported_attrs(tmp_path):
+    frame = _sample_frame()
+    frame.attrs["nested_frame"] = pd.DataFrame({"x": [1, 2, 3]})
+    frame.attrs["safe_flag"] = True
+    path = partitioned_parquet_path(
+        tmp_path,
+        dataset="live",
+        symbol="XAU_USD",
+        timeframe="H4",
+        partition=monthly_partition_label(frame["timestamp"].iloc[-1]),
+    )
+
+    result = write_parquet_atomic(frame, path)
+    reloaded = pd.read_parquet(result.path)
+
+    pd.testing.assert_frame_equal(reloaded, frame)
+    assert "nested_frame" in frame.attrs
+    assert reloaded.attrs.get("safe_flag") is True
+    assert "nested_frame" not in reloaded.attrs
+
+
 def test_resolve_incremental_plan_detects_noop():
     frame = _sample_frame()
     input_fingerprint = dataframe_fingerprint(frame)
@@ -128,8 +149,20 @@ def test_profiler_summary_contains_stages_and_artifacts(tmp_path):
     profiler.record_artifact(
         path=tmp_path / "artifact.parquet", rows=len(frame), bytes_written=123
     )
+    profiler.record_read(
+        path=tmp_path / "input.parquet",
+        rows=len(frame),
+        bytes_read=456,
+        kind="load-existing-live-history",
+    )
+    profiler.set_metric("workload_class", "warm_rerun")
     summary_path = profiler.write_json(tmp_path / "summary.json")
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     assert payload["pipeline"] == "build_live"
     assert payload["stages"][0]["name"] == "load_raw"
+    assert payload["bytes_read"] == 456
+    assert payload["parquet_reads"] == 1
+    assert payload["artifacts_read"][0]["kind"] == "load-existing-live-history"
     assert payload["artifacts_written"][0]["bytes_written"] == 123
+    assert payload["counters"]["workload_class"] == "warm_rerun"
+    assert payload["avg_cpu_utilization_pct"] is not None

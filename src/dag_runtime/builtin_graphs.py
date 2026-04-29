@@ -13,7 +13,10 @@ from src.dag_runtime.contracts import (
     ValidationPolicy,
     WindowPolicy,
 )
-from src.dag_runtime.fingerprints import default_node_fingerprint_payload
+from src.dag_runtime.fingerprints import (
+    compute_multi_source_hash,
+    default_node_fingerprint_payload,
+)
 from src.dag_runtime.graph import GraphManifest
 from src.dag_runtime.node import (
     GraphRunContext,
@@ -26,6 +29,35 @@ from src.validation.indicators.range_boundaries import validate_range_boundaries
 from src.validation.indicators.regime import validate_regime
 from src.validation.indicators.trend_state import validate_trend_state
 from src.validation.indicators.sr_levels import summarize_sr_levels
+
+
+def _runtime_config_fingerprint(*keys: str):
+    def _fingerprint(
+        manifest: NodeManifest,
+        context: GraphRunContext,
+        dependency_results: dict[str, NodeExecutionResult],
+    ) -> dict[str, Any]:
+        payload = default_node_fingerprint_payload(
+            manifest, context, dependency_results
+        )
+        payload["runtime_config"] = {
+            key: payload["runtime_config"][key]
+            for key in keys
+            if key in payload["runtime_config"]
+        }
+        return payload
+
+    return _fingerprint
+
+
+def _node_cache_policy(*, materialize: bool, artifact_kind: str) -> CachePolicy:
+    return CachePolicy(materialize=materialize, artifact_kind=artifact_kind)
+
+
+def _source_hash_config(*source_funcs: Any, materialize: bool = True) -> dict[str, Any]:
+    if not materialize or not source_funcs:
+        return {}
+    return {"source_hash": compute_multi_source_hash(*source_funcs)}
 
 
 def _source_node(graph_name: str, name: str, input_key: str) -> NodeManifest:
@@ -58,16 +90,654 @@ def _source_node(graph_name: str, name: str, input_key: str) -> NodeManifest:
     )
 
 
+# --- Pipeline stage caching configuration ---
+#
+# Stages whose output is cached at the DAG node level.
+#
+# Carried-state Class B nodes are intentionally excluded until replay-context
+# parity is proven for persistent node-cache reuse. The current safe promoted
+# set is Class A nodes, `swings`, and non-carried `rsi_divergence`.
+_PIPELINE_MATERIALIZE_NODES: frozenset[str] = frozenset(
+    {
+        "normalize_candles",
+        "atr",
+        "ema",
+        "adx",
+        "rsi",
+        "macd",
+        "bb_width",
+        "body_ratio",
+        "swings",
+        "rsi_divergence",
+        "rolling_atr_ratio",
+        "volume_features",
+        "prev_day_hl",
+        "prev_week_hl",
+        "round_number_flag",
+        "intraday_context",
+        # Sweeps v2 (Steps 9-11). All three are promoted because they
+        # dominate cold-run time (per-bar Python loops). The research
+        # pipeline always processes full frames, so the fingerprint-based
+        # cache lookup is sound; the live pipeline is intentionally not
+        # wired to these stages, so partial-replay parity for the
+        # carried-state ones is not exercised here.
+        "sr_levels",
+        "unified_liquidity_sources",
+        "final_sweeps",
+    }
+)
+
+
+def _pipeline_stage_source_funcs(stage_name: str) -> tuple[Any, ...]:
+    """Return the underlying functions whose source determines a stage's output.
+
+    The DAG node's compute_fn is a small lambda wrapper. Hashing only the
+    wrapper would miss logic changes inside the wrapped indicator function
+    (e.g. editing ``add_atr``'s body wouldn't change the lambda's source).
+    This map names the actual functions the wrapper delegates to so we hash
+    them all and embed the result in the node fingerprint.
+    """
+    # Import lazily to avoid pulling indicator modules at import time
+    # (build_live / build_research already import them for stage construction).
+    from src.indicators._helpers.schema import normalize_candle_schema
+    from src.indicators.foundation.adx import add_adx
+    from src.indicators.foundation.ema import add_emas
+    from src.indicators.foundation.momentum import (
+        add_macd,
+        add_rsi,
+        add_rsi_divergence,
+    )
+    from src.indicators.foundation.regime import add_regime
+    from src.indicators.foundation.session import add_session_features
+    from src.indicators.foundation.value import (
+        add_anchored_vwap,
+        add_asian_session_hl,
+        add_prev_day_hl,
+        add_prev_week_hl,
+        add_round_number_flag,
+    )
+    from src.indicators.foundation.volatility import (
+        add_atr,
+        add_bb_width,
+        add_body_ratio,
+        add_rolling_atr_ratio,
+    )
+    from src.indicators.foundation.volume import add_volume_features
+    from src.indicators.smc.amd import add_amd_engine
+    from src.indicators.smc.displacement import add_displacement_candle
+    from src.indicators.smc.equal_hl import add_equal_hl
+    from src.indicators.smc.fvg import collect_fvg_debug_tables
+    from src.indicators.smc.fvg_fill import add_fvg_fill
+    from src.indicators.smc.ifvg import add_ifvg
+    from src.indicators.smc.ob import add_ob
+    from src.indicators.smc.ob_mitigation import add_ob_mitigation
+    from src.indicators.smc.sweeps import add_liquidity_sweep
+    from src.indicators.structure.bos import add_bos
+    from src.indicators.structure.choch import add_choch
+    from src.indicators.structure.trend_state import add_trend_state
+    from src.indicators.structure.swings import add_swings
+
+    # Sweeps v2 (Steps 9-11)
+    from src.indicators.foundation.sr_levels import (
+        add_sr_levels,
+        build_sr_level_registry,
+        project_sr_context,
+        update_sr_lifecycle,
+    )
+    from src.indicators.sweeps_v2.unified_sources import (
+        add_unified_liquidity_sources,
+    )
+    from src.indicators.sweeps_v2.final_sweeps import add_final_sweeps
+
+    table: dict[str, tuple[Any, ...]] = {
+        "normalize_candles": (normalize_candle_schema,),
+        "atr": (add_atr,),
+        "ema": (add_emas,),
+        "adx": (add_adx,),
+        "rsi": (add_rsi,),
+        "macd": (add_macd,),
+        "bb_width": (add_bb_width,),
+        "body_ratio": (add_body_ratio,),
+        "swings": (add_swings,),
+        "trend_state": (add_trend_state,),
+        "bos": (add_bos,),
+        "choch": (add_choch,),
+        "rsi_divergence": (add_rsi_divergence,),
+        "rolling_atr_ratio": (add_rolling_atr_ratio,),
+        "volume_features": (add_volume_features,),
+        "fvg_stack": (collect_fvg_debug_tables, add_fvg_fill, add_ifvg),
+        "displacement": (add_displacement_candle,),
+        "order_blocks": (add_ob,),
+        "ob_mitigation": (add_ob_mitigation,),
+        "liquidity_sweeps": (add_liquidity_sweep,),
+        "equal_hl": (add_equal_hl,),
+        "amd_engine": (add_amd_engine,),
+        "prev_day_hl": (add_prev_day_hl,),
+        "prev_week_hl": (add_prev_week_hl,),
+        "round_number_flag": (add_round_number_flag,),
+        "anchored_vwap": (add_anchored_vwap,),
+        "regime": (add_regime,),
+        # intraday_context conditionally calls both — hash both so either's
+        # source change invalidates.
+        "intraday_context": (add_session_features, add_asian_session_hl),
+        # Sweeps v2 (Steps 9-11). Hash all underlying functions so a logic
+        # change in any of them invalidates the node + downstream cache.
+        "sr_levels": (
+            add_sr_levels,
+            build_sr_level_registry,
+            project_sr_context,
+            update_sr_lifecycle,
+        ),
+        "unified_liquidity_sources": (add_unified_liquidity_sources,),
+        "final_sweeps": (add_final_sweeps,),
+    }
+    return table.get(stage_name, ())
+
+
+def _pipeline_stage_config(stage: Any) -> dict[str, Any]:
+    """Build the per-node ``config`` used in the fingerprint.
+
+    For materialized stages we embed a hash of the underlying indicator
+    function's source so any logic change invalidates the cache. For
+    non-materialized stages we return an empty config (fingerprint
+    unaffected — saves a bit of hashing work).
+    """
+    if stage.name not in _PIPELINE_MATERIALIZE_NODES:
+        return {}
+    source_funcs = _pipeline_stage_source_funcs(stage.name)
+    return _source_hash_config(*source_funcs)
+
+
+def _pipeline_cache_policy(stage: Any) -> CachePolicy:
+    """CachePolicy for a pipeline stage based on the materialize whitelist."""
+    if stage.name in _PIPELINE_MATERIALIZE_NODES:
+        return _node_cache_policy(materialize=True, artifact_kind="frame")
+    return _node_cache_policy(materialize=False, artifact_kind="ephemeral")
+
+
+def _live_peer_symbols(instrument: str) -> tuple[str, ...]:
+    from src.indicators.features.cross_asset import CONTEXT_SYMBOLS
+
+    return tuple(symbol for symbol in CONTEXT_SYMBOLS if symbol != instrument)
+
+
+def _live_partner_node_name(symbol: str) -> str:
+    return f"live_partner_{symbol}"
+
+
+def _live_market_context_symbols(instrument: str) -> tuple[str, ...]:
+    from src.indicators.features.cross_asset import relevant_correlation_pairs
+
+    relevant_pairs = relevant_correlation_pairs(instrument)
+    return tuple(
+        sorted(
+            {value for pair in relevant_pairs for value in pair if value != instrument}
+        )
+    )
+
+
+def _live_peer_context_source_hash() -> str:
+    from src.indicators._helpers.schema import normalize_candle_schema
+    from src.indicators.features.cross_asset import load_raw_context_frames
+
+    return compute_multi_source_hash(normalize_candle_schema, load_raw_context_frames)
+
+
+def _live_market_context_source_hash() -> str:
+    from src.indicators.features.cross_asset import (
+        build_global_market_context,
+        build_global_market_context_incremental,
+        market_context_cache_is_current,
+        relevant_correlation_pairs,
+    )
+
+    return compute_multi_source_hash(
+        build_global_market_context,
+        build_global_market_context_incremental,
+        market_context_cache_is_current,
+        relevant_correlation_pairs,
+    )
+
+
+def _live_partner_source_hash(symbol: str) -> str:
+    from src.indicators._helpers.schema import normalize_candle_schema
+    from src.indicators.foundation.adx import add_adx
+    from src.indicators.foundation.ema import add_emas
+    from src.indicators.foundation.momentum import add_macd, add_rsi
+    from src.indicators.foundation.volatility import (
+        add_atr,
+        add_bb_width,
+        add_body_ratio,
+    )
+    from src.indicators.pipelines.build_research import build_smt_partner_indicators
+    from src.indicators.structure.swings import add_swings
+
+    return compute_multi_source_hash(
+        build_smt_partner_indicators,
+        normalize_candle_schema,
+        add_atr,
+        add_emas,
+        add_adx,
+        add_rsi,
+        add_macd,
+        add_bb_width,
+        add_body_ratio,
+        add_swings,
+        lambda value=symbol: value,
+    )
+
+
+def _live_cross_asset_attach_hash() -> str:
+    from src.indicators.features.cross_asset import attach_cross_asset_context
+
+    return compute_multi_source_hash(attach_cross_asset_context)
+
+
+def _live_peer_context_fingerprint(
+    manifest: NodeManifest,
+    context: GraphRunContext,
+    dependency_results: dict[str, NodeExecutionResult],
+) -> dict[str, Any]:
+    from src.pipeline_runtime import dataframe_fingerprint
+
+    payload = default_node_fingerprint_payload(manifest, context, dependency_results)
+    instrument = str(context.config.get("instrument", context.symbol))
+    timeframe = str(context.config.get("timeframe", context.timeframe))
+    raw_data_root = context.config.get("raw_data_root")
+    provided = context.inputs.get("peer_raw_frames") or {}
+    peer_inputs: dict[str, Any] = {}
+    for symbol in _live_peer_symbols(instrument):
+        frame = provided.get(symbol) if isinstance(provided, dict) else None
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            peer_inputs[symbol] = {
+                "source": "input",
+                "fingerprint": dataframe_fingerprint(frame, strategy="content"),
+            }
+            continue
+        if raw_data_root is None:
+            peer_inputs[symbol] = {"source": "missing"}
+            continue
+        path = Path(raw_data_root) / f"{symbol}_{timeframe}.parquet"
+        if not path.exists():
+            peer_inputs[symbol] = {"source": "missing"}
+            continue
+        stat = path.stat()
+        peer_inputs[symbol] = {
+            "source": "file",
+            "path": str(path.resolve()),
+            "bytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    payload["runtime_config"] = {
+        key: payload["runtime_config"][key]
+        for key in ("timeframe", "raw_data_root")
+        if key in payload["runtime_config"]
+    }
+    payload["peer_inputs"] = peer_inputs
+    payload["input_fingerprints"] = {}
+    return payload
+
+
+def _live_market_context_fingerprint(
+    manifest: NodeManifest,
+    context: GraphRunContext,
+    dependency_results: dict[str, NodeExecutionResult],
+) -> dict[str, Any]:
+    from src.indicators.features.cross_asset import (
+        cross_asset_runtime_config_hash,
+        relevant_correlation_pairs,
+    )
+    from src.pipeline_runtime import dataframe_fingerprint
+
+    instrument = str(context.config.get("instrument", context.symbol))
+    timeframe = str(context.config.get("timeframe", context.timeframe))
+    relevant_pairs = relevant_correlation_pairs(instrument)
+    peer_frames = dependency_results["live_peer_context_source"].output.frames
+    relevant_symbols = _live_market_context_symbols(instrument)
+    return {
+        "graph_name": manifest.graph_name,
+        "node_name": manifest.node_name,
+        "config": dict(manifest.config),
+        "runtime_config": {"timeframe": timeframe},
+        "primary_input_fingerprint": dataframe_fingerprint(
+            dependency_results["raw_input"].primary_frame(), strategy="content"
+        ),
+        "relevant_peer_fingerprints": {
+            symbol: (
+                dataframe_fingerprint(peer_frames[symbol], strategy="content")
+                if symbol in peer_frames and peer_frames[symbol] is not None
+                else None
+            )
+            for symbol in relevant_symbols
+        },
+        "cross_asset_config_hash": cross_asset_runtime_config_hash(
+            timeframe=timeframe,
+            relevant_pairs=relevant_pairs,
+        ),
+        "relevant_pairs": sorted(relevant_pairs),
+    }
+
+
+def _live_partner_fingerprint(symbol: str):
+    def _fingerprint(
+        manifest: NodeManifest,
+        context: GraphRunContext,
+        dependency_results: dict[str, NodeExecutionResult],
+    ) -> dict[str, Any]:
+        from src.indicators._helpers.schema import normalize_candle_schema
+        from src.indicators.features.cross_asset import (
+            _trim_frame_to_range,
+            _warmup_buffer,
+        )
+        from src.pipeline_runtime import dataframe_fingerprint
+
+        timeframe = str(context.config.get("timeframe", context.timeframe))
+        primary_raw = normalize_candle_schema(
+            dependency_results["raw_input"].primary_frame().copy(),
+            require_volume=True,
+        )
+        primary_ts = pd.to_datetime(
+            primary_raw["timestamp"], utc=True, errors="coerce"
+        ).dropna()
+        primary_max = primary_ts.max()
+        primary_min = primary_ts.min() - _warmup_buffer(timeframe)
+        peer_frame = dependency_results["live_peer_context_source"].output.frames.get(
+            symbol
+        )
+        trimmed = (
+            _trim_frame_to_range(peer_frame, min_ts=primary_min, max_ts=primary_max)
+            if peer_frame is not None and not peer_frame.empty
+            else pd.DataFrame()
+        )
+        return {
+            "graph_name": manifest.graph_name,
+            "node_name": manifest.node_name,
+            "config": dict(manifest.config),
+            "runtime_config": {"timeframe": timeframe, "symbol": symbol},
+            "trimmed_partner_fingerprint": dataframe_fingerprint(
+                trimmed, strategy="content"
+            ),
+        }
+
+    return _fingerprint
+
+
+def _live_cross_asset_attach_fingerprint(
+    partner_node_names: tuple[str, ...],
+):
+    def _fingerprint(
+        manifest: NodeManifest,
+        context: GraphRunContext,
+        dependency_results: dict[str, NodeExecutionResult],
+    ) -> dict[str, Any]:
+        from src.pipeline_runtime import dataframe_fingerprint
+
+        primary_node = manifest.upstream_nodes[0]
+        return {
+            "graph_name": manifest.graph_name,
+            "node_name": manifest.node_name,
+            "config": dict(manifest.config),
+            "runtime_config": {
+                key: context.config.get(key) for key in ("instrument", "timeframe")
+            },
+            "primary_frame_fingerprint": dataframe_fingerprint(
+                dependency_results[primary_node].primary_frame(), strategy="content"
+            ),
+            "market_context_fingerprint": dependency_results[
+                "live_market_context_source"
+            ].fingerprint,
+            "partner_fingerprints": {
+                name: dependency_results[name].fingerprint
+                for name in partner_node_names
+            },
+        }
+
+    return _fingerprint
+
+
+def _research_partner_node_name(symbol: str) -> str:
+    return f"research_partner_{symbol}"
+
+
+def _research_peer_context_source_hash() -> str:
+    return _live_peer_context_source_hash()
+
+
+def _research_market_context_source_hash() -> str:
+    from src.indicators.features.cross_asset import (
+        build_global_market_context,
+        build_global_market_context_incremental,
+        market_context_cache_is_current,
+    )
+
+    return compute_multi_source_hash(
+        build_global_market_context,
+        build_global_market_context_incremental,
+        market_context_cache_is_current,
+    )
+
+
+def _research_partner_source_hash(symbol: str) -> str:
+    return _live_partner_source_hash(symbol)
+
+
+def _research_cross_asset_attach_hash() -> str:
+    return _live_cross_asset_attach_hash()
+
+
+def _research_smt_research_hash() -> str:
+    from src.indicators.research.smt_research import (
+        build_smt_research_table,
+        summarize_smt_research,
+    )
+
+    return compute_multi_source_hash(build_smt_research_table, summarize_smt_research)
+
+
+def _research_cross_asset_audit_hash() -> str:
+    from src.indicators.research.cross_asset_research import (
+        build_cross_asset_correlation_audit,
+        summarize_cross_asset_correlation_audit,
+    )
+
+    return compute_multi_source_hash(
+        build_cross_asset_correlation_audit,
+        summarize_cross_asset_correlation_audit,
+    )
+
+
+def _research_market_context_fingerprint(
+    manifest: NodeManifest,
+    context: GraphRunContext,
+    dependency_results: dict[str, NodeExecutionResult],
+) -> dict[str, Any]:
+    from src.indicators.features.cross_asset import cross_asset_runtime_config_hash
+    from src.pipeline_runtime import dataframe_fingerprint
+
+    timeframe = str(context.config.get("timeframe", context.timeframe))
+    peer_frames = dependency_results["research_peer_context_source"].output.frames
+    return {
+        "graph_name": manifest.graph_name,
+        "node_name": manifest.node_name,
+        "config": dict(manifest.config),
+        "runtime_config": {"timeframe": timeframe, "full_pair_matrix": True},
+        "primary_input_fingerprint": dataframe_fingerprint(
+            dependency_results["raw_input"].primary_frame(), strategy="content"
+        ),
+        "peer_frame_fingerprints": {
+            symbol: dataframe_fingerprint(frame, strategy="content")
+            for symbol, frame in sorted(peer_frames.items())
+            if frame is not None and not frame.empty
+        },
+        "cross_asset_config_hash": cross_asset_runtime_config_hash(
+            timeframe=timeframe,
+            relevant_pairs=None,
+        ),
+    }
+
+
+def _research_partner_fingerprint(symbol: str):
+    def _fingerprint(
+        manifest: NodeManifest,
+        context: GraphRunContext,
+        dependency_results: dict[str, NodeExecutionResult],
+    ) -> dict[str, Any]:
+        from src.indicators._helpers.schema import normalize_candle_schema
+        from src.indicators.features.cross_asset import (
+            _trim_frame_to_range,
+            _warmup_buffer,
+        )
+        from src.pipeline_runtime import dataframe_fingerprint
+
+        timeframe = str(context.config.get("timeframe", context.timeframe))
+        primary_raw = normalize_candle_schema(
+            dependency_results["raw_input"].primary_frame().copy(),
+            require_volume=True,
+        )
+        primary_ts = pd.to_datetime(
+            primary_raw["timestamp"], utc=True, errors="coerce"
+        ).dropna()
+        primary_max = primary_ts.max()
+        primary_min = primary_ts.min() - _warmup_buffer(timeframe)
+        peer_frame = dependency_results[
+            "research_peer_context_source"
+        ].output.frames.get(symbol)
+        trimmed = (
+            _trim_frame_to_range(peer_frame, min_ts=primary_min, max_ts=primary_max)
+            if peer_frame is not None and not peer_frame.empty
+            else pd.DataFrame()
+        )
+        return {
+            "graph_name": manifest.graph_name,
+            "node_name": manifest.node_name,
+            "config": dict(manifest.config),
+            "runtime_config": {"timeframe": timeframe, "symbol": symbol},
+            "trimmed_partner_fingerprint": dataframe_fingerprint(
+                trimmed, strategy="content"
+            ),
+        }
+
+    return _fingerprint
+
+
+def _research_cross_asset_attach_fingerprint(
+    partner_node_names: tuple[str, ...],
+):
+    def _fingerprint(
+        manifest: NodeManifest,
+        context: GraphRunContext,
+        dependency_results: dict[str, NodeExecutionResult],
+    ) -> dict[str, Any]:
+        from src.pipeline_runtime import dataframe_fingerprint
+
+        primary_node = manifest.upstream_nodes[0]
+        return {
+            "graph_name": manifest.graph_name,
+            "node_name": manifest.node_name,
+            "config": dict(manifest.config),
+            "runtime_config": {
+                key: context.config.get(key) for key in ("instrument", "timeframe")
+            },
+            "primary_frame_fingerprint": dataframe_fingerprint(
+                dependency_results[primary_node].primary_frame(), strategy="content"
+            ),
+            "market_context_fingerprint": dependency_results[
+                "research_market_context_source"
+            ].fingerprint,
+            "partner_fingerprints": {
+                name: dependency_results[name].fingerprint
+                for name in partner_node_names
+            },
+        }
+
+    return _fingerprint
+
+
+def _research_smt_research_fingerprint(
+    manifest: NodeManifest,
+    context: GraphRunContext,
+    dependency_results: dict[str, NodeExecutionResult],
+) -> dict[str, Any]:
+    from src.pipeline_runtime import dataframe_fingerprint
+
+    return {
+        "graph_name": manifest.graph_name,
+        "node_name": manifest.node_name,
+        "config": dict(manifest.config),
+        "runtime_config": {
+            key: context.config.get(key) for key in ("instrument", "timeframe")
+        },
+        "attach_node_fingerprint": dependency_results[
+            "research_cross_asset_attach"
+        ].fingerprint,
+        "attached_frame_fingerprint": dataframe_fingerprint(
+            dependency_results["research_cross_asset_attach"].primary_frame(),
+            strategy="content",
+        ),
+    }
+
+
+def _research_cross_asset_audit_fingerprint(
+    manifest: NodeManifest,
+    context: GraphRunContext,
+    dependency_results: dict[str, NodeExecutionResult],
+) -> dict[str, Any]:
+    from src.pipeline_runtime import dataframe_fingerprint
+
+    return {
+        "graph_name": manifest.graph_name,
+        "node_name": manifest.node_name,
+        "config": dict(manifest.config),
+        "runtime_config": {
+            key: context.config.get(key) for key in ("instrument", "timeframe")
+        },
+        "attach_node_fingerprint": dependency_results[
+            "research_cross_asset_attach"
+        ].fingerprint,
+        "attached_frame_fingerprint": dataframe_fingerprint(
+            dependency_results["research_cross_asset_attach"].primary_frame(),
+            strategy="content",
+        ),
+        "market_context_fingerprint": dependency_results[
+            "research_market_context_source"
+        ].fingerprint,
+    }
+
+
 def build_live_stage_graph(
-    *, instrument: str, swing_window: int, include_vp: bool
+    *,
+    instrument: str,
+    swing_window: int,
+    include_vp: bool,
+    timeframe: str = "H4",
+    include_cross_asset: bool = False,
 ) -> GraphManifest:
     from src.indicators.pipelines import build_live as live
+    from src.indicators._helpers.schema import normalize_candle_schema
+    from src.indicators.features.cross_asset import (
+        CONTEXT_SYMBOLS,
+        SMT_PARTNERS,
+        SUPPORTED_CROSS_ASSET_TIMEFRAMES,
+        _trim_frame_to_range,
+        _warmup_buffer,
+        attach_cross_asset_context,
+        build_global_market_context,
+        build_global_market_context_incremental,
+        load_raw_context_frames,
+        market_context_cache_is_current,
+        relevant_correlation_pairs,
+    )
+    from src.indicators.pipelines.build_research import build_smt_partner_indicators
+    from src.pipeline_runtime import load_partitioned_dataset
 
     graph_name = "live_pipeline"
     nodes: list[NodeManifest] = [_source_node(graph_name, "raw_input", "raw_input")]
     upstream = "raw_input"
     for stage in live._live_stages(
-        instrument=instrument, swing_window=swing_window, include_vp=include_vp
+        instrument=instrument,
+        swing_window=swing_window,
+        include_vp=include_vp,
+        timeframe=timeframe,
     ):
         prev = upstream
         nodes.append(
@@ -79,7 +749,8 @@ def build_live_stage_graph(
                 inputs=(),
                 upstream_nodes=(prev,),
                 output_artifacts=("frame",),
-                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                cache_policy=_pipeline_cache_policy(stage),
+                config=_pipeline_stage_config(stage),
                 replay_policy=ReplayPolicyContract(
                     mode=(
                         "carried_state"
@@ -102,15 +773,327 @@ def build_live_stage_graph(
             )
         )
         upstream = stage.name
+    if not include_cross_asset:
+        return GraphManifest(
+            graph_name=graph_name, nodes=tuple(nodes), default_target=upstream
+        )
+
+    if timeframe not in SUPPORTED_CROSS_ASSET_TIMEFRAMES:
+        raise ValueError(
+            f"Cross-asset context only supports {sorted(SUPPORTED_CROSS_ASSET_TIMEFRAMES)}"
+        )
+
+    peer_context_node = "live_peer_context_source"
+    materialized_bundle_policy = _node_cache_policy(
+        materialize=True, artifact_kind="bundle"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
+    partner_symbols = tuple(
+        partner for partner, _relation in SMT_PARTNERS.get(instrument, ())
+    )
+
+    def _compute_peer_context(
+        context: GraphRunContext, _deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        provided = context.inputs.get("peer_raw_frames") or {}
+        symbols = _live_peer_symbols(instrument)
+        frames: dict[str, pd.DataFrame] = {}
+        loaded_from_input: list[str] = []
+        for symbol in symbols:
+            frame = provided.get(symbol) if isinstance(provided, dict) else None
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                frames[symbol] = normalize_candle_schema(
+                    frame.copy(), require_volume=True
+                ).reset_index(drop=True)
+                loaded_from_input.append(symbol)
+        missing_symbols = tuple(symbol for symbol in symbols if symbol not in frames)
+        raw_data_root = context.config.get("raw_data_root")
+        if raw_data_root is not None and missing_symbols:
+            loaded = load_raw_context_frames(
+                raw_data_root=raw_data_root,
+                timeframe=timeframe,
+                instruments=missing_symbols,
+            )
+            for symbol, frame in loaded.items():
+                frames.setdefault(symbol, frame.reset_index(drop=True))
+        return NodeOutput(
+            frames=frames,
+            payload={"symbols": sorted(frames)},
+            profile_details={
+                "loaded_from_input": loaded_from_input,
+                "loaded_from_raw": sorted(
+                    symbol for symbol in frames if symbol not in loaded_from_input
+                ),
+            },
+        )
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=peer_context_node,
+            node_kind="source",
+            semantic_class="A",
+            inputs=(),
+            upstream_nodes=(),
+            output_artifacts=("payload",),
+            fingerprint_fn=_live_peer_context_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config={"source_hash": _live_peer_context_source_hash()},
+            validation_policy=ValidationPolicy(level="node_parity"),
+            mutable_scope=MutableScope(scope="frontier_only"),
+            compute_fn=_compute_peer_context,
+        )
+    )
+
+    def _compute_live_market_context(
+        context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        primary_raw = normalize_candle_schema(
+            deps["raw_input"].primary_frame().copy(),
+            require_volume=True,
+        )
+        relevant_pairs = relevant_correlation_pairs(instrument)
+        cache_current = market_context_cache_is_current(
+            features_root=context.features_root,
+            timeframe=timeframe,
+            variant="live",
+            relevant_pairs=relevant_pairs,
+        )
+        cached_mc = load_partitioned_dataset(
+            context.features_root,
+            dataset="market_context_live",
+            symbol="GLOBAL",
+            timeframe=timeframe,
+        )
+        primary_ts = pd.to_datetime(
+            primary_raw["timestamp"], utc=True, errors="coerce"
+        ).dropna()
+        if cache_current and not cached_mc.empty:
+            mc_ts = pd.to_datetime(
+                cached_mc["timestamp"], utc=True, errors="coerce"
+            ).dropna()
+            if mc_ts.min() <= primary_ts.min() and mc_ts.max() >= primary_ts.max():
+                return NodeOutput(
+                    frames={"frame": cached_mc.reset_index(drop=True)},
+                    profile_details={"market_context_source": "persisted-full"},
+                )
+
+        peer_frames = {
+            symbol: frame.reset_index(drop=True)
+            for symbol, frame in deps[peer_context_node].output.frames.items()
+            if frame is not None and not frame.empty
+        }
+        raw_context_frames: dict[str, pd.DataFrame] = {}
+        required_symbols = sorted(
+            {value for pair in relevant_pairs for value in pair if value != instrument}
+        )
+        for symbol in required_symbols:
+            frame = peer_frames.get(symbol)
+            if frame is not None and not frame.empty:
+                raw_context_frames[symbol] = frame
+        if instrument in CONTEXT_SYMBOLS:
+            raw_context_frames[instrument] = primary_raw
+
+        if cache_current and not cached_mc.empty:
+            mc_ts = pd.to_datetime(
+                cached_mc["timestamp"], utc=True, errors="coerce"
+            ).dropna()
+            if (
+                mc_ts.min() <= primary_ts.min()
+                and mc_ts.max() < primary_ts.max()
+                and mc_ts.max() >= primary_ts.min()
+            ):
+                frontier_from_ts = mc_ts.max() - _warmup_buffer(timeframe)
+                rebuilt = build_global_market_context_incremental(
+                    raw_context_frames,
+                    timeframe=timeframe,
+                    prior_context=cached_mc,
+                    frontier_from_ts=frontier_from_ts,
+                    relevant_pairs=relevant_pairs,
+                )
+                return NodeOutput(
+                    frames={"frame": rebuilt.reset_index(drop=True)},
+                    profile_details={"market_context_source": "persisted-incremental"},
+                )
+
+        built = build_global_market_context(
+            raw_context_frames,
+            timeframe=timeframe,
+            relevant_pairs=relevant_pairs,
+        )
+        return NodeOutput(
+            frames={"frame": built.reset_index(drop=True)},
+            profile_details={"market_context_source": "build"},
+        )
+
+    market_context_node = "live_market_context_source"
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=market_context_node,
+            node_kind="compute",
+            semantic_class="B",
+            inputs=(),
+            upstream_nodes=("raw_input", peer_context_node),
+            output_artifacts=("frame",),
+            fingerprint_fn=_live_market_context_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config={"source_hash": _live_market_context_source_hash()},
+            validation_policy=ValidationPolicy(level="node_parity"),
+            mutable_scope=MutableScope(scope="frontier_only"),
+            compute_fn=_compute_live_market_context,
+        )
+    )
+
+    partner_node_names: list[str] = []
+    for partner_symbol in partner_symbols:
+        node_name = _live_partner_node_name(partner_symbol)
+        partner_node_names.append(node_name)
+
+        def _compute_partner(
+            context: GraphRunContext,
+            deps: dict[str, NodeExecutionResult],
+            partner_symbol: str = partner_symbol,
+        ) -> NodeOutput:
+            primary_raw = normalize_candle_schema(
+                deps["raw_input"].primary_frame().copy(),
+                require_volume=True,
+            )
+            primary_ts = pd.to_datetime(
+                primary_raw["timestamp"], utc=True, errors="coerce"
+            ).dropna()
+            primary_max = primary_ts.max()
+            primary_min = primary_ts.min() - _warmup_buffer(timeframe)
+            raw_partner = deps[peer_context_node].output.frames.get(partner_symbol)
+            if raw_partner is None or raw_partner.empty:
+                return NodeOutput(frames={"frame": pd.DataFrame()})
+            trimmed = _trim_frame_to_range(
+                raw_partner,
+                min_ts=primary_min,
+                max_ts=primary_max,
+            )
+            built = build_smt_partner_indicators(
+                trimmed.copy(),
+                swing_window=swing_window,
+            )
+            return NodeOutput(frames={"frame": built.reset_index(drop=True)})
+
+        nodes.append(
+            NodeManifest(
+                graph_name=graph_name,
+                node_name=node_name,
+                node_kind="compute",
+                semantic_class="B",
+                inputs=(),
+                upstream_nodes=("raw_input", peer_context_node),
+                output_artifacts=("frame",),
+                fingerprint_fn=_live_partner_fingerprint(partner_symbol),
+                cache_policy=materialized_frame_policy,
+                config={
+                    "partner_symbol": partner_symbol,
+                    "source_hash": _live_partner_source_hash(partner_symbol),
+                },
+                validation_policy=ValidationPolicy(level="node_parity"),
+                mutable_scope=MutableScope(scope="frontier_only"),
+                compute_fn=_compute_partner,
+            )
+        )
+
+    attach_node = "live_cross_asset_attach"
+
+    def _compute_attach(
+        context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        processed_frames = {
+            symbol: deps[_live_partner_node_name(symbol)].primary_frame()
+            for symbol in partner_symbols
+            if deps[_live_partner_node_name(symbol)].primary_frame() is not None
+            and not deps[_live_partner_node_name(symbol)].primary_frame().empty
+        }
+        attached = attach_cross_asset_context(
+            deps[upstream].primary_frame().copy(),
+            instrument=instrument,
+            timeframe=timeframe,
+            market_context=deps[market_context_node].primary_frame(),
+            processed_frames=processed_frames,
+        )
+        return NodeOutput(frames={"frame": attached.reset_index(drop=True)})
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=attach_node,
+            node_kind="compute",
+            semantic_class="B",
+            inputs=(),
+            upstream_nodes=(upstream, market_context_node, *tuple(partner_node_names)),
+            output_artifacts=("frame",),
+            fingerprint_fn=_live_cross_asset_attach_fingerprint(
+                tuple(partner_node_names)
+            ),
+            cache_policy=ephemeral_policy,
+            config={"source_hash": _live_cross_asset_attach_hash()},
+            validation_policy=ValidationPolicy(level="node_parity"),
+            mutable_scope=MutableScope(scope="frontier_only"),
+            compute_fn=_compute_attach,
+        )
+    )
+
+    bundle_node = "live_feature_bundle"
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=bundle_node,
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=(attach_node,),
+            output_artifacts=("frame",),
+            cache_policy=ephemeral_policy,
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                frames={"frame": deps[attach_node].primary_frame().copy()}
+            ),
+        )
+    )
     return GraphManifest(
-        graph_name=graph_name, nodes=tuple(nodes), default_target=upstream
+        graph_name=graph_name, nodes=tuple(nodes), default_target=bundle_node
     )
 
 
 def build_research_stage_graph(
-    *, instrument: str, swing_window: int, include_vp: bool, include_avwap: bool
+    *,
+    instrument: str,
+    swing_window: int,
+    include_vp: bool,
+    include_avwap: bool,
+    timeframe: str = "H4",
+    include_cross_asset: bool = False,
 ) -> GraphManifest:
     from src.indicators.pipelines import build_research as research
+    from src.indicators._helpers.schema import normalize_candle_schema
+    from src.indicators.features.cross_asset import (
+        CONTEXT_SYMBOLS,
+        SMT_PARTNERS,
+        SUPPORTED_CROSS_ASSET_TIMEFRAMES,
+        _trim_frame_to_range,
+        _warmup_buffer,
+        attach_cross_asset_context,
+        build_global_market_context,
+        build_global_market_context_incremental,
+        load_raw_context_frames,
+        market_context_cache_is_current,
+    )
+    from src.indicators.research import (
+        build_cross_asset_correlation_audit,
+        build_smt_research_table,
+        summarize_cross_asset_correlation_audit,
+        summarize_smt_research,
+    )
+    from src.pipeline_runtime import load_partitioned_dataset
 
     graph_name = "research_pipeline"
     nodes: list[NodeManifest] = [_source_node(graph_name, "raw_input", "raw_input")]
@@ -120,6 +1103,7 @@ def build_research_stage_graph(
         swing_window=swing_window,
         include_vp=include_vp,
         include_avwap=include_avwap,
+        timeframe=timeframe,
     ):
         prev = upstream
         nodes.append(
@@ -131,7 +1115,8 @@ def build_research_stage_graph(
                 inputs=(),
                 upstream_nodes=(prev,),
                 output_artifacts=("frame",),
-                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                cache_policy=_pipeline_cache_policy(stage),
+                config=_pipeline_stage_config(stage),
                 replay_policy=ReplayPolicyContract(
                     mode=(
                         "carried_state"
@@ -159,8 +1144,389 @@ def build_research_stage_graph(
             )
         )
         upstream = stage.name
+    if not include_cross_asset:
+        return GraphManifest(
+            graph_name=graph_name, nodes=tuple(nodes), default_target=upstream
+        )
+
+    if timeframe not in SUPPORTED_CROSS_ASSET_TIMEFRAMES:
+        raise ValueError(
+            f"Cross-asset context only supports {sorted(SUPPORTED_CROSS_ASSET_TIMEFRAMES)}"
+        )
+
+    peer_context_node = "research_peer_context_source"
+    market_context_node = "research_market_context_source"
+    attach_node = "research_cross_asset_attach"
+    smt_node = "research_smt_research_table"
+    audit_node = "research_cross_asset_audit"
+    bundle_node = "research_feature_bundle"
+    full_bundle_node = "research_full_bundle"
+    materialized_bundle_policy = _node_cache_policy(
+        materialize=True, artifact_kind="bundle"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
+    partner_symbols = tuple(
+        partner for partner, _relation in SMT_PARTNERS.get(instrument, ())
+    )
+
+    def _compute_peer_context(
+        context: GraphRunContext, _deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        provided = context.inputs.get("peer_raw_frames") or {}
+        symbols = _live_peer_symbols(instrument)
+        frames: dict[str, pd.DataFrame] = {}
+        loaded_from_input: list[str] = []
+        for symbol in symbols:
+            frame = provided.get(symbol) if isinstance(provided, dict) else None
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                frames[symbol] = normalize_candle_schema(
+                    frame.copy(), require_volume=True
+                ).reset_index(drop=True)
+                loaded_from_input.append(symbol)
+        missing_symbols = tuple(symbol for symbol in symbols if symbol not in frames)
+        raw_data_root = context.config.get("raw_data_root")
+        if raw_data_root is not None and missing_symbols:
+            loaded = load_raw_context_frames(
+                raw_data_root=raw_data_root,
+                timeframe=timeframe,
+                instruments=missing_symbols,
+            )
+            for symbol, frame in loaded.items():
+                frames.setdefault(symbol, frame.reset_index(drop=True))
+        return NodeOutput(
+            frames=frames,
+            payload={"symbols": sorted(frames)},
+            profile_details={
+                "loaded_from_input": loaded_from_input,
+                "loaded_from_raw": sorted(
+                    symbol for symbol in frames if symbol not in loaded_from_input
+                ),
+            },
+        )
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=peer_context_node,
+            node_kind="source",
+            semantic_class="A",
+            inputs=(),
+            upstream_nodes=(),
+            output_artifacts=("payload",),
+            fingerprint_fn=_live_peer_context_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config={"source_hash": _research_peer_context_source_hash()},
+            validation_policy=ValidationPolicy(level="node_parity"),
+            mutable_scope=MutableScope(scope="frontier_only"),
+            compute_fn=_compute_peer_context,
+        )
+    )
+
+    def _compute_research_market_context(
+        context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        primary_raw = normalize_candle_schema(
+            deps["raw_input"].primary_frame().copy(),
+            require_volume=True,
+        )
+        cache_current = market_context_cache_is_current(
+            features_root=context.features_root,
+            timeframe=timeframe,
+            variant="research",
+            relevant_pairs=None,
+        )
+        cached_mc = load_partitioned_dataset(
+            context.features_root,
+            dataset="market_context_research",
+            symbol="GLOBAL",
+            timeframe=timeframe,
+        )
+        primary_ts = pd.to_datetime(
+            primary_raw["timestamp"], utc=True, errors="coerce"
+        ).dropna()
+        if cache_current and not cached_mc.empty:
+            mc_ts = pd.to_datetime(
+                cached_mc["timestamp"], utc=True, errors="coerce"
+            ).dropna()
+            if mc_ts.min() <= primary_ts.min() and mc_ts.max() >= primary_ts.max():
+                return NodeOutput(
+                    frames={"frame": cached_mc.reset_index(drop=True)},
+                    profile_details={"market_context_source": "persisted-full"},
+                )
+
+        peer_frames = {
+            symbol: frame.reset_index(drop=True)
+            for symbol, frame in deps[peer_context_node].output.frames.items()
+            if frame is not None and not frame.empty
+        }
+        raw_context_frames = dict(peer_frames)
+        if instrument in CONTEXT_SYMBOLS:
+            raw_context_frames[instrument] = primary_raw
+
+        if cache_current and not cached_mc.empty:
+            mc_ts = pd.to_datetime(
+                cached_mc["timestamp"], utc=True, errors="coerce"
+            ).dropna()
+            if (
+                mc_ts.min() <= primary_ts.min()
+                and mc_ts.max() < primary_ts.max()
+                and mc_ts.max() >= primary_ts.min()
+            ):
+                frontier_from_ts = mc_ts.max() - _warmup_buffer(timeframe)
+                rebuilt = build_global_market_context_incremental(
+                    raw_context_frames,
+                    timeframe=timeframe,
+                    prior_context=cached_mc,
+                    frontier_from_ts=frontier_from_ts,
+                    relevant_pairs=None,
+                )
+                return NodeOutput(
+                    frames={"frame": rebuilt.reset_index(drop=True)},
+                    profile_details={"market_context_source": "persisted-incremental"},
+                )
+
+        built = build_global_market_context(
+            raw_context_frames,
+            timeframe=timeframe,
+            relevant_pairs=None,
+        )
+        return NodeOutput(
+            frames={"frame": built.reset_index(drop=True)},
+            profile_details={"market_context_source": "build"},
+        )
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=market_context_node,
+            node_kind="compute",
+            semantic_class="B",
+            inputs=(),
+            upstream_nodes=("raw_input", peer_context_node),
+            output_artifacts=("frame",),
+            fingerprint_fn=_research_market_context_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config={"source_hash": _research_market_context_source_hash()},
+            replay_policy=ReplayPolicyContract(mode="bounded_replay", replay_bars=200),
+            validation_policy=ValidationPolicy(level="node_parity"),
+            mutable_scope=MutableScope(scope="frontier_only"),
+            compute_fn=_compute_research_market_context,
+        )
+    )
+
+    partner_node_names: list[str] = []
+    for partner_symbol in partner_symbols:
+        node_name = _research_partner_node_name(partner_symbol)
+        partner_node_names.append(node_name)
+
+        def _compute_partner(
+            context: GraphRunContext,
+            deps: dict[str, NodeExecutionResult],
+            partner_symbol: str = partner_symbol,
+        ) -> NodeOutput:
+            primary_raw = normalize_candle_schema(
+                deps["raw_input"].primary_frame().copy(),
+                require_volume=True,
+            )
+            primary_ts = pd.to_datetime(
+                primary_raw["timestamp"], utc=True, errors="coerce"
+            ).dropna()
+            primary_max = primary_ts.max()
+            primary_min = primary_ts.min() - _warmup_buffer(timeframe)
+            raw_partner = deps[peer_context_node].output.frames.get(partner_symbol)
+            if raw_partner is None or raw_partner.empty:
+                return NodeOutput(frames={"frame": pd.DataFrame()})
+            trimmed = _trim_frame_to_range(
+                raw_partner,
+                min_ts=primary_min,
+                max_ts=primary_max,
+            )
+            built = research.build_smt_partner_indicators(
+                trimmed.copy(),
+                swing_window=swing_window,
+            )
+            return NodeOutput(frames={"frame": built.reset_index(drop=True)})
+
+        nodes.append(
+            NodeManifest(
+                graph_name=graph_name,
+                node_name=node_name,
+                node_kind="compute",
+                semantic_class="B",
+                inputs=(),
+                upstream_nodes=("raw_input", peer_context_node),
+                output_artifacts=("frame",),
+                fingerprint_fn=_research_partner_fingerprint(partner_symbol),
+                cache_policy=materialized_frame_policy,
+                config={
+                    "partner_symbol": partner_symbol,
+                    "source_hash": _research_partner_source_hash(partner_symbol),
+                },
+                replay_policy=ReplayPolicyContract(
+                    mode="bounded_replay", replay_bars=200
+                ),
+                validation_policy=ValidationPolicy(level="node_parity"),
+                mutable_scope=MutableScope(scope="frontier_only"),
+                compute_fn=_compute_partner,
+            )
+        )
+
+    def _compute_attach(
+        context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        processed_frames = {
+            symbol: deps[_research_partner_node_name(symbol)].primary_frame()
+            for symbol in partner_symbols
+            if deps[_research_partner_node_name(symbol)].primary_frame() is not None
+            and not deps[_research_partner_node_name(symbol)].primary_frame().empty
+        }
+        attached = attach_cross_asset_context(
+            deps[upstream].primary_frame().copy(),
+            instrument=instrument,
+            timeframe=timeframe,
+            market_context=deps[market_context_node].primary_frame(),
+            processed_frames=processed_frames,
+        )
+        return NodeOutput(frames={"frame": attached.reset_index(drop=True)})
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=attach_node,
+            node_kind="compute",
+            semantic_class="B",
+            inputs=(),
+            upstream_nodes=(upstream, market_context_node, *tuple(partner_node_names)),
+            output_artifacts=("frame",),
+            fingerprint_fn=_research_cross_asset_attach_fingerprint(
+                tuple(partner_node_names)
+            ),
+            cache_policy=ephemeral_policy,
+            config={"source_hash": _research_cross_asset_attach_hash()},
+            replay_policy=ReplayPolicyContract(mode="bounded_replay", replay_bars=200),
+            validation_policy=ValidationPolicy(level="node_parity"),
+            mutable_scope=MutableScope(scope="frontier_only"),
+            compute_fn=_compute_attach,
+        )
+    )
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=smt_node,
+            node_kind="compute",
+            semantic_class="B",
+            inputs=(),
+            upstream_nodes=(attach_node,),
+            output_artifacts=("frame", "payload"),
+            fingerprint_fn=_research_smt_research_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config={"source_hash": _research_smt_research_hash()},
+            replay_policy=ReplayPolicyContract(mode="bounded_replay", replay_bars=200),
+            validation_policy=ValidationPolicy(level="node_parity"),
+            mutable_scope=MutableScope(scope="frontier_only"),
+            compute_fn=lambda context, deps: NodeOutput(
+                frames={
+                    "frame": build_smt_research_table(
+                        deps[attach_node].primary_frame()
+                    ).reset_index(drop=True)
+                },
+                payload={
+                    "summary": summarize_smt_research(
+                        build_smt_research_table(deps[attach_node].primary_frame())
+                    )
+                },
+            ),
+        )
+    )
+
+    def _compute_audit(
+        context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        audit_tables = build_cross_asset_correlation_audit(
+            deps[attach_node].primary_frame(),
+            deps[market_context_node].primary_frame(),
+            instrument=instrument,
+            timeframe=timeframe,
+        )
+        return NodeOutput(
+            frames={
+                table_name: table.reset_index(drop=True)
+                for table_name, table in audit_tables.items()
+            },
+            payload={"summary": summarize_cross_asset_correlation_audit(audit_tables)},
+        )
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=audit_node,
+            node_kind="compute",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=(attach_node, market_context_node),
+            output_artifacts=("payload",),
+            fingerprint_fn=_research_cross_asset_audit_fingerprint,
+            cache_policy=ephemeral_policy,
+            config={"source_hash": _research_cross_asset_audit_hash()},
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            mutable_scope=MutableScope(scope="explicit_rebuild_only"),
+            compute_fn=_compute_audit,
+        )
+    )
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=bundle_node,
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=(attach_node, smt_node),
+            output_artifacts=("frame", "payload"),
+            cache_policy=ephemeral_policy,
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                frames={
+                    "frame": deps[attach_node].primary_frame().copy(),
+                    "smt_research": deps[smt_node].primary_frame().copy(),
+                },
+                payload={"smt_summary": deps[smt_node].output.payload.get("summary")},
+            ),
+        )
+    )
+
+    nodes.append(
+        NodeManifest(
+            graph_name=graph_name,
+            node_name=full_bundle_node,
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=(bundle_node, audit_node),
+            output_artifacts=("frame", "payload"),
+            cache_policy=ephemeral_policy,
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                frames={
+                    "frame": deps[bundle_node].output.frames["frame"].copy(),
+                    "smt_research": deps[bundle_node]
+                    .output.frames["smt_research"]
+                    .copy(),
+                },
+                payload={
+                    "smt_summary": deps[bundle_node].output.payload.get("smt_summary"),
+                    "audit_summary": deps[audit_node].output.payload.get("summary"),
+                },
+            ),
+        )
+    )
+
     return GraphManifest(
-        graph_name=graph_name, nodes=tuple(nodes), default_target=upstream
+        graph_name=graph_name, nodes=tuple(nodes), default_target=bundle_node
     )
 
 
@@ -170,29 +1536,21 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
     graph_name = "validate_range_boundaries"
     nodes: list[NodeManifest] = [_source_node(graph_name, "raw_input", "raw_input")]
 
-    def _runtime_config_fingerprint(*keys: str):
-        def _fingerprint(
-            manifest: NodeManifest,
-            context: GraphRunContext,
-            dependency_results: dict[str, NodeExecutionResult],
-        ) -> dict[str, Any]:
-            payload = default_node_fingerprint_payload(
-                manifest, context, dependency_results
-            )
-            payload["runtime_config"] = {
-                key: payload["runtime_config"][key]
-                for key in keys
-                if key in payload["runtime_config"]
-            }
-            return payload
-
-        return _fingerprint
-
     no_runtime_config_fingerprint = _runtime_config_fingerprint()
     chart_runtime_config_fingerprint = _runtime_config_fingerprint(
         "html", "date_from", "plot_rows", "full", "out_dir"
     )
     csv_runtime_config_fingerprint = _runtime_config_fingerprint("write_csv", "out_dir")
+    materialized_bundle_policy = _node_cache_policy(
+        materialize=True, artifact_kind="bundle"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    materialized_report_policy = _node_cache_policy(
+        materialize=True, artifact_kind="report"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
 
     def context_compute(
         context: GraphRunContext, deps: dict[str, NodeExecutionResult]
@@ -219,6 +1577,12 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=("raw_input",),
             output_artifacts=("frame",),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(
+                context_compute,
+                vrb._load_canonical_live_context,
+                vrb._build_context,
+            ),
             replay_policy=ReplayPolicyContract(mode="bounded_replay", replay_bars=400),
             validation_policy=ValidationPolicy(level="node_parity"),
             mutable_scope=MutableScope(scope="frontier_only"),
@@ -311,6 +1675,10 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
                     ),
                     output_artifacts=("event_table", "candidate_table"),
                     fingerprint_fn=no_runtime_config_fingerprint,
+                    cache_policy=materialized_bundle_policy,
+                    config=_source_hash_config(
+                        rung_compute, vrb._run_debug_with_params
+                    ),
                     replay_policy=ReplayPolicyContract(
                         mode="bounded_replay", replay_bars=400
                     ),
@@ -356,6 +1724,12 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=tuple(step8e_a_names),
             output_artifacts=("payload",),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                retune_gate_compute,
+                vrb._assess_rung,
+                vrb._select_best_assessment,
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             mutable_scope=MutableScope(scope="frontier_only"),
             compute_fn=retune_gate_compute,
@@ -412,6 +1786,12 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=("range_retune_gate",) + tuple(step8e_b_names),
             output_artifacts=("payload",),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                select_compute,
+                vrb._assess_rung,
+                vrb._select_best_assessment,
+            ),
             validation_policy=ValidationPolicy(level="graph_parity"),
             mutable_scope=MutableScope(scope="frontier_only"),
             compute_fn=select_compute,
@@ -435,7 +1815,7 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=("range_selected_rung",),
             output_artifacts=("payload",),
             fingerprint_fn=no_runtime_config_fingerprint,
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+            cache_policy=ephemeral_policy,
             validation_policy=ValidationPolicy(level="graph_parity"),
             compute_fn=selection_bundle_compute,
         )
@@ -473,6 +1853,10 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=("range_context", "range_selected_rung"),
             output_artifacts=("frame", "event_table", "candidate_table"),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(
+                selected_debug_compute, vrb._run_debug_with_params
+            ),
             replay_policy=ReplayPolicyContract(mode="bounded_replay", replay_bars=400),
             validation_policy=ValidationPolicy(level="graph_parity"),
             mutable_scope=MutableScope(scope="frontier_only"),
@@ -505,6 +1889,13 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=("range_selected_debug",),
             output_artifacts=("forensics",),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                forensics_compute,
+                vrb._build_forensics_tables,
+                vrb._add_path_c2_candidate_scores,
+                vrb._assign_contract_bucket_labels,
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=forensics_compute,
         )
@@ -545,6 +1936,12 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
                 "geometry_candidate_summary",
             ),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                geometry_compute,
+                vrb._build_geometry_audit,
+                vrb._build_geometry_candidate_comparison,
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=geometry_compute,
         )
@@ -583,6 +1980,12 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
                 "geometry_candidate_truth_summary",
             ),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                active_truth_compute,
+                vrb._build_active_truth_audit,
+                vrb._build_geometry_candidate_active_truth_summary,
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=active_truth_compute,
         )
@@ -621,6 +2024,10 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=tuple(rung_names) + ("range_selected_rung",),
             output_artifacts=("coverage_regime_report",),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                coverage_compute, vrb._build_coverage_regime_report
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=coverage_compute,
         )
@@ -667,6 +2074,19 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=("range_forensics", "range_geometry_audit"),
             output_artifacts=("ranking_bundle",),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                ranking_compute,
+                vrb._evaluate_path_c2_candidates,
+                vrb._build_geometry_ranking_preservation_report,
+                vrb._build_ranking_disagreement_report,
+                vrb._build_ranking_rebase_comparison_report,
+                vrb._build_path_c2_candidate_report,
+                vrb._build_agreement_matrix,
+                vrb._build_bucket_lift_report,
+                vrb._build_family_comparison_report,
+                vrb._build_path_c2_archetype_report,
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=ranking_compute,
         )
@@ -959,6 +2379,18 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
                 "geometry_candidate_gate_report",
             ),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                diagnostics_compute,
+                vrb._primary_path_from_reports,
+                vrb._build_geometry_candidate_gate_report,
+                vrb._build_interpretability_metrics_summary,
+                vrb._build_contract_bucket_summary,
+                vrb._build_archetype_summary,
+                vrb._build_viability_alignment_audit,
+                vrb._build_pressure_alignment_audit,
+                vrb._bundle_named_reports,
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=diagnostics_compute,
         )
@@ -1001,6 +2433,12 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
                 "geometry_candidate_downstream_summary",
             ),
             fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config=_source_hash_config(
+                downstream_compute,
+                vrb._build_downstream_usefulness_report,
+                vrb._build_geometry_candidate_downstream_summary,
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=downstream_compute,
         )
@@ -1042,7 +2480,7 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             ),
             output_artifacts=("payload",),
             fingerprint_fn=no_runtime_config_fingerprint,
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+            cache_policy=ephemeral_policy,
             validation_policy=ValidationPolicy(level="graph_parity"),
             compute_fn=analysis_bundle_compute,
         )
@@ -1101,7 +2539,8 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             upstream_nodes=("range_selected_debug", "range_selected_rung"),
             output_artifacts=("html",),
             fingerprint_fn=chart_runtime_config_fingerprint,
-            cache_policy=CachePolicy(materialize=True, artifact_kind="report"),
+            cache_policy=materialized_report_policy,
+            config=_source_hash_config(chart_compute, validate_range_boundaries),
             validation_policy=ValidationPolicy(level="report"),
             mutable_scope=MutableScope(scope="immutable"),
             compute_fn=chart_compute,
@@ -1153,7 +2592,10 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             ),
             output_artifacts=("html",),
             fingerprint_fn=chart_runtime_config_fingerprint,
-            cache_policy=CachePolicy(materialize=True, artifact_kind="report"),
+            cache_policy=materialized_report_policy,
+            config=_source_hash_config(
+                geometry_chart_compute, vrb._plot_audit_chart_pack
+            ),
             validation_policy=ValidationPolicy(level="report"),
             mutable_scope=MutableScope(scope="immutable"),
             compute_fn=geometry_chart_compute,
@@ -1209,7 +2651,10 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             ),
             output_artifacts=("html",),
             fingerprint_fn=chart_runtime_config_fingerprint,
-            cache_policy=CachePolicy(materialize=True, artifact_kind="report"),
+            cache_policy=materialized_report_policy,
+            config=_source_hash_config(
+                refresh_chart_compute, vrb._plot_audit_chart_pack
+            ),
             validation_policy=ValidationPolicy(level="report"),
             mutable_scope=MutableScope(scope="immutable"),
             compute_fn=refresh_chart_compute,
@@ -1267,7 +2712,10 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             ),
             output_artifacts=("html",),
             fingerprint_fn=chart_runtime_config_fingerprint,
-            cache_policy=CachePolicy(materialize=True, artifact_kind="report"),
+            cache_policy=materialized_report_policy,
+            config=_source_hash_config(
+                downstream_chart_compute, vrb._plot_audit_chart_pack
+            ),
             validation_policy=ValidationPolicy(level="report"),
             mutable_scope=MutableScope(scope="immutable"),
             compute_fn=downstream_chart_compute,
@@ -1305,7 +2753,7 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             ),
             output_artifacts=("payload",),
             fingerprint_fn=chart_runtime_config_fingerprint,
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+            cache_policy=ephemeral_policy,
             validation_policy=ValidationPolicy(level="report"),
             compute_fn=chart_bundle_compute,
         )
@@ -1517,7 +2965,14 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             ),
             output_artifacts=("artifacts",),
             fingerprint_fn=csv_runtime_config_fingerprint,
-            cache_policy=CachePolicy(materialize=True, artifact_kind="report"),
+            cache_policy=materialized_report_policy,
+            config=_source_hash_config(
+                csv_bundle_compute,
+                vrb._build_diagnosis_memo_text,
+                vrb._bundle_named_reports,
+                write_csv_atomic,
+                write_text_atomic,
+            ),
             validation_policy=ValidationPolicy(level="report"),
             mutable_scope=MutableScope(scope="immutable"),
             compute_fn=csv_bundle_compute,
@@ -1568,7 +3023,7 @@ def build_range_boundaries_graph(*, instrument: str, timeframe: str) -> GraphMan
             fingerprint_fn=_runtime_config_fingerprint(
                 "html", "write_csv", "date_from", "plot_rows", "full", "out_dir"
             ),
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+            cache_policy=ephemeral_policy,
             validation_policy=ValidationPolicy(level="graph_parity"),
             compute_fn=validation_bundle_compute,
         )
@@ -1586,6 +3041,20 @@ def build_regime_validation_graph(*, instrument: str, timeframe: str) -> GraphMa
 
     graph_name = "validate_regime"
     nodes: list[NodeManifest] = [_source_node(graph_name, "raw_input", "raw_input")]
+    no_runtime_config_fingerprint = _runtime_config_fingerprint()
+    summary_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "plot_rows", "full"
+    )
+    chart_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "html", "plot_rows", "full", "out_dir"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    materialized_report_policy = _node_cache_policy(
+        materialize=True, artifact_kind="report"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
 
     def make_context(include_research_only: bool, node_name: str) -> NodeManifest:
         return NodeManifest(
@@ -1596,6 +3065,9 @@ def build_regime_validation_graph(*, instrument: str, timeframe: str) -> GraphMa
             inputs=(),
             upstream_nodes=("raw_input",),
             output_artifacts=("frame",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(vr._load_canonical_context, vr._build_context),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=lambda context, deps, include_research_only=include_research_only: NodeOutput(
                 frames={
@@ -1631,7 +3103,12 @@ def build_regime_validation_graph(*, instrument: str, timeframe: str) -> GraphMa
                 inputs=(),
                 upstream_nodes=("regime_live_context", "regime_research_context"),
                 output_artifacts=("payload",),
-                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                fingerprint_fn=summary_runtime_config_fingerprint,
+                cache_policy=ephemeral_policy,
+                config=_source_hash_config(
+                    validate_regime,
+                    vr._synthetic_fixture_summary,
+                ),
                 validation_policy=ValidationPolicy(level="graph_parity"),
                 compute_fn=lambda context, deps: NodeOutput(
                     payload=validate_regime(
@@ -1663,7 +3140,9 @@ def build_regime_validation_graph(*, instrument: str, timeframe: str) -> GraphMa
                     "regime_research_context",
                 ),
                 output_artifacts=("html",),
-                cache_policy=CachePolicy(materialize=True, artifact_kind="report"),
+                fingerprint_fn=chart_runtime_config_fingerprint,
+                cache_policy=materialized_report_policy,
+                config=_source_hash_config(validate_regime),
                 validation_policy=ValidationPolicy(level="report"),
                 mutable_scope=MutableScope(scope="immutable"),
                 compute_fn=lambda context, deps: (
@@ -1721,7 +3200,8 @@ def build_regime_validation_graph(*, instrument: str, timeframe: str) -> GraphMa
                 inputs=(),
                 upstream_nodes=("regime_summary", "regime_main_chart"),
                 output_artifacts=("payload",),
-                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                fingerprint_fn=chart_runtime_config_fingerprint,
+                cache_policy=ephemeral_policy,
                 validation_policy=ValidationPolicy(level="graph_parity"),
                 compute_fn=lambda context, deps: NodeOutput(
                     payload={
@@ -1747,6 +3227,20 @@ def build_trend_state_validation_graph(
     from scripts import validate_trend_state as vt
 
     graph_name = "validate_trend_state"
+    no_runtime_config_fingerprint = _runtime_config_fingerprint()
+    summary_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "plot_rows", "full"
+    )
+    chart_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "html", "plot_rows", "full", "out_dir"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    materialized_report_policy = _node_cache_policy(
+        materialize=True, artifact_kind="report"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
     nodes = [
         _source_node(graph_name, "raw_input", "raw_input"),
         NodeManifest(
@@ -1757,6 +3251,11 @@ def build_trend_state_validation_graph(
             inputs=(),
             upstream_nodes=("raw_input",),
             output_artifacts=("frame",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(
+                vt._load_canonical_live_context, vt._build_trend_state_context
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=lambda context, deps: NodeOutput(
                 frames={
@@ -1785,6 +3284,11 @@ def build_trend_state_validation_graph(
             inputs=(),
             upstream_nodes=("raw_input",),
             output_artifacts=("frame",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(
+                vt._load_canonical_live_context, vt._build_context
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=lambda context, deps: NodeOutput(
                 frames={
@@ -1811,7 +3315,9 @@ def build_trend_state_validation_graph(
             inputs=(),
             upstream_nodes=("trend_state_context",),
             output_artifacts=("payload",),
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+            fingerprint_fn=summary_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
+            config=_source_hash_config(validate_trend_state),
             validation_policy=ValidationPolicy(level="graph_parity"),
             compute_fn=lambda context, deps: NodeOutput(
                 payload=validate_trend_state(
@@ -1837,7 +3343,9 @@ def build_trend_state_validation_graph(
             inputs=(),
             upstream_nodes=("trend_state_summary", "trend_state_context"),
             output_artifacts=("html",),
-            cache_policy=CachePolicy(materialize=True, artifact_kind="report"),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=materialized_report_policy,
+            config=_source_hash_config(validate_trend_state),
             validation_policy=ValidationPolicy(level="report"),
             mutable_scope=MutableScope(scope="immutable"),
             compute_fn=lambda context, deps: (
@@ -1887,7 +3395,8 @@ def build_trend_state_validation_graph(
             inputs=(),
             upstream_nodes=("trend_state_summary", "trend_state_main_chart"),
             output_artifacts=("payload",),
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
             validation_policy=ValidationPolicy(level="graph_parity"),
             compute_fn=lambda context, deps: NodeOutput(
                 payload={
@@ -1910,8 +3419,57 @@ def build_sr_levels_validation_graph(
     *, instrument: str, timeframe: str
 ) -> GraphManifest:
     from scripts import validate_sr_levels as vsr
+    from src.indicators._helpers.schema import normalize_candle_schema
+    from src.indicators.foundation.session import add_session_features
+    from src.indicators.foundation.sr_levels import (
+        add_sr_research_columns,
+        build_sr_level_registry,
+        build_sr_touch_audit_table,
+        deserialize_sr_registry,
+        project_sr_context,
+        serialize_sr_registry,
+        update_sr_lifecycle,
+    )
+    from src.indicators.foundation.value import add_prev_day_hl, add_prev_week_hl
+    from src.indicators.foundation.volatility import add_atr
+    from src.indicators.foundation.volume_profile import add_volume_profile
+    from src.indicators.smc.equal_hl import add_equal_hl
+    from src.indicators.structure.swings import add_swings
 
     graph_name = "validate_sr_levels"
+    no_runtime_config_fingerprint = _runtime_config_fingerprint()
+    chart_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "html", "out_dir", "date_from", "plot_label"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    materialized_report_policy = _node_cache_policy(
+        materialize=True, artifact_kind="report"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
+
+    def _build_projected_output(deps: dict[str, Any]) -> NodeOutput:
+        enriched = deps["sr_enriched_context"].primary_frame()
+        registry = build_sr_level_registry(enriched)
+        ctx = update_sr_lifecycle(enriched, registry)
+        projected = pd.concat(
+            [enriched.copy(), pd.DataFrame(ctx, index=enriched.index)], axis=1
+        )
+        audit = build_sr_touch_audit_table(projected, registry)
+        registry_serialized = serialize_sr_registry(registry)
+        return NodeOutput(
+            frames={"frame": projected, "audit": audit},
+            payload={"registry_serialized": registry_serialized},
+        )
+
+    def _registry_from_deps(deps: dict[str, Any]) -> dict:
+        payload = deps["sr_projected_context"].output.payload
+        return deserialize_sr_registry(payload["registry_serialized"])
+
+    def _audit_from_deps(deps: dict[str, Any]) -> pd.DataFrame:
+        return deps["sr_projected_context"].output.frames["audit"]
+
     nodes = [
         _source_node(graph_name, "raw_input", "raw_input"),
         NodeManifest(
@@ -1922,37 +3480,31 @@ def build_sr_levels_validation_graph(
             inputs=(),
             upstream_nodes=("raw_input",),
             output_artifacts=("frame",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(
+                normalize_candle_schema,
+                add_atr,
+                add_swings,
+                add_equal_hl,
+                add_prev_day_hl,
+                add_prev_week_hl,
+                add_session_features,
+                add_volume_profile,
+            ),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=lambda context, deps: NodeOutput(
                 frames={
                     "frame": deps["raw_input"]
                     .primary_frame()
-                    .pipe(vsr.normalize_candle_schema, require_volume=True)
-                    .pipe(vsr.add_atr)
-                    .pipe(vsr.add_swings)
-                    .pipe(vsr.add_equal_hl)
-                    .pipe(vsr.add_prev_day_hl)
-                    .pipe(vsr.add_prev_week_hl)
-                    .pipe(vsr.add_session_features)
-                    .pipe(vsr.add_volume_profile)
-                }
-            ),
-        ),
-        NodeManifest(
-            graph_name=graph_name,
-            node_name="sr_registry",
-            node_kind="compute",
-            semantic_class="B",
-            inputs=(),
-            upstream_nodes=("sr_enriched_context",),
-            output_artifacts=("payload",),
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
-            validation_policy=ValidationPolicy(level="node_parity"),
-            compute_fn=lambda context, deps: NodeOutput(
-                payload={
-                    "registry": vsr.build_sr_level_registry(
-                        deps["sr_enriched_context"].primary_frame()
-                    )
+                    .pipe(normalize_candle_schema, require_volume=True)
+                    .pipe(add_atr)
+                    .pipe(add_swings)
+                    .pipe(add_equal_hl)
+                    .pipe(add_prev_day_hl)
+                    .pipe(add_prev_week_hl)
+                    .pipe(add_session_features)
+                    .pipe(add_volume_profile)
                 }
             ),
         ),
@@ -1962,14 +3514,38 @@ def build_sr_levels_validation_graph(
             node_kind="compute",
             semantic_class="B",
             inputs=(),
-            upstream_nodes=("sr_enriched_context", "sr_registry"),
+            upstream_nodes=("sr_enriched_context",),
+            output_artifacts=("frame", "audit"),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(
+                build_sr_level_registry,
+                update_sr_lifecycle,
+                project_sr_context,
+                build_sr_touch_audit_table,
+                serialize_sr_registry,
+            ),
+            validation_policy=ValidationPolicy(level="node_parity"),
+            compute_fn=lambda context, deps: _build_projected_output(deps),
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="sr_research_context",
+            node_kind="compute",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("sr_projected_context",),
             output_artifacts=("frame",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(add_sr_research_columns),
             validation_policy=ValidationPolicy(level="node_parity"),
             compute_fn=lambda context, deps: NodeOutput(
                 frames={
-                    "frame": vsr.project_sr_context(
-                        deps["sr_enriched_context"].primary_frame().copy(),
-                        deps["sr_registry"].output.payload["registry"],
+                    "frame": add_sr_research_columns(
+                        deps["sr_projected_context"].primary_frame().copy(),
+                        _registry_from_deps(deps),
+                        touch_rows=_audit_from_deps(deps),
                     )
                 }
             ),
@@ -1980,16 +3556,19 @@ def build_sr_levels_validation_graph(
             node_kind="aggregate",
             semantic_class="C",
             inputs=(),
-            upstream_nodes=("sr_projected_context", "sr_registry"),
+            upstream_nodes=("sr_projected_context", "sr_research_context"),
             output_artifacts=("payload",),
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
+            config=_source_hash_config(summarize_sr_levels),
             validation_policy=ValidationPolicy(level="graph_parity"),
             compute_fn=lambda context, deps: NodeOutput(
                 payload={
                     "summary": summarize_sr_levels(
-                        deps["sr_projected_context"].primary_frame(),
-                        deps["sr_registry"].output.payload["registry"],
+                        deps["sr_research_context"].primary_frame(),
+                        _registry_from_deps(deps),
                         live_df=deps["sr_projected_context"].primary_frame(),
+                        touch_rows=_audit_from_deps(deps),
                     )
                 }
             ),
@@ -2003,10 +3582,34 @@ def build_sr_levels_validation_graph(
             upstream_nodes=(
                 "sr_enriched_context",
                 "sr_projected_context",
-                "sr_registry",
             ),
             output_artifacts=("html",),
-            cache_policy=CachePolicy(materialize=True, artifact_kind="report"),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=materialized_report_policy,
+            config={
+                **_source_hash_config(
+                    vsr._build_sr_chart,
+                    vsr._is_structural_zone,
+                    vsr._select_visible_zones,
+                    vsr._zone_lifecycle_bounds,
+                    vsr._add_zone_lifecycle_shapes,
+                    vsr._add_zone_terminal_markers,
+                    vsr._add_zone_touch_markers,
+                    vsr._add_primary_zone_band,
+                    vsr._zone_rect_color,
+                    vsr._terminal_label,
+                    save_figure_html,
+                ),
+                # Module-level tuning knobs that don't live in any function
+                # body — embed them so changing the constant invalidates the
+                # cached chart on the next run.
+                "structural_score_min": float(vsr._STRUCTURAL_SCORE_MIN),
+                "structural_min_touches": int(vsr._STRUCTURAL_MIN_TOUCHES),
+                "structural_high_info_families": sorted(
+                    vsr._STRUCTURAL_HIGH_INFO_FAMILIES
+                ),
+                "zone_render_budget_per_side": int(vsr._ZONE_RENDER_BUDGET_PER_SIDE),
+            },
             validation_policy=ValidationPolicy(level="report"),
             mutable_scope=MutableScope(scope="immutable"),
             compute_fn=lambda context, deps: (
@@ -2019,15 +3622,25 @@ def build_sr_levels_validation_graph(
                                 vsr._build_sr_chart(
                                     deps["sr_enriched_context"].primary_frame(),
                                     deps["sr_projected_context"].primary_frame(),
-                                    deps["sr_registry"].output.payload["registry"],
-                                    title=f"S/R Levels — {instrument} {timeframe}  |  {vsr.DATE_FROM} → end",
+                                    _registry_from_deps(deps),
+                                    title=(
+                                        f"S/R Levels — {instrument} {timeframe}  |  "
+                                        f"{context.config.get('plot_label', vsr.DATE_FROM + ' -> end')}"
+                                    ),
+                                    date_from=context.config.get(
+                                        "date_from", vsr.DATE_FROM
+                                    ),
+                                    audit=_audit_from_deps(deps),
                                 ),
                                 Path(
                                     context.config.get(
                                         "out_dir", "notebooks/foundation"
                                     )
                                 )
-                                / f"sr_levels_validation_{instrument}_{timeframe}.html",
+                                / (
+                                    f"sr_levels_validation_{instrument}_{timeframe}"
+                                    f"{context.config.get('plot_suffix', '')}.html"
+                                ),
                             )
                         )
                     },
@@ -2035,7 +3648,10 @@ def build_sr_levels_validation_graph(
                         "html": Path(
                             context.config.get("out_dir", "notebooks/foundation")
                         )
-                        / f"sr_levels_validation_{instrument}_{timeframe}.html"
+                        / (
+                            f"sr_levels_validation_{instrument}_{timeframe}"
+                            f"{context.config.get('plot_suffix', '')}.html"
+                        )
                     },
                 )
             ),
@@ -2048,7 +3664,8 @@ def build_sr_levels_validation_graph(
             inputs=(),
             upstream_nodes=("sr_summary", "sr_main_chart", "sr_projected_context"),
             output_artifacts=("payload",),
-            cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
             validation_policy=ValidationPolicy(level="graph_parity"),
             compute_fn=lambda context, deps: NodeOutput(
                 payload={
@@ -2064,12 +3681,665 @@ def build_sr_levels_validation_graph(
     )
 
 
+def build_structure_context_validation_graph(
+    *, instrument: str, timeframe: str
+) -> GraphManifest:
+    from scripts import validate_structure_context as vsc
+    from src.validation.indicators.structure_context import (
+        plot_structure_context_validation,
+        summarize_structure_context,
+    )
+
+    graph_name = "validate_structure_context"
+    no_runtime_config_fingerprint = _runtime_config_fingerprint()
+    summary_runtime_config_fingerprint = _runtime_config_fingerprint("plot_start")
+    chart_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "html", "plot_start", "out_dir"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    materialized_report_policy = _node_cache_policy(
+        materialize=True, artifact_kind="report"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
+
+    def _plot_start(context: GraphRunContext) -> pd.Timestamp:
+        value = context.config.get("plot_start", str(vsc.PLOT_START))
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    nodes = [
+        _source_node(graph_name, "raw_input", "raw_input"),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="structure_context_frame",
+            node_kind="compute",
+            semantic_class="B",
+            inputs=(),
+            upstream_nodes=("raw_input",),
+            output_artifacts=("frame",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(vsc._build_context),
+            validation_policy=ValidationPolicy(level="node_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                frames={"frame": vsc._build_context(deps["raw_input"].primary_frame())}
+            ),
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="structure_context_view",
+            node_kind="aggregate",
+            semantic_class="B",
+            inputs=(),
+            upstream_nodes=("structure_context_frame",),
+            output_artifacts=("frame",),
+            fingerprint_fn=summary_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
+            validation_policy=ValidationPolicy(level="node_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                frames={
+                    "frame": deps["structure_context_frame"]
+                    .primary_frame()
+                    .loc[
+                        pd.to_datetime(
+                            deps["structure_context_frame"].primary_frame()[
+                                "timestamp"
+                            ],
+                            utc=True,
+                            errors="coerce",
+                        )
+                        >= _plot_start(context)
+                    ]
+                    .copy()
+                    .reset_index(drop=True)
+                }
+            ),
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="structure_context_summary",
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("structure_context_view",),
+            output_artifacts=("payload",),
+            fingerprint_fn=summary_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
+            config=_source_hash_config(summarize_structure_context),
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                payload={
+                    "summary": summarize_structure_context(
+                        deps["structure_context_view"].primary_frame()
+                    )
+                }
+            ),
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="structure_context_chart",
+            node_kind="report",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("structure_context_view",),
+            output_artifacts=("html",),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=materialized_report_policy,
+            config=_source_hash_config(plot_structure_context_validation),
+            validation_policy=ValidationPolicy(level="report"),
+            mutable_scope=MutableScope(scope="immutable"),
+            compute_fn=lambda context, deps: (
+                NodeOutput(payload={"html_path": None})
+                if not context.config.get("html", True)
+                else NodeOutput(
+                    payload={
+                        "html_path": str(
+                            plot_structure_context_validation(
+                                deps["structure_context_view"].primary_frame(),
+                                outpath=Path(context.config.get("out_dir", vsc.OUT_DIR))
+                                / f"structure_context_{instrument}_{timeframe}.html",
+                                title=(
+                                    "Structure Context Validation "
+                                    f"- {instrument} {timeframe}"
+                                ),
+                            )
+                        )
+                    },
+                    artifacts={
+                        "html": Path(context.config.get("out_dir", vsc.OUT_DIR))
+                        / f"structure_context_{instrument}_{timeframe}.html"
+                    },
+                )
+            ),
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="structure_context_validation_bundle",
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("structure_context_summary", "structure_context_chart"),
+            output_artifacts=("payload",),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                payload={
+                    "summary": deps["structure_context_summary"].output.payload[
+                        "summary"
+                    ],
+                    "html_path": deps["structure_context_chart"].output.payload.get(
+                        "html_path"
+                    ),
+                }
+            ),
+        ),
+    ]
+    return GraphManifest(
+        graph_name=graph_name,
+        nodes=tuple(nodes),
+        default_target="structure_context_validation_bundle",
+    )
+
+
+def build_swings_validation_graph(*, instrument: str, timeframe: str) -> GraphManifest:
+    from scripts import validate_swings as vsw
+    from src.validation.indicators.swings import (
+        plot_swings_validation,
+        summarize_swings,
+        swing_event_windows,
+    )
+
+    graph_name = "validate_swings"
+    no_runtime_config_fingerprint = _runtime_config_fingerprint()
+    summary_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "n_windows", "start_ts", "end_ts"
+    )
+    chart_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "html", "start_ts", "end_ts", "out_dir"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    materialized_report_policy = _node_cache_policy(
+        materialize=True, artifact_kind="report"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
+    nodes = [
+        _source_node(graph_name, "raw_input", "raw_input"),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="swings_context_frame",
+            node_kind="compute",
+            semantic_class="B",
+            inputs=(),
+            upstream_nodes=("raw_input",),
+            output_artifacts=("frame",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config=_source_hash_config(vsw._build_context),
+            validation_policy=ValidationPolicy(level="node_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                frames={"frame": vsw._build_context(deps["raw_input"].primary_frame())}
+            ),
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="swings_summary",
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("swings_context_frame",),
+            output_artifacts=("payload",),
+            fingerprint_fn=summary_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
+            config=_source_hash_config(summarize_swings, swing_event_windows),
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                payload={
+                    "summary": summarize_swings(
+                        deps["swings_context_frame"].primary_frame()
+                    ),
+                    "high_windows": swing_event_windows(
+                        deps["swings_context_frame"].primary_frame(),
+                        side="high",
+                        limit=int(context.config.get("n_windows", 3)),
+                    ),
+                    "low_windows": swing_event_windows(
+                        deps["swings_context_frame"].primary_frame(),
+                        side="low",
+                        limit=int(context.config.get("n_windows", 3)),
+                    ),
+                }
+            ),
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="swings_chart",
+            node_kind="report",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("swings_context_frame",),
+            output_artifacts=("html",),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=materialized_report_policy,
+            config=_source_hash_config(plot_swings_validation),
+            validation_policy=ValidationPolicy(level="report"),
+            mutable_scope=MutableScope(scope="immutable"),
+            compute_fn=lambda context, deps: (
+                NodeOutput(payload={"html_path": None})
+                if not context.config.get("html", True)
+                else NodeOutput(
+                    payload={
+                        "html_path": str(
+                            plot_swings_validation(
+                                deps["swings_context_frame"].primary_frame(),
+                                outpath=Path(context.config.get("out_dir", vsw.OUT_DIR))
+                                / f"swings_validation_{instrument}_{timeframe}.html",
+                                title=(f"Swings Validation - {instrument} {timeframe}"),
+                                start_ts=context.config.get("start_ts", "2026-01-01"),
+                                end_ts=context.config.get("end_ts", "2026-03-15"),
+                            )
+                        )
+                    },
+                    artifacts={
+                        "html": Path(context.config.get("out_dir", vsw.OUT_DIR))
+                        / f"swings_validation_{instrument}_{timeframe}.html"
+                    },
+                )
+            ),
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="swings_validation_bundle",
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("swings_summary", "swings_chart"),
+            output_artifacts=("payload",),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                payload={
+                    "summary": deps["swings_summary"].output.payload["summary"],
+                    "high_windows": deps["swings_summary"].output.payload[
+                        "high_windows"
+                    ],
+                    "low_windows": deps["swings_summary"].output.payload["low_windows"],
+                    "html_path": deps["swings_chart"].output.payload.get("html_path"),
+                }
+            ),
+        ),
+    ]
+    return GraphManifest(
+        graph_name=graph_name,
+        nodes=tuple(nodes),
+        default_target="swings_validation_bundle",
+    )
+
+
+def build_ob_validation_graph(*, instrument: str, timeframe: str) -> GraphManifest:
+    from scripts import validate_ob as vob
+    from src.validation.indicators.ob import (
+        _plot_endpoint_inventory_validation_html,
+        _plot_equivalence_casebook_overlay_html,
+        _plot_monitorability_series_html,
+        build_ob_diagnostic_package,
+        ob_event_windows,
+        plot_ob_validation,
+        summarize_ob,
+    )
+
+    graph_name = "validate_ob"
+    no_runtime_config_fingerprint = _runtime_config_fingerprint()
+    artifact_runtime_config_fingerprint = _runtime_config_fingerprint("out_dir", "html")
+    chart_runtime_config_fingerprint = _runtime_config_fingerprint(
+        "html", "out_dir", "plot_start"
+    )
+    materialized_frame_policy = _node_cache_policy(
+        materialize=True, artifact_kind="frame"
+    )
+    materialized_bundle_policy = _node_cache_policy(
+        materialize=True, artifact_kind="bundle"
+    )
+    materialized_report_policy = _node_cache_policy(
+        materialize=True, artifact_kind="report"
+    )
+    ephemeral_policy = _node_cache_policy(materialize=False, artifact_kind="ephemeral")
+
+    def _ob_context_compute(
+        _context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        return NodeOutput(
+            frames={
+                "frame": vob._build_context(deps["raw_input"].primary_frame().copy())
+            }
+        )
+
+    def _ob_summary_compute(
+        _context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        df = deps["ob_context"].primary_frame()
+        diagnostics = build_ob_diagnostic_package(
+            df,
+            instrument=instrument,
+            timeframe=timeframe,
+        )
+        bull_windows = ob_event_windows(df, side="bull", limit=5)
+        bear_windows = ob_event_windows(df, side="bear", limit=5)
+        frames = {
+            "bos_coverage_audit": diagnostics["bos_coverage_audit"],
+            "event_audit": diagnostics["event_audit"],
+            "monitorability_timeseries": diagnostics["monitorability_timeseries"],
+            "inventory_timeseries": diagnostics["inventory_timeseries"],
+            "distance_band_audit": diagnostics["distance_band_audit"],
+            "live_vs_nonlive_casebook": diagnostics["live_vs_nonlive_casebook"],
+            "execution_comparison": diagnostics["execution_comparison"],
+            "accepted": diagnostics["accepted"],
+        }
+        for idx, window in enumerate(bull_windows):
+            frames[f"bull_window_{idx}"] = window
+        for idx, window in enumerate(bear_windows):
+            frames[f"bear_window_{idx}"] = window
+        return NodeOutput(
+            frames=frames,
+            payload={
+                "summary": diagnostics["summary"],
+                "coverage_summary": diagnostics["coverage_summary"],
+                "inventory_summary": diagnostics["inventory_summary"],
+                "equivalence_summary": diagnostics["equivalence_summary"],
+                "execution_summary": diagnostics["execution_summary"],
+                "redundancy_summary": diagnostics["redundancy_summary"],
+                "canonical_contract_memo": diagnostics["canonical_contract_memo"],
+                "redundancy_diagnostic_memo": diagnostics["redundancy_diagnostic_memo"],
+                "decision_memo": diagnostics["decision_memo"],
+                "bull_window_count": len(bull_windows),
+                "bear_window_count": len(bear_windows),
+            },
+        )
+
+    def _ob_artifacts_compute(
+        context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        out_dir = Path(context.config.get("out_dir", "notebooks/smc"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        suffix = f"{instrument}_{timeframe}"
+        summary_output = deps["ob_summary_bundle"].output
+        context_df = deps["ob_context"].primary_frame()
+        artifact_frames = {
+            f"ob_bos_coverage_audit_{suffix}.csv": summary_output.frames[
+                "bos_coverage_audit"
+            ],
+            f"ob_inventory_timeseries_{suffix}.csv": summary_output.frames[
+                "inventory_timeseries"
+            ],
+            f"ob_monitorability_timeseries_{suffix}.csv": summary_output.frames[
+                "monitorability_timeseries"
+            ],
+            f"ob_distance_band_audit_{suffix}.csv": summary_output.frames[
+                "distance_band_audit"
+            ],
+            f"ob_live_vs_nonlive_casebook_{suffix}.csv": summary_output.frames[
+                "live_vs_nonlive_casebook"
+            ],
+            f"ob_bos_vs_ob_execution_comparison_{suffix}.csv": summary_output.frames[
+                "execution_comparison"
+            ],
+        }
+        artifacts: dict[str, Path] = {}
+        for filename, frame in artifact_frames.items():
+            artifacts[filename] = write_csv_atomic(frame, out_dir / filename)
+        contract_name = f"ob_canonical_contract_memo_{suffix}.md"
+        artifacts[contract_name] = write_text_atomic(
+            summary_output.payload["canonical_contract_memo"], out_dir / contract_name
+        )
+        redundancy_name = f"ob_redundancy_diagnostic_{suffix}.md"
+        artifacts[redundancy_name] = write_text_atomic(
+            summary_output.payload["redundancy_diagnostic_memo"],
+            out_dir / redundancy_name,
+        )
+        decision_name = f"ob_canonical_decision_memo_{suffix}.md"
+        artifacts[decision_name] = write_text_atomic(
+            summary_output.payload["decision_memo"], out_dir / decision_name
+        )
+        if context.config.get("html", False):
+            monitorability_html = _plot_monitorability_series_html(
+                summary_output.frames["inventory_timeseries"],
+                outpath=out_dir / f"ob_monitorability_timeseries_{suffix}.html",
+                title=f"OB Monitorability Over Time — {instrument} {timeframe}",
+                y_columns=[
+                    "top_active_distance_atr",
+                    "top_fresh_distance_atr",
+                    "raw_active_count",
+                    "raw_fresh_count",
+                ],
+            )
+            artifacts[monitorability_html.name] = monitorability_html
+            casebook_html = _plot_equivalence_casebook_overlay_html(
+                context_df,
+                reference=summary_output.frames["live_vs_nonlive_casebook"],
+                accepted=summary_output.frames["accepted"],
+                outpath=out_dir / f"ob_live_vs_nonlive_casebook_{suffix}.html",
+                title=f"OB Live vs Nonlive Casebook — {instrument} {timeframe}",
+            )
+            artifacts[casebook_html.name] = casebook_html
+            inventory_html = _plot_endpoint_inventory_validation_html(
+                context_df,
+                inventory_df=summary_output.frames["inventory_timeseries"],
+                accepted=summary_output.frames["accepted"],
+                outpath=out_dir / f"ob_validation_inventory_canonical_{suffix}.html",
+                title=f"OB Validation Inventory Canonical — {instrument} {timeframe}",
+            )
+            artifacts[inventory_html.name] = inventory_html
+        artifact_paths = {name: str(path) for name, path in artifacts.items()}
+        return NodeOutput(
+            payload={"artifact_paths": artifact_paths}, artifacts=artifacts
+        )
+
+    def _ob_chart_compute(
+        context: GraphRunContext, deps: dict[str, NodeExecutionResult]
+    ) -> NodeOutput:
+        if not context.config.get("html", False):
+            return NodeOutput(payload={"html_path": None})
+        df = deps["ob_context"].primary_frame()
+        plot_start = pd.Timestamp(
+            context.config.get("plot_start", str(vob.PLOT_START)), tz="UTC"
+        )
+        plot_end = pd.to_datetime(df["timestamp"], utc=True).max()
+        plot_df = (
+            df[pd.to_datetime(df["timestamp"], utc=True) >= plot_start]
+            .copy()
+            .reset_index(drop=True)
+        )
+        if plot_df.empty:
+            raise ValueError(
+                f"No {instrument} {timeframe} rows found for validation window starting {plot_start}."
+            )
+        title = (
+            f"Order Blocks Validation — {instrument} {timeframe} "
+            f"(swing w={vob.SWING_WINDOW}, ret={vob.SWING_RETRACE}, confirm={vob.SWING_CONFIRM_BARS}) "
+            f"({plot_start.date()} to {plot_end.date()})"
+        )
+        outpath = (
+            Path(context.config.get("out_dir", "notebooks/smc"))
+            / f"ob_validation_{instrument}_{timeframe}.html"
+        )
+        html_path = plot_ob_validation(plot_df, outpath=outpath, title=title)
+        return NodeOutput(
+            payload={"html_path": str(html_path)},
+            artifacts={"html": outpath},
+        )
+
+    nodes = [
+        _source_node(graph_name, "raw_input", "raw_input"),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="ob_context",
+            node_kind="compute",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("raw_input",),
+            output_artifacts=("frame",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_frame_policy,
+            config={
+                **_source_hash_config(
+                    vob._build_context,
+                    vob.normalize_candle_schema,
+                    vob.add_atr,
+                    vob.add_swings,
+                    vob.add_trend_state,
+                    vob.add_bos,
+                    vob.add_choch,
+                    vob.add_displacement_candle,
+                    vob.add_ob,
+                    vob.add_ob_mitigation,
+                ),
+                "swing_window": int(vob.SWING_WINDOW),
+                "swing_retrace": float(vob.SWING_RETRACE),
+                "swing_confirm_bars": int(vob.SWING_CONFIRM_BARS),
+                "ob_validation_context_contract": 1,
+            },
+            validation_policy=ValidationPolicy(level="node_parity"),
+            compute_fn=_ob_context_compute,
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="ob_summary_bundle",
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("ob_context",),
+            output_artifacts=("payload",),
+            fingerprint_fn=no_runtime_config_fingerprint,
+            cache_policy=materialized_bundle_policy,
+            config={
+                **_source_hash_config(
+                    summarize_ob,
+                    ob_event_windows,
+                    build_ob_diagnostic_package,
+                ),
+                "n_windows": 5,
+                "ob_validation_summary_contract": 6,
+            },
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=_ob_summary_compute,
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="ob_artifact_bundle",
+            node_kind="report",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("ob_context", "ob_summary_bundle"),
+            output_artifacts=("artifacts",),
+            fingerprint_fn=artifact_runtime_config_fingerprint,
+            cache_policy=materialized_report_policy,
+            config={
+                **_source_hash_config(
+                    write_csv_atomic,
+                    write_text_atomic,
+                    _plot_monitorability_series_html,
+                    _plot_equivalence_casebook_overlay_html,
+                    _plot_endpoint_inventory_validation_html,
+                ),
+                "ob_validation_artifact_contract": 6,
+            },
+            validation_policy=ValidationPolicy(level="report"),
+            mutable_scope=MutableScope(scope="immutable"),
+            compute_fn=_ob_artifacts_compute,
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="ob_main_chart",
+            node_kind="report",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=("ob_context",),
+            output_artifacts=("html",),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=materialized_report_policy,
+            config={
+                **_source_hash_config(plot_ob_validation),
+                "swing_window": int(vob.SWING_WINDOW),
+                "swing_retrace": float(vob.SWING_RETRACE),
+                "swing_confirm_bars": int(vob.SWING_CONFIRM_BARS),
+                "ob_validation_chart_contract": 1,
+            },
+            validation_policy=ValidationPolicy(level="report"),
+            mutable_scope=MutableScope(scope="immutable"),
+            compute_fn=_ob_chart_compute,
+        ),
+        NodeManifest(
+            graph_name=graph_name,
+            node_name="ob_validation_bundle",
+            node_kind="aggregate",
+            semantic_class="C",
+            inputs=(),
+            upstream_nodes=(
+                "ob_context",
+                "ob_summary_bundle",
+                "ob_artifact_bundle",
+                "ob_main_chart",
+            ),
+            output_artifacts=("payload",),
+            fingerprint_fn=chart_runtime_config_fingerprint,
+            cache_policy=ephemeral_policy,
+            validation_policy=ValidationPolicy(level="graph_parity"),
+            compute_fn=lambda context, deps: NodeOutput(
+                frames=dict(deps["ob_summary_bundle"].output.frames),
+                payload={
+                    "summary": deps["ob_summary_bundle"].output.payload["summary"],
+                    "coverage_summary": deps["ob_summary_bundle"].output.payload[
+                        "coverage_summary"
+                    ],
+                    "inventory_summary": deps["ob_summary_bundle"].output.payload[
+                        "inventory_summary"
+                    ],
+                    "equivalence_summary": deps["ob_summary_bundle"].output.payload[
+                        "equivalence_summary"
+                    ],
+                    "execution_summary": deps["ob_summary_bundle"].output.payload[
+                        "execution_summary"
+                    ],
+                    "redundancy_summary": deps["ob_summary_bundle"].output.payload[
+                        "redundancy_summary"
+                    ],
+                    "bull_window_count": deps["ob_summary_bundle"].output.payload[
+                        "bull_window_count"
+                    ],
+                    "bear_window_count": deps["ob_summary_bundle"].output.payload[
+                        "bear_window_count"
+                    ],
+                    "artifact_paths": deps["ob_artifact_bundle"].output.payload[
+                        "artifact_paths"
+                    ],
+                    "html_path": deps["ob_main_chart"].output.payload.get("html_path"),
+                    "row_count": int(len(deps["ob_context"].primary_frame())),
+                },
+            ),
+        ),
+    ]
+    return GraphManifest(
+        graph_name=graph_name,
+        nodes=tuple(nodes),
+        default_target="ob_validation_bundle",
+    )
+
+
 def get_builtin_graph(graph_name: str, **kwargs: Any) -> GraphManifest:
     if graph_name == "live_pipeline":
         return build_live_stage_graph(
             instrument=kwargs.get("instrument", "XAU_USD"),
             swing_window=int(kwargs.get("swing_window", 6)),
             include_vp=bool(kwargs.get("include_vp", True)),
+            timeframe=kwargs.get("timeframe", "H4"),
+            include_cross_asset=bool(kwargs.get("include_cross_asset", False)),
         )
     if graph_name == "research_pipeline":
         return build_research_stage_graph(
@@ -2077,6 +4347,8 @@ def get_builtin_graph(graph_name: str, **kwargs: Any) -> GraphManifest:
             swing_window=int(kwargs.get("swing_window", 6)),
             include_vp=bool(kwargs.get("include_vp", True)),
             include_avwap=bool(kwargs.get("include_avwap", False)),
+            timeframe=kwargs.get("timeframe", "H4"),
+            include_cross_asset=bool(kwargs.get("include_cross_asset", False)),
         )
     if graph_name == "validate_range_boundaries":
         return build_range_boundaries_graph(
@@ -2095,6 +4367,21 @@ def get_builtin_graph(graph_name: str, **kwargs: Any) -> GraphManifest:
         )
     if graph_name == "validate_sr_levels":
         return build_sr_levels_validation_graph(
+            instrument=kwargs.get("instrument", "XAU_USD"),
+            timeframe=kwargs.get("timeframe", "H4"),
+        )
+    if graph_name == "validate_structure_context":
+        return build_structure_context_validation_graph(
+            instrument=kwargs.get("instrument", "XAU_USD"),
+            timeframe=kwargs.get("timeframe", "H4"),
+        )
+    if graph_name == "validate_swings":
+        return build_swings_validation_graph(
+            instrument=kwargs.get("instrument", "XAU_USD"),
+            timeframe=kwargs.get("timeframe", "H4"),
+        )
+    if graph_name == "validate_ob":
+        return build_ob_validation_graph(
             instrument=kwargs.get("instrument", "XAU_USD"),
             timeframe=kwargs.get("timeframe", "H4"),
         )

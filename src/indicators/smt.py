@@ -253,6 +253,11 @@ def add_smt_divergence(
     last_partner_high: _SwingEvent | None = None
     prev_partner_high: _SwingEvent | None = None
 
+    # Track which swing-pair has already fired to prevent the same structural
+    # divergence from being flagged on multiple consecutive bars.
+    last_bull_pair: tuple[int, int, int, int] | None = None
+    last_bear_pair: tuple[int, int, int, int] | None = None
+
     for i in range(n):
         if i in primary_low_events:
             prev_primary_low = last_primary_low
@@ -315,6 +320,32 @@ def add_smt_divergence(
             and (high_rel_primary == 1) != (high_rel_partner == 1)
         )
 
+        # Deduplicate: only fire on the first bar where a new swing-pair
+        # divergence is detected.  The tuple identifies the four origin
+        # indices that define the structural comparison.
+        if bullish_ready:
+            bull_pair = (
+                prev_primary_low.origin_idx,
+                last_primary_low.origin_idx,
+                prev_partner_low.origin_idx,
+                last_partner_low.origin_idx,
+            )
+            if bull_pair == last_bull_pair:
+                bullish_ready = False
+            else:
+                last_bull_pair = bull_pair
+        if bearish_ready:
+            bear_pair = (
+                prev_primary_high.origin_idx,
+                last_primary_high.origin_idx,
+                prev_partner_high.origin_idx,
+                last_partner_high.origin_idx,
+            )
+            if bear_pair == last_bear_pair:
+                bearish_ready = False
+            else:
+                last_bear_pair = bear_pair
+
         if bullish_ready and not bearish_ready:
             gap = abs(last_primary_low.detect_idx - last_partner_low.detect_idx)
             bull_flag[i] = 1
@@ -328,9 +359,9 @@ def add_smt_divergence(
             partner_side_atr[i] = _row_atr(df_correlated, last_partner_low.origin_idx)
             score[i] = float(
                 np.clip(
-                    0.45
-                    + 0.30 * _freshness_score(gap, max_gap=confirm_window)
-                    + 0.25
+                    0.20
+                    + 0.40 * _freshness_score(gap, max_gap=confirm_window)
+                    + 0.40
                     * _strength_score(
                         last_primary_low.strength,
                         last_partner_low.strength,
@@ -352,9 +383,9 @@ def add_smt_divergence(
             partner_side_atr[i] = _row_atr(df_correlated, last_partner_high.origin_idx)
             score[i] = float(
                 np.clip(
-                    0.45
-                    + 0.30 * _freshness_score(gap, max_gap=confirm_window)
-                    + 0.25
+                    0.20
+                    + 0.40 * _freshness_score(gap, max_gap=confirm_window)
+                    + 0.40
                     * _strength_score(
                         last_primary_high.strength,
                         last_partner_high.strength,

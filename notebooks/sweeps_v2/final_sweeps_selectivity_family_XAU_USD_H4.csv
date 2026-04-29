@@ -1,0 +1,13 @@
+family,displacement_confirmed_sweep,micro_interaction_sweep,standard_liquidity_sweep,tradeable_sweep_candidate
+equal_high,3,4,15,13
+equal_low,5,4,33,10
+previous_day_high,61,83,169,103
+previous_day_low,55,70,171,94
+previous_week_high,13,25,43,26
+previous_week_low,12,11,42,29
+resistance,43,65,114,42
+session_high,57,70,132,82
+session_low,86,72,181,108
+support,54,55,203,67
+swing_high,4,7,24,9
+swing_low,3,6,21,10

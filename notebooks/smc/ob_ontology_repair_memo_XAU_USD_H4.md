@@ -1,0 +1,26 @@
+# OB Ontology Repair Memo — XAU_USD H4
+
+## Source variants
+- `baseline_current_live`: current canonical baseline; geometry=`body_to_extreme`; tie-break=`latest`.
+- `source_repair_last_opposing_before_bos`: last opposing candle before parent BOS bar inside pre-break context; geometry=`body_to_extreme`; tie-break=`latest`.
+- `source_repair_last_opposing_before_displacement`: last opposing candle before the first qualifying displacement/activation bar; geometry=`body_to_extreme`; tie-break=`latest`.
+- `source_repair_last_meaningful_opposing_before_impulse`: last non-trivial opposing candle before the break impulse; geometry=`body_to_extreme`; tie-break=`latest`.
+- `source_repair_cluster_base_before_break`: tight contiguous pre-break base window with at least one opposing candle; geometry=`cluster_envelope`; tie-break=`latest`.
+- `source_repair_source_freeze_on_pre_break_context`: freeze earliest meaningful opposing source in the causal pre-break context; geometry=`body_to_extreme`; tie-break=`earliest_meaningful`.
+- `activation_repair_best_mild`: baseline source with wider causal activation window; geometry=`body_to_extreme`; tie-break=`latest`.
+- `composite_source_freeze_plus_activation_best`: pre-break source freeze plus best mild activation window; geometry=`body_to_extreme`; tie-break=`earliest_meaningful`.
+- `composite_cluster_base_plus_activation_best`: cluster base source plus best mild activation window; geometry=`cluster_envelope`; tie-break=`latest`.
+
+## Repair ranking
+```text
+                                        variant_label  ob_count  equivalence_recovery_fraction  exact_source_exact_geometry_fraction  fraction_bars_with_top_inventory_within_1atr  fraction_bars_with_top_inventory_within_2atr  median_distance_to_price_of_top_inventory  median_best_active_monitorability_score  false_positive_risk_proxy  passes_all_gates
+          composite_cluster_base_plus_activation_best       431                       0.111111                                   0.0                                      0.093657                                      0.207794                                   2.816892                                 0.514876                   0.260078             False
+         composite_source_freeze_plus_activation_best       431                       0.111111                                   0.0                                      0.089519                                      0.195747                                   2.851862                                 0.511873                   0.247812             False
+     source_repair_source_freeze_on_pre_break_context       398                       0.111111                                   0.0                                      0.080300                                      0.183385                                   2.855248                                 0.508926                   0.229830             False
+              source_repair_cluster_base_before_break       398                       0.111111                                   0.0                                      0.078728                                      0.185480                                   2.890553                                 0.510933                   0.237360             False
+source_repair_last_meaningful_opposing_before_impulse       398                       0.111111                                   0.0                                      0.076581                                      0.181918                                   2.975362                                 0.512555                   0.222724             False
+                          activation_repair_best_mild       431                       0.111111                                   0.0                                      0.072338                                      0.178618                                   3.049889                                 0.515452                   0.242499             False
+                                baseline_current_live       398                       0.111111                                   0.0                                      0.065214                                      0.166361                                   3.085613                                 0.510855                   0.224106             False
+               source_repair_last_opposing_before_bos       398                       0.111111                                   0.0                                      0.065214                                      0.166361                                   3.085613                                 0.510855                   0.224106             False
+      source_repair_last_opposing_before_displacement       398                       0.111111                                   0.0                                      0.065214                                      0.166361                                   3.085613                                 0.510855                   0.224106             False
+```

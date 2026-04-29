@@ -1,3 +1,13 @@
+"""BOS context feature layer.
+
+Repo stance:
+- BOS is already the superior structural signal.
+- OB-based proximity or confluence features in this module are optional context
+  only and are not required for any strategy.
+- Strategy logic should not depend on OB when the BOS event itself already
+  carries the structural decision.
+"""
+
 from __future__ import annotations
 
 import numpy as np

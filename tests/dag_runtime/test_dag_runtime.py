@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import pandas as pd
+import pytest
 
 from src.dag_runtime import (
     CachePolicy,
+    ExecutionPolicy,
     GraphManifest,
     GraphRunContext,
     NodeManifest,
@@ -141,3 +146,253 @@ def test_live_stage_graph_matches_manual_stage_chain():
         manual.reset_index(drop=True),
         check_dtype=False,
     )
+
+
+def _parallel_test_graph() -> GraphManifest:
+    return GraphManifest(
+        graph_name="parallel_graph",
+        nodes=(
+            NodeManifest(
+                graph_name="parallel_graph",
+                node_name="source",
+                node_kind="source",
+                semantic_class="A",
+                inputs=("raw",),
+                upstream_nodes=(),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                compute_fn=lambda context, deps: NodeOutput(
+                    frames={"frame": context.inputs["raw"].copy()}
+                ),
+            ),
+            NodeManifest(
+                graph_name="parallel_graph",
+                node_name="left",
+                node_kind="compute",
+                semantic_class="A",
+                inputs=(),
+                upstream_nodes=("source",),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=True, artifact_kind="frame"),
+                compute_fn=lambda context, deps: NodeOutput(
+                    frames={
+                        "frame": deps["source"]
+                        .primary_frame()
+                        .assign(left=lambda df: df["close"] + 1.0)
+                    }
+                ),
+            ),
+            NodeManifest(
+                graph_name="parallel_graph",
+                node_name="right",
+                node_kind="compute",
+                semantic_class="A",
+                inputs=(),
+                upstream_nodes=("source",),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=True, artifact_kind="frame"),
+                compute_fn=lambda context, deps: NodeOutput(
+                    frames={
+                        "frame": deps["source"]
+                        .primary_frame()
+                        .assign(right=lambda df: df["close"] - 1.0)
+                    }
+                ),
+            ),
+            NodeManifest(
+                graph_name="parallel_graph",
+                node_name="bundle",
+                node_kind="aggregate",
+                semantic_class="A",
+                inputs=(),
+                upstream_nodes=("left", "right"),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                compute_fn=lambda context, deps: NodeOutput(
+                    frames={
+                        "frame": deps["left"]
+                        .primary_frame()
+                        .merge(
+                            deps["right"].primary_frame()[["timestamp", "right"]],
+                            on="timestamp",
+                            how="left",
+                        )
+                    }
+                ),
+            ),
+        ),
+        default_target="bundle",
+    )
+
+
+def test_bounded_parallel_matches_serial_output_and_records_scheduler(tmp_path):
+    raw = _sample_ohlcv(48)
+    graph = _parallel_test_graph()
+    serial = execute_graph(
+        graph,
+        context=GraphRunContext(
+            graph_name=graph.graph_name,
+            symbol="XAU_USD",
+            timeframe="H4",
+            inputs={"raw": raw},
+            cache_root=tmp_path / "serial",
+        ),
+    )
+    parallel = execute_graph(
+        graph,
+        context=GraphRunContext(
+            graph_name=graph.graph_name,
+            symbol="XAU_USD",
+            timeframe="H4",
+            inputs={"raw": raw},
+            cache_root=tmp_path / "parallel",
+            execution_policy=ExecutionPolicy(
+                scheduler_mode="bounded_parallel",
+                max_workers=2,
+                max_concurrent_cache_writes=1,
+            ),
+        ),
+    )
+    pd.testing.assert_frame_equal(serial.primary_frame(), parallel.primary_frame())
+    assert parallel.profiler.summary()["scheduler_mode"] == "bounded_parallel"
+    assert parallel.profiler.summary()["worker_count"] == 2
+    assert parallel.closure_nodes == ["source", "left", "right", "bundle"]
+
+
+def test_bounded_parallel_throttles_cache_writes(tmp_path, monkeypatch):
+    raw = _sample_ohlcv(24)
+    graph = _parallel_test_graph()
+    counters = {"active": 0, "max_active": 0}
+    lock = threading.Lock()
+    original_save = __import__(
+        "src.dag_runtime.executor", fromlist=["save_cached_node"]
+    ).save_cached_node
+
+    def wrapped_save(*args, **kwargs):
+        with lock:
+            counters["active"] += 1
+            counters["max_active"] = max(counters["max_active"], counters["active"])
+        time.sleep(0.05)
+        try:
+            return original_save(*args, **kwargs)
+        finally:
+            with lock:
+                counters["active"] -= 1
+
+    monkeypatch.setattr("src.dag_runtime.executor.save_cached_node", wrapped_save)
+    execute_graph(
+        graph,
+        context=GraphRunContext(
+            graph_name=graph.graph_name,
+            symbol="XAU_USD",
+            timeframe="H4",
+            inputs={"raw": raw},
+            cache_root=tmp_path,
+            execution_policy=ExecutionPolicy(
+                scheduler_mode="bounded_parallel",
+                max_workers=2,
+                max_concurrent_cache_writes=1,
+            ),
+        ),
+    )
+    assert counters["max_active"] == 1
+
+
+def test_bounded_parallel_surfaces_first_error_without_scheduling_new_ready_nodes(
+    tmp_path,
+):
+    executed = {"slow": 0, "late": 0}
+
+    graph = GraphManifest(
+        graph_name="parallel_failure_graph",
+        nodes=(
+            NodeManifest(
+                graph_name="parallel_failure_graph",
+                node_name="source",
+                node_kind="source",
+                semantic_class="A",
+                inputs=("raw",),
+                upstream_nodes=(),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                compute_fn=lambda context, deps: NodeOutput(
+                    frames={"frame": context.inputs["raw"].copy()}
+                ),
+            ),
+            NodeManifest(
+                graph_name="parallel_failure_graph",
+                node_name="bad",
+                node_kind="compute",
+                semantic_class="A",
+                inputs=(),
+                upstream_nodes=("source",),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                compute_fn=lambda context, deps: (_ for _ in ()).throw(
+                    RuntimeError("boom")
+                ),
+            ),
+            NodeManifest(
+                graph_name="parallel_failure_graph",
+                node_name="slow",
+                node_kind="compute",
+                semantic_class="A",
+                inputs=(),
+                upstream_nodes=("source",),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                compute_fn=lambda context, deps: (
+                    executed.__setitem__("slow", executed["slow"] + 1),
+                    time.sleep(0.05),
+                    NodeOutput(frames={"frame": deps["source"].primary_frame().copy()}),
+                )[-1],
+            ),
+            NodeManifest(
+                graph_name="parallel_failure_graph",
+                node_name="late",
+                node_kind="compute",
+                semantic_class="A",
+                inputs=(),
+                upstream_nodes=("source",),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                compute_fn=lambda context, deps: (
+                    executed.__setitem__("late", executed["late"] + 1),
+                    NodeOutput(frames={"frame": deps["source"].primary_frame().copy()}),
+                )[-1],
+            ),
+            NodeManifest(
+                graph_name="parallel_failure_graph",
+                node_name="bundle",
+                node_kind="aggregate",
+                semantic_class="A",
+                inputs=(),
+                upstream_nodes=("bad", "slow", "late"),
+                output_artifacts=("frame",),
+                cache_policy=CachePolicy(materialize=False, artifact_kind="ephemeral"),
+                compute_fn=lambda context, deps: NodeOutput(
+                    frames={"frame": deps["late"].primary_frame().copy()}
+                ),
+            ),
+        ),
+        default_target="bundle",
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        execute_graph(
+            graph,
+            context=GraphRunContext(
+                graph_name=graph.graph_name,
+                symbol="XAU_USD",
+                timeframe="H4",
+                inputs={"raw": _sample_ohlcv(8)},
+                cache_root=tmp_path,
+                execution_policy=ExecutionPolicy(
+                    scheduler_mode="bounded_parallel",
+                    max_workers=2,
+                    max_concurrent_cache_writes=1,
+                ),
+            ),
+        )
+    assert executed["slow"] <= 1
+    assert executed["late"] == 0

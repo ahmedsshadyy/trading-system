@@ -1,0 +1,10 @@
+key_type,window_bars,repeat_count
+source_cluster_id_raw,5,0
+source_cluster_id_raw,10,0
+source_cluster_id_raw,20,0
+source_level_key,5,0
+source_level_key,10,0
+source_level_key,20,8
+source_instance_key,5,0
+source_instance_key,10,0
+source_instance_key,20,0

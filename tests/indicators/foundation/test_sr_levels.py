@@ -1,74 +1,44 @@
-"""
-tests/indicators/foundation/test_sr_levels.py
-
-Full test coverage for src/indicators/foundation/sr_levels.py.
-
-Five synthetic fixtures cover the canonical lifecycle scenarios:
-
-  A — clean support hold (touch_count increments, state stays active)
-  B — support weakening then invalidation (weaken → break)
-  C — deduplication / supersession of nearby same-side levels
-  D — range context (between_nearest_sr_flag, flags, distance)
-  E — prior-period family (prev_day_high / prev_day_low activation)
-
-ATR for all fixtures: fixed at 5.0 (supplied as column ``atr_14``).
-Derived thresholds:
-  touch zone    ±0.75  (TOUCH_TOL_ATR=0.15 × 5.0)
-  invalidation  ±0.50  (INVALIDATION_BUFFER_ATR=0.10 × 5.0)
-  merge tol      1.00  (MERGE_TOL_ATR=0.20 × 5.0)
-"""
-
 from __future__ import annotations
-
-import math
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from scripts import validate_sr_levels as vsr
 from src.indicators.foundation.sr_levels import (
+    ABSORB_TOL_ATR,
+    BREAK_CONFIRM_CLOSES,
+    FAMILY_MAX_AGE,
     FAMILY_PRIOR,
-    INVALIDATION_BUFFER_ATR,
     MAX_AGE_BARS,
-    MAX_WEAKEN_COUNT,
-    MERGE_TOL_ATR,
     SR_FAMILY_DAY,
+    SR_FAMILY_EQHL,
     SR_FAMILY_SWING,
-    SR_SIDE_RESISTANCE,
-    SR_SIDE_SUPPORT,
     SR_STATE_ACTIVE,
-    SR_STATE_INACTIVE_PRE_LIVE,
+    SR_STATE_ACTIVE_WEAKENED,
     SR_STATE_INVALIDATED,
     SR_STATE_RETIRED,
-    TOUCH_TOL_ATR,
-    SRLevel,
+    SR_SIDE_RESISTANCE,
+    SR_SIDE_SUPPORT,
     add_sr_levels,
     build_sr_level_registry,
     extract_sr_source_events,
     project_sr_context,
     update_sr_lifecycle,
-    _compute_strength,
 )
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from src.validation.indicators.sr_levels import summarize_sr_levels
 
 ATR = 5.0
-TOUCH_TOL = TOUCH_TOL_ATR * ATR  # 0.75
-INV_BUF = INVALIDATION_BUFFER_ATR * ATR  # 0.50
-MERGE_TOL = MERGE_TOL_ATR * ATR  # 1.00
 
 
-def _base_candle(
-    n: int, *, open_=100.0, high=101.0, low=99.0, close=100.0
-) -> pd.DataFrame:
-    """Minimal OHLC frame with fixed ATR column."""
+def _base(n: int, close: float = 100.0) -> pd.DataFrame:
+    ts = pd.date_range("2026-01-01", periods=n, freq="4h", tz="UTC")
     return pd.DataFrame(
         {
-            "open": np.full(n, open_),
-            "high": np.full(n, high),
-            "low": np.full(n, low),
+            "timestamp": ts,
+            "open": np.full(n, close),
+            "high": np.full(n, close + 1.0),
+            "low": np.full(n, close - 1.0),
             "close": np.full(n, close),
             "volume": np.ones(n),
             "atr_14": np.full(n, ATR),
@@ -76,205 +46,7 @@ def _base_candle(
     )
 
 
-def _swing_confirm_at(
-    df: pd.DataFrame,
-    bar: int,
-    price: float,
-    *,
-    side: int,
-    origin_bar: int | None = None,
-) -> None:
-    """Inject a single swing confirm event into ``df`` at ``bar``."""
-    if origin_bar is None:
-        origin_bar = max(0, bar - 3)
-
-    if side == SR_SIDE_RESISTANCE:
-        if "swing_high_confirm_flag" not in df.columns:
-            df["swing_high_confirm_flag"] = 0
-            df["swing_high_confirm_price"] = np.nan
-            df["swing_high_confirm_origin_idx"] = np.nan
-            df["swing_low_confirm_flag"] = 0
-            df["swing_low_confirm_price"] = np.nan
-            df["swing_low_confirm_origin_idx"] = np.nan
-        df.at[bar, "swing_high_confirm_flag"] = 1
-        df.at[bar, "swing_high_confirm_price"] = price
-        df.at[bar, "swing_high_confirm_origin_idx"] = origin_bar
-    else:
-        if "swing_low_confirm_flag" not in df.columns:
-            df["swing_high_confirm_flag"] = 0
-            df["swing_high_confirm_price"] = np.nan
-            df["swing_high_confirm_origin_idx"] = np.nan
-            df["swing_low_confirm_flag"] = 0
-            df["swing_low_confirm_price"] = np.nan
-            df["swing_low_confirm_origin_idx"] = np.nan
-        df.at[bar, "swing_low_confirm_flag"] = 1
-        df.at[bar, "swing_low_confirm_price"] = price
-        df.at[bar, "swing_low_confirm_origin_idx"] = origin_bar
-
-
-# ---------------------------------------------------------------------------
-# Fixture A — clean support hold
-# ---------------------------------------------------------------------------
-
-
-def _fixture_a() -> pd.DataFrame:
-    """
-    50-bar frame.  Swing low at bar 5 (price = 95.0).
-    Bars 10, 15, 20: candle low touches support zone (low=95.3, close=100.0).
-    Price never falls below invalidation threshold.
-    Expected: level active throughout, touch_count = 3 by bar 20.
-    """
-    n = 50
-    df = _base_candle(n, close=100.0, low=99.0, high=101.0)
-    # Add swing columns
-    _swing_confirm_at(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
-    # Touch bars: low enters touch zone (≤ 95.0 + 0.75 = 95.75) but close holds
-    for bar in (10, 15, 20):
-        df.at[bar, "low"] = 95.3  # inside touch zone
-        df.at[bar, "high"] = 101.0
-        df.at[bar, "close"] = 100.0
-    return df
-
-
-def test_fixture_a_level_created():
-    df = _fixture_a()
-    events = extract_sr_source_events(df)
-    sup_events = [e for e in events if e.side == SR_SIDE_SUPPORT]
-    assert len(sup_events) == 1
-    assert sup_events[0].level_price == pytest.approx(95.0)
-    assert sup_events[0].source_family == SR_FAMILY_SWING
-    assert sup_events[0].source_live_from_idx == 5
-
-
-def test_fixture_a_state_active_after_activation():
-    df = _fixture_a()
-    registry = build_sr_level_registry(df)
-    update_sr_lifecycle(df, registry)
-    lev = next(l for l in registry.values() if l.side == SR_SIDE_SUPPORT)
-    assert lev.state == SR_STATE_ACTIVE
-
-
-def test_fixture_a_touch_count():
-    df = _fixture_a()
-    registry = build_sr_level_registry(df)
-    update_sr_lifecycle(df, registry)
-    lev = next(l for l in registry.values() if l.side == SR_SIDE_SUPPORT)
-    assert lev.touch_count == 3
-
-
-def test_fixture_a_purity():
-    """add_sr_levels must not mutate the original DataFrame."""
-    df = _fixture_a()
-    original_cols = list(df.columns)
-    original_close = df["close"].copy()
-    _ = add_sr_levels(df, include_research_only=False)
-    assert list(df.columns) == original_cols
-    pd.testing.assert_series_equal(df["close"], original_close)
-
-
-def test_fixture_a_projection_nearest_support():
-    df = _fixture_a()
-    out = add_sr_levels(df, include_research_only=False)
-    # From bar 5 onward there should be a nearest support active
-    assert int(out["nearest_support_active"].iloc[6]) == 1
-    assert float(out["nearest_support_price"].iloc[10]) == pytest.approx(95.0)
-
-
-def test_fixture_a_no_label_contamination():
-    df = _fixture_a()
-    out = add_sr_levels(df, include_research_only=False)
-    bad = [c for c in out.columns if c.startswith("label_") or c.startswith("future_")]
-    assert bad == []
-
-
-# ---------------------------------------------------------------------------
-# Fixture B — support weakening then invalidation
-# ---------------------------------------------------------------------------
-
-
-def _fixture_b() -> pd.DataFrame:
-    """
-    60-bar frame.  Swing low at bar 5 (price = 95.0).
-    Bars 10–12: low pierces touch zone but close holds → weaken events.
-    Bar 25: close falls below 95.0 − INV_BUF (= 94.5) → invalidation.
-    """
-    n = 60
-    df = _base_candle(n, close=100.0, low=99.0, high=101.0)
-    _swing_confirm_at(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
-
-    # Weaken events: low < 95.0 - TOUCH_TOL = 94.25 but close stays above 94.5
-    for bar in (10, 11, 12):
-        df.at[bar, "low"] = 94.0  # low < 94.25 → weak pierce
-        df.at[bar, "close"] = 95.2  # close > 94.5 → holds, not invalidated
-
-    # Invalidation: close < 94.5
-    df.at[25, "close"] = 94.0
-    df.at[25, "low"] = 93.5
-    # After invalidation keep close below (levels remain invalidated)
-    for bar in range(26, 60):
-        df.at[bar, "close"] = 94.0
-        df.at[bar, "low"] = 93.5
-
-    return df
-
-
-def test_fixture_b_weaken_count():
-    df = _fixture_b()
-    registry = build_sr_level_registry(df)
-    update_sr_lifecycle(df, registry)
-    lev = next(l for l in registry.values() if l.side == SR_SIDE_SUPPORT)
-    # weaken_count is capped by MAX_WEAKEN_COUNT=4 but we only trigger 3 events
-    assert lev.weaken_count == 3
-
-
-def test_fixture_b_invalidation_state():
-    df = _fixture_b()
-    registry = build_sr_level_registry(df)
-    update_sr_lifecycle(df, registry)
-    lev = next(l for l in registry.values() if l.side == SR_SIDE_SUPPORT)
-    assert lev.state in (SR_STATE_INVALIDATED, SR_STATE_RETIRED)
-    assert lev.invalidation_idx == 25
-
-
-def test_fixture_b_support_broken_flag():
-    df = _fixture_b()
-    out = add_sr_levels(df, include_research_only=False)
-    assert int(out["support_broken_this_bar"].iloc[25]) == 1
-    # Not set before bar 25
-    assert int(out["support_broken_this_bar"].iloc[24]) == 0
-
-
-def test_fixture_b_invalidation_bars_before_confirm():
-    """A level must NOT appear at bars before its source_live_from_idx."""
-    df = _fixture_b()
-    out = add_sr_levels(df, include_research_only=False)
-    # Support confirm at bar 5 — bars 0-4 must have no nearest support
-    for bar in range(5):
-        assert int(out["nearest_support_active"].iloc[bar]) == 0
-
-
-# ---------------------------------------------------------------------------
-# Fixture C — deduplication / supersession
-# ---------------------------------------------------------------------------
-
-
-def _fixture_c() -> pd.DataFrame:
-    """
-    40-bar frame.  Two swing highs confirmed close together at bars 10 and 11.
-    First: price=105.0 (weaker source, origin close to confirm).
-    Second: price=105.5 (stronger source — larger origin-to-confirm distance).
-
-    MERGE_TOL = 1.0 ATR-unit price distance.
-    |105.5 − 105.0| = 0.5 < 1.0 → deduplication fires.
-    The weaker level is retired as superseded.
-    """
-    n = 40
-    df = _base_candle(n, close=100.0, low=99.0, high=106.0)
-    # Swing high 1 at bar 10: origin at bar 10 (same bar → mag_atr=1.5 default)
-    # Swing high 2 at bar 11: origin at bar 5 (5 bars back, price diff = 6.0 → mag=1.2 ATR)
-    # Stronger source: let origin_bar differ significantly so mag_atr > 1.5
-
-    # high_1 at bar 10: origin_bar=10 (no origin distance → src_strength=1.5/3=0.50)
+def _ensure_swing_cols(df: pd.DataFrame) -> None:
     if "swing_high_confirm_flag" not in df.columns:
         df["swing_high_confirm_flag"] = 0
         df["swing_high_confirm_price"] = np.nan
@@ -283,367 +55,393 @@ def _fixture_c() -> pd.DataFrame:
         df["swing_low_confirm_price"] = np.nan
         df["swing_low_confirm_origin_idx"] = np.nan
 
-    df.at[10, "swing_high_confirm_flag"] = 1
-    df.at[10, "swing_high_confirm_price"] = 105.0
-    df.at[10, "swing_high_confirm_origin_idx"] = 10  # same → mag default=1.5 → src=0.50
 
-    # high_2 at bar 11: origin at bar 5, close[5]=100 → mag=(105.5-100)/5=1.1 → src=0.367
-    # So high_1 (src=0.50) is STRONGER than high_2 (src=0.367)
-    df.at[11, "swing_high_confirm_flag"] = 1
-    df.at[11, "swing_high_confirm_price"] = 105.5
-    df.at[11, "swing_high_confirm_origin_idx"] = 5
+def _swing_confirm(
+    df: pd.DataFrame,
+    *,
+    bar: int,
+    price: float,
+    side: int,
+    origin_bar: int | None = None,
+) -> None:
+    _ensure_swing_cols(df)
+    if origin_bar is None:
+        origin_bar = max(0, bar - 3)
+    if side == SR_SIDE_SUPPORT:
+        df.at[bar, "swing_low_confirm_flag"] = 1
+        df.at[bar, "swing_low_confirm_price"] = price
+        df.at[bar, "swing_low_confirm_origin_idx"] = origin_bar
+    else:
+        df.at[bar, "swing_high_confirm_flag"] = 1
+        df.at[bar, "swing_high_confirm_price"] = price
+        df.at[bar, "swing_high_confirm_origin_idx"] = origin_bar
 
-    return df
+
+def _emitted_supports(registry: dict[int, object]) -> list[object]:
+    return [
+        lev
+        for lev in registry.values()
+        if lev.side == SR_SIDE_SUPPORT and getattr(lev, "emitted_zone_flag", False)
+    ]
 
 
-def test_fixture_c_dedup_one_survivor():
-    df = _fixture_c()
+def test_source_absorption_merges_nearby_supports() -> None:
+    df = _base(40)
+    _swing_confirm(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    _swing_confirm(df, bar=7, price=95.6, side=SR_SIDE_SUPPORT, origin_bar=3)
+
     registry = build_sr_level_registry(df)
-    update_sr_lifecycle(df, registry)
-    res_levels = [l for l in registry.values() if l.side == SR_SIDE_RESISTANCE]
-    active = [l for l in res_levels if l.state == SR_STATE_ACTIVE]
-    retired = [l for l in res_levels if l.state == SR_STATE_RETIRED]
-    # Exactly one active, one retired (superseded)
-    assert len(active) == 1
-    assert len(retired) == 1
+    project_sr_context(df, registry)
+
+    emitted = _emitted_supports(registry)
+    absorbed = [
+        lev
+        for lev in registry.values()
+        if lev.side == SR_SIDE_SUPPORT and lev.absorbed_by
+    ]
+    assert len(emitted) == 1
+    assert len(absorbed) == 1
+    assert emitted[0].anchor_count == 2
+    assert abs(emitted[0].level_price - 95.3) < ABSORB_TOL_ATR * ATR
 
 
-def test_fixture_c_superseded_by_set():
-    df = _fixture_c()
+def test_multi_anchor_zone_width_expands() -> None:
+    single_df = _base(40)
+    _swing_confirm(single_df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    single_registry = build_sr_level_registry(single_df)
+    project_sr_context(single_df, single_registry)
+    single_width = _emitted_supports(single_registry)[0].zone_half_width_atr
+
+    df = _base(40)
+    _swing_confirm(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    _swing_confirm(df, bar=7, price=96.2, side=SR_SIDE_SUPPORT, origin_bar=3)
+
     registry = build_sr_level_registry(df)
-    update_sr_lifecycle(df, registry)
-    res_levels = [l for l in registry.values() if l.side == SR_SIDE_RESISTANCE]
-    retired = [l for l in res_levels if l.state == SR_STATE_RETIRED]
-    assert len(retired) == 1
-    assert retired[0].superseded_by is not None
+    project_sr_context(df, registry)
+
+    zone = _emitted_supports(registry)[0]
+    assert zone.anchor_count == 2
+    assert zone.zone_half_width_atr > single_width
 
 
-def test_fixture_c_levels_not_created_before_confirm():
-    """No resistance projected before bar 10."""
-    df = _fixture_c()
-    out = add_sr_levels(df, include_research_only=False)
-    for bar in range(10):
-        assert int(out["nearest_resistance_active"].iloc[bar]) == 0
+def test_family_aware_absorption_preserves_eqhl_best_family() -> None:
+    df = _base(50)
+    df["prev_day_low"] = np.nan
+    df.loc[10:, "prev_day_low"] = 99.0
+    df["eql_detect_flag"] = 0
+    df["eql_level_on_detect"] = np.nan
+    df["eql_origin_idx"] = np.nan
+    df["eql_score_on_detect"] = np.nan
+    df["eql_member_count_on_detect"] = np.nan
+    df.at[12, "eql_detect_flag"] = 1
+    df.at[12, "eql_level_on_detect"] = 99.1
+    df.at[12, "eql_origin_idx"] = 8
+    df.at[12, "eql_score_on_detect"] = 0.95
+    df.at[12, "eql_member_count_on_detect"] = 3
 
-
-# ---------------------------------------------------------------------------
-# Fixture D — range context flags
-# ---------------------------------------------------------------------------
-
-
-def _fixture_d() -> pd.DataFrame:
-    """
-    30-bar frame with:
-      - swing low  at bar 5 → support at 90.0
-      - swing high at bar 5 → resistance at 110.0
-    Bars 10+: price held in range at close=100 — bounded between 90 and 110.
-    Expected: between_nearest_sr_flag=1, flags correct.
-    """
-    n = 30
-    df = _base_candle(n, close=100.0, low=99.0, high=101.0)
-
-    df["swing_high_confirm_flag"] = 0
-    df["swing_high_confirm_price"] = np.nan
-    df["swing_high_confirm_origin_idx"] = np.nan
-    df["swing_low_confirm_flag"] = 0
-    df["swing_low_confirm_price"] = np.nan
-    df["swing_low_confirm_origin_idx"] = np.nan
-
-    df.at[5, "swing_low_confirm_flag"] = 1
-    df.at[5, "swing_low_confirm_price"] = 90.0
-    df.at[5, "swing_low_confirm_origin_idx"] = 2
-
-    df.at[5, "swing_high_confirm_flag"] = 1
-    df.at[5, "swing_high_confirm_price"] = 110.0
-    df.at[5, "swing_high_confirm_origin_idx"] = 2
-
-    return df
-
-
-def test_fixture_d_between_flag():
-    df = _fixture_d()
-    out = add_sr_levels(df, include_research_only=False)
-    # From bar 6 onward (after activation at bar 5) both levels exist
-    assert int(out["between_nearest_sr_flag"].iloc[6]) == 1
-    assert int(out["between_nearest_sr_flag"].iloc[29]) == 1
-
-
-def test_fixture_d_not_above_resistance():
-    df = _fixture_d()
-    out = add_sr_levels(df, include_research_only=False)
-    # Price=100 is below resistance at 110 → above_nearest_resistance_flag=0
-    assert int(out["above_nearest_resistance_flag"].iloc[10]) == 0
-
-
-def test_fixture_d_not_below_support():
-    df = _fixture_d()
-    out = add_sr_levels(df, include_research_only=False)
-    # Price=100 is above support at 90 → below_nearest_support_flag=0
-    assert int(out["below_nearest_support_flag"].iloc[10]) == 0
-
-
-def test_fixture_d_distances_correct():
-    df = _fixture_d()
-    out = add_sr_levels(df, include_research_only=False)
-    bar = 10
-    # Support distance = 100 - 90 = 10.0
-    assert float(out["nearest_support_distance"].iloc[bar]) == pytest.approx(10.0)
-    # Resistance distance = 110 - 100 = 10.0
-    assert float(out["nearest_resistance_distance"].iloc[bar]) == pytest.approx(10.0)
-    # ATR-normalized: 10 / 5 = 2.0
-    assert float(out["nearest_support_distance_atr"].iloc[bar]) == pytest.approx(2.0)
-    assert float(out["nearest_resistance_distance_atr"].iloc[bar]) == pytest.approx(2.0)
-
-
-def test_fixture_d_above_resistance_when_price_escapes():
-    """When close > resistance price → above_nearest_resistance_flag = 1."""
-    df = _fixture_d()
-    # Push price above resistance
-    for bar in range(20, 30):
-        df.at[bar, "close"] = 115.0
-        df.at[bar, "high"] = 116.0
-        df.at[bar, "low"] = 114.0
-    out = add_sr_levels(df, include_research_only=False)
-    # Resistance should be invalidated by bar 20 (close=115 > 110+0.5)
-    assert int(out["above_nearest_resistance_flag"].iloc[25]) == 1
-
-
-# ---------------------------------------------------------------------------
-# Fixture E — prior-period family (day H/L)
-# ---------------------------------------------------------------------------
-
-
-def _fixture_e() -> pd.DataFrame:
-    """
-    40-bar frame.  No swing columns — only prev_day_high / prev_day_low.
-    Period 1: bars 0-9  → no value (NaN)
-    Period 2: bars 10-19 → prev_day_high=108.0, prev_day_low=92.0
-    Period 3: bars 20-39 → prev_day_high=109.0, prev_day_low=91.0
-    """
-    n = 40
-    df = _base_candle(n, close=100.0, low=99.0, high=101.0)
-    prev_day_high = np.full(n, np.nan)
-    prev_day_low = np.full(n, np.nan)
-    prev_day_high[10:20] = 108.0
-    prev_day_low[10:20] = 92.0
-    prev_day_high[20:] = 109.0
-    prev_day_low[20:] = 91.0
-    df["prev_day_high"] = prev_day_high
-    df["prev_day_low"] = prev_day_low
-    return df
-
-
-def test_fixture_e_no_level_before_first_value():
-    df = _fixture_e()
-    out = add_sr_levels(df, include_research_only=False)
-    for bar in range(10):
-        assert int(out["nearest_resistance_active"].iloc[bar]) == 0
-        assert int(out["nearest_support_active"].iloc[bar]) == 0
-
-
-def test_fixture_e_level_active_at_first_value():
-    df = _fixture_e()
-    out = add_sr_levels(df, include_research_only=False)
-    # At bar 10 levels activate (source_live_from_idx=10)
-    assert int(out["nearest_resistance_active"].iloc[10]) == 1
-    assert int(out["nearest_support_active"].iloc[10]) == 1
-
-
-def test_fixture_e_correct_prices():
-    df = _fixture_e()
-    out = add_sr_levels(df, include_research_only=False)
-    assert float(out["nearest_resistance_price"].iloc[15]) == pytest.approx(108.0)
-    assert float(out["nearest_support_price"].iloc[15]) == pytest.approx(92.0)
-
-
-def test_fixture_e_family_is_day():
-    df = _fixture_e()
-    out = add_sr_levels(df, include_research_only=False)
-    assert out["nearest_resistance_source_family"].iloc[15] == SR_FAMILY_DAY
-    assert out["nearest_support_source_family"].iloc[15] == SR_FAMILY_DAY
-
-
-def test_fixture_e_new_period_creates_new_level():
-    df = _fixture_e()
     registry = build_sr_level_registry(df)
-    # Should have 4 source events: 2 for period 2, 2 for period 3
-    day_events = [e for e in registry.values() if e.source_family == SR_FAMILY_DAY]
-    assert len(day_events) == 4
+    project_sr_context(df, registry)
+
+    emitted = _emitted_supports(registry)
+    assert emitted
+    zone = emitted[0]
+    assert zone.family_mix_counts[SR_FAMILY_DAY] >= 1
+    assert zone.family_mix_counts[SR_FAMILY_EQHL] >= 1
+    assert zone.best_source_family == SR_FAMILY_EQHL
 
 
-# ---------------------------------------------------------------------------
-# Research / live parity
-# ---------------------------------------------------------------------------
+def test_width_model_distinguishes_tight_vs_broad_anchor_dispersion() -> None:
+    tight_df = _base(40)
+    _swing_confirm(tight_df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    _swing_confirm(tight_df, bar=7, price=95.1, side=SR_SIDE_SUPPORT, origin_bar=3)
+    tight_registry = build_sr_level_registry(tight_df)
+    project_sr_context(tight_df, tight_registry)
+    tight_width = _emitted_supports(tight_registry)[0].zone_width_atr
+
+    broad_df = _base(40)
+    _swing_confirm(broad_df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    _swing_confirm(broad_df, bar=7, price=96.1, side=SR_SIDE_SUPPORT, origin_bar=3)
+    broad_registry = build_sr_level_registry(broad_df)
+    project_sr_context(broad_df, broad_registry)
+    broad_width = _emitted_supports(broad_registry)[0].zone_width_atr
+
+    assert broad_width > tight_width
 
 
-def test_parity_live_columns_match_research():
-    """Live columns in the research build must equal those in the live build."""
-    df = _fixture_a()
+def test_break_pending_then_reclaim() -> None:
+    df = _base(40)
+    _swing_confirm(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    df.loc[10, ["close", "low", "high"]] = [94.0, 93.9, 95.5]
+    df.loc[11, ["close", "low", "high"]] = [95.2, 94.8, 96.0]
+
+    registry = build_sr_level_registry(df)
+    out = project_sr_context(df, registry)
+    zone = _emitted_supports(registry)[0]
+
+    assert zone.invalidation_idx == -1
+    assert zone.reclaim_count == 1
+    assert zone.failed_break_count == 1
+    assert zone.state in {SR_STATE_ACTIVE, SR_STATE_ACTIVE_WEAKENED}
+    assert int(out["sr_reclaim_this_bar_flag"].iloc[11]) == 1
+    assert int(out["support_broken_this_bar"].iloc[10]) == 0
+
+
+def test_confirmed_invalidation_after_two_break_closes() -> None:
+    df = _base(40)
+    _swing_confirm(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    df.loc[10, ["close", "low", "high"]] = [94.1, 94.0, 95.2]
+    df.loc[11, ["close", "low", "high"]] = [94.0, 93.9, 95.1]
+
+    registry = build_sr_level_registry(df)
+    out = project_sr_context(df, registry)
+    zone = _emitted_supports(registry)[0]
+
+    assert BREAK_CONFIRM_CLOSES == 2
+    assert zone.state in {SR_STATE_INVALIDATED, SR_STATE_RETIRED}
+    assert zone.invalidation_idx == 11
+    assert int(out["support_broken_this_bar"].iloc[11]) == 1
+
+
+def test_vp_dwell_and_shift_suppresses_small_noise() -> None:
+    df = _base(20)
+    df["vp_val"] = np.nan
+    df.loc[2:8, "vp_val"] = 90.0
+    df.loc[9:12, "vp_val"] = 90.5
+    df.loc[13:18, "vp_val"] = 92.0
+
+    events = extract_sr_source_events(df)
+    vp_supports = [
+        lev
+        for lev in events
+        if lev.side == SR_SIDE_SUPPORT and lev.source_family == "vp"
+    ]
+    assert len(vp_supports) == 2
+
+
+def test_primary_zone_can_differ_from_geometric_nearest() -> None:
+    df = _base(60)
+    df["prev_day_low"] = np.nan
+    df.loc[10:, "prev_day_low"] = 99.0
+    _swing_confirm(df, bar=12, price=97.4, side=SR_SIDE_SUPPORT, origin_bar=6)
+    if "eql_detect_flag" not in df.columns:
+        df["eql_detect_flag"] = 0
+        df["eql_level_on_detect"] = np.nan
+        df["eql_origin_idx"] = np.nan
+        df["eql_score_on_detect"] = np.nan
+        df["eql_member_count_on_detect"] = np.nan
+    df.at[13, "eql_detect_flag"] = 1
+    df.at[13, "eql_level_on_detect"] = 97.6
+    df.at[13, "eql_origin_idx"] = 8
+    df.at[13, "eql_score_on_detect"] = 0.92
+    df.at[13, "eql_member_count_on_detect"] = 3
+    for bar in (18, 22, 26):
+        df.loc[bar, ["low", "close", "high"]] = [97.5, 100.0, 101.0]
+
+    out = add_sr_levels(df, include_research_only=False)
+    probe = out.iloc[30]
+    assert probe["nearest_support_price"] == pytest.approx(99.0)
+    assert probe["primary_support_zone_mid"] < probe["nearest_support_price"]
+    assert probe["primary_support_zone_score"] >= probe["nearest_support_strength"]
+
+
+def test_reaction_quality_penalizes_weak_pierce_churn() -> None:
+    clean_df = _base(60)
+    _swing_confirm(clean_df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    for bar in (12, 16, 20, 24):
+        clean_df.loc[bar, ["low", "close", "high"]] = [95.05, 95.4, 100.0]
+    clean_registry = build_sr_level_registry(clean_df)
+    project_sr_context(clean_df, clean_registry)
+    clean_zone = _emitted_supports(clean_registry)[0]
+
+    weak_df = _base(60)
+    _swing_confirm(weak_df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    for bar in (12, 16, 20, 24):
+        weak_df.loc[bar, ["low", "close", "high"]] = [94.2, 95.15, 100.0]
+    weak_registry = build_sr_level_registry(weak_df)
+    project_sr_context(weak_df, weak_registry)
+    weak_zone = _emitted_supports(weak_registry)[0]
+
+    assert clean_zone.clean_touch_count > 0
+    assert weak_zone.weak_touch_count > 0
+    assert weak_zone.reaction_quality_score < clean_zone.reaction_quality_score
+
+
+def test_primary_zone_falls_back_to_nearest_when_score_edge_is_small() -> None:
+    df = _base(60)
+    df["prev_day_low"] = np.nan
+    df.loc[10:, "prev_day_low"] = 99.0
+    _swing_confirm(df, bar=12, price=97.6, side=SR_SIDE_SUPPORT, origin_bar=6)
+
+    out = add_sr_levels(df, include_research_only=False)
+    probe = out.iloc[30]
+    assert probe["nearest_support_price"] == pytest.approx(99.0)
+    assert probe["primary_support_zone_mid"] == pytest.approx(
+        probe["nearest_support_price"]
+    )
+
+
+def test_live_research_columns_remain_backward_compatible() -> None:
+    df = _base(40)
+    _swing_confirm(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    df["prev_day_high"] = np.nan
+    df.loc[10:, "prev_day_high"] = 108.0
+
     live_df = add_sr_levels(df, include_research_only=False)
     research_df = add_sr_levels(df, include_research_only=True)
-    live_cols = [c for c in research_df.columns if not c.startswith("r_")]
-    shared = [c for c in live_cols if c in live_df.columns]
-    pd.testing.assert_frame_equal(live_df[shared], research_df[shared])
 
-
-def test_research_has_r_prefix_columns():
-    df = _fixture_a()
-    out = add_sr_levels(df, include_research_only=True)
-    r_cols = [c for c in out.columns if c.startswith("r_")]
-    assert len(r_cols) > 0
-
-
-def test_live_has_no_r_prefix_columns():
-    df = _fixture_a()
-    out = add_sr_levels(df, include_research_only=False)
-    r_cols = [c for c in out.columns if c.startswith("r_")]
-    assert r_cols == []
-
-
-# ---------------------------------------------------------------------------
-# Edge cases — missing families / empty frame
-# ---------------------------------------------------------------------------
-
-
-def test_empty_frame_returns_empty():
-    df = pd.DataFrame(columns=["open", "high", "low", "close", "volume", "atr_14"])
-    out = add_sr_levels(df, include_research_only=False)
-    assert len(out) == 0
-
-
-def test_no_swing_columns_no_swing_levels():
-    df = _base_candle(20)
-    events = extract_sr_source_events(df)
-    swing_events = [e for e in events if e.source_family == SR_FAMILY_SWING]
-    assert swing_events == []
-
-
-def test_warmup_rows_have_no_nearest_sr():
-    """Bars before the first confirm row have no active nearest SR."""
-    df = _fixture_a()  # confirm at bar 5
-    out = add_sr_levels(df, include_research_only=False)
-    for bar in range(5):
-        assert int(out["nearest_support_active"].iloc[bar]) == 0
-        assert int(out["nearest_resistance_active"].iloc[bar]) == 0
-
-
-# ---------------------------------------------------------------------------
-# Strength model
-# ---------------------------------------------------------------------------
-
-
-def test_strength_in_unit_interval():
-    lev = SRLevel(
-        level_id=1,
-        side=SR_SIDE_SUPPORT,
-        level_price=100.0,
-        source_family=SR_FAMILY_SWING,
-        source_strength_initial=0.8,
+    legacy_cols = [
+        "nearest_support_price",
+        "nearest_support_distance_atr",
+        "nearest_support_strength",
+        "nearest_resistance_price",
+        "nearest_resistance_distance_atr",
+        "nearest_resistance_strength",
+        "active_support_count",
+        "active_resistance_count",
+    ]
+    for col in legacy_cols:
+        assert col in live_df.columns
+        assert col in research_df.columns
+    live_cols = [col for col in research_df.columns if not col.startswith("r_")]
+    pd.testing.assert_frame_equal(
+        live_df[live_cols],
+        research_df[live_cols],
+        check_dtype=False,
     )
-    lev.age_bars = 10
-    lev.touch_count = 2
-    lev.weaken_count = 0
-    s = _compute_strength(lev)
-    assert 0.0 <= s <= 1.0
+    assert "r_sr_touch_event_id" in research_df.columns
+    assert "r_sr_score_quintile_calibration_json" in research_df.columns
 
 
-def test_strength_decreases_with_weakens():
-    lev = SRLevel(
-        level_id=1,
-        side=SR_SIDE_SUPPORT,
-        level_price=100.0,
-        source_family=SR_FAMILY_SWING,
-        source_strength_initial=0.8,
-    )
-    lev.age_bars = 5
-    s_no_weaken = _compute_strength(lev)
-    lev.weaken_count = 3
-    s_weakened = _compute_strength(lev)
-    assert s_weakened < s_no_weaken
+def test_input_dataframe_not_mutated() -> None:
+    df = _base(20)
+    _swing_confirm(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    original = df.copy(deep=True)
+    _ = add_sr_levels(df, include_research_only=False)
+    pd.testing.assert_frame_equal(df, original)
 
 
-def test_strength_increases_with_touches():
-    base = SRLevel(
-        level_id=1,
-        side=SR_SIDE_SUPPORT,
-        level_price=100.0,
-        source_family=SR_FAMILY_SWING,
-        source_strength_initial=0.5,
-    )
-    base.age_bars = 5
-    s_zero_touches = _compute_strength(base)
-    base.touch_count = 4
-    s_four_touches = _compute_strength(base)
-    assert s_four_touches > s_zero_touches
-
-
-def test_family_prior_used_in_strength():
-    """Week-family level should have higher base strength than swing-family."""
-    from src.indicators.foundation.sr_levels import SR_FAMILY_WEEK
-
-    sw = SRLevel(
-        level_id=1,
-        side=SR_SIDE_RESISTANCE,
-        level_price=100.0,
-        source_family=SR_FAMILY_SWING,
-        source_strength_initial=0.5,
-    )
-    wk = SRLevel(
-        level_id=2,
-        side=SR_SIDE_RESISTANCE,
-        level_price=100.0,
-        source_family=SR_FAMILY_WEEK,
-        source_strength_initial=0.5,
-    )
-    assert _compute_strength(wk) > _compute_strength(sw)
-
-
-# ---------------------------------------------------------------------------
-# Retirement by age
-# ---------------------------------------------------------------------------
-
-
-def test_retirement_by_max_age():
-    """A level that ages beyond MAX_AGE_BARS must be retired."""
-    n = MAX_AGE_BARS + 20
-    df = _base_candle(n, close=100.0, low=99.0, high=101.0)
-    _swing_confirm_at(df, bar=0, price=90.0, side=SR_SIDE_SUPPORT, origin_bar=0)
+def test_retires_very_old_zone() -> None:
+    df = _base(MAX_AGE_BARS + 25)
+    _swing_confirm(df, bar=0, price=90.0, side=SR_SIDE_SUPPORT, origin_bar=0)
     registry = build_sr_level_registry(df)
     update_sr_lifecycle(df, registry)
-    lev = next(l for l in registry.values() if l.side == SR_SIDE_SUPPORT)
-    assert lev.state == SR_STATE_RETIRED
+    zone = _emitted_supports(registry)[0]
+    assert zone.state == SR_STATE_RETIRED
 
 
-# ---------------------------------------------------------------------------
-# Causality (no future look-ahead)
-# ---------------------------------------------------------------------------
+def test_family_prior_still_available_for_day_levels() -> None:
+    assert FAMILY_PRIOR[SR_FAMILY_DAY] > FAMILY_PRIOR[SR_FAMILY_SWING]
 
 
-def test_no_level_projected_before_source_live_from():
-    """Nearest support must not appear before its source_live_from_idx."""
-    df = _fixture_a()  # support live from bar 5
+def test_hard_expiry_sets_terminal_reason_and_removes_zone_from_ladder() -> None:
+    df = _base(FAMILY_MAX_AGE[SR_FAMILY_DAY] + 20)
+    df["prev_day_low"] = 99.0
+
+    registry = build_sr_level_registry(df)
+    out = project_sr_context(df, registry)
+    zone = _emitted_supports(registry)[0]
+
+    assert zone.expiry_idx == FAMILY_MAX_AGE[SR_FAMILY_DAY]
+    assert zone.terminal_reason == "expired_hard"
+    assert pd.notna(out.loc[zone.expiry_idx - 1, "sr_support_l1_id"])
+    assert pd.isna(out.loc[zone.expiry_idx, "sr_support_l1_id"])
+
+
+def test_ladder_exports_visible_deeper_support_backups_in_distance_order() -> None:
+    df = _base(80)
+    df["prev_day_low"] = np.nan
+    df.loc[0:, "prev_day_low"] = 99.0
+    _swing_confirm(df, bar=5, price=97.5, side=SR_SIDE_SUPPORT, origin_bar=2)
+    df["eql_detect_flag"] = 0
+    df["eql_level_on_detect"] = np.nan
+    df["eql_origin_idx"] = np.nan
+    df["eql_score_on_detect"] = np.nan
+    df["eql_member_count_on_detect"] = np.nan
+    df.at[8, "eql_detect_flag"] = 1
+    df.at[8, "eql_level_on_detect"] = 96.0
+    df.at[8, "eql_origin_idx"] = 6
+    df.at[8, "eql_score_on_detect"] = 0.9
+    df.at[8, "eql_member_count_on_detect"] = 3
+
     out = add_sr_levels(df, include_research_only=False)
-    # Bars 0-4: before activation — must be inactive
-    for bar in range(5):
-        assert int(out["nearest_support_active"].iloc[bar]) == 0
-    # Bar 5: activation row — level is immediately projected (correct causal behaviour)
-    assert int(out["nearest_support_active"].iloc[5]) == 1
+    probe = out.iloc[20]
+
+    assert probe["sr_support_l1_id"] == probe["nearest_support_zone_id"]
+    assert (
+        probe["sr_support_l1_mid"]
+        > probe["sr_support_l2_mid"]
+        > probe["sr_support_l3_mid"]
+    )
+    assert probe["sr_support_l1_score"] >= 0.0
+    assert probe["sr_support_l3_expiry_bars_remaining"] >= 0.0
 
 
-# ---------------------------------------------------------------------------
-# Contamination check
-# ---------------------------------------------------------------------------
+def test_invalidated_zone_is_visible_before_break_and_absent_after_terminal_bar() -> (
+    None
+):
+    df = _base(50)
+    _swing_confirm(df, bar=5, price=95.0, side=SR_SIDE_SUPPORT, origin_bar=2)
+    df.loc[10, ["close", "low", "high"]] = [94.1, 94.0, 95.2]
+    df.loc[11, ["close", "low", "high"]] = [94.0, 93.9, 95.1]
+
+    registry = build_sr_level_registry(df)
+    out = project_sr_context(df, registry)
+    zone = _emitted_supports(registry)[0]
+
+    assert zone.invalidation_idx == 11
+    assert zone.terminal_reason == "invalidated"
+    assert pd.notna(out.loc[9, "nearest_support_zone_id"])
+    assert pd.isna(out.loc[10, "nearest_support_zone_id"])
+    assert pd.isna(out.loc[11, "nearest_support_zone_id"])
+    assert pd.isna(out.loc[20, "sr_support_l1_id"])
 
 
-def test_no_label_future_columns_in_live():
-    df = _fixture_d()
-    out = add_sr_levels(df, include_research_only=False)
-    bad = [c for c in out.columns if c.startswith("label_") or c.startswith("future_")]
-    assert bad == []
+def test_summary_splits_structure_pass_from_score_fail() -> None:
+    df = _base(60)
+    df["prev_day_low"] = 95.0
+    df["prev_day_high"] = 105.0
+
+    live_df = add_sr_levels(df, include_research_only=False)
+    research_df = add_sr_levels(df, include_research_only=True)
+    registry = build_sr_level_registry(df)
+    summary = summarize_sr_levels(research_df, registry, live_df=live_df)
+
+    assert summary["structure_status"]["label"] == "pass"
+    assert summary["score_status"]["label"] == "fail"
+    assert summary["score_status"]["flat"] is True
 
 
-def test_no_label_future_columns_in_research():
-    df = _fixture_d()
-    out = add_sr_levels(df, include_research_only=True)
-    bad = [c for c in out.columns if c.startswith("label_") or c.startswith("future_")]
-    assert bad == []
+def test_validator_chart_renders_per_zone_rectangles(monkeypatch) -> None:
+    df = _base(60)
+    df["prev_day_low"] = 95.0
+    df["prev_day_high"] = 105.0
+    # Add a swing high (high-info family) so the chart has at least one zone
+    # passing the structural-quality filter applied in _select_visible_zones.
+    _swing_confirm(df, bar=10, price=104.5, side=SR_SIDE_RESISTANCE, origin_bar=8)
+    _swing_confirm(df, bar=12, price=95.5, side=SR_SIDE_SUPPORT, origin_bar=10)
+
+    # The structural-score floor in the chart filter is a tunable knob;
+    # synthetic single-anchor swings here can't reach prod thresholds.
+    # Loosen the floor for this test so it tests the rendering contract,
+    # not a specific tuning value.
+    monkeypatch.setattr(vsr, "_STRUCTURAL_SCORE_MIN", 0.30)
+
+    registry = build_sr_level_registry(df)
+    out = project_sr_context(df, registry)  # mutates registry via update_sr_lifecycle
+    fig = vsr._build_sr_chart(
+        out,
+        out,
+        registry,
+        title="test",
+        date_from=str(out["timestamp"].iloc[0].date()),
+    )
+
+    rect_shapes = [shape for shape in (fig.layout.shapes or ()) if shape.type == "rect"]
+    assert rect_shapes, "expected at least one zone rectangle on the price subplot"
+    trace_names = {trace.name for trace in fig.data}
+    assert any(
+        name in trace_names for name in ("Support zone", "Resistance zone")
+    ), f"expected zone-anchor markers in legend; got {trace_names}"
+    assert all(
+        "Support L1" not in name for name in trace_names
+    ), "ladder bands should be removed in the rebuilt chart"

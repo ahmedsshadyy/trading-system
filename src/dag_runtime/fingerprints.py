@@ -1,13 +1,42 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from dataclasses import asdict
 
 import pandas as pd
 
 from src.dag_runtime.node import GraphRunContext, NodeExecutionResult, NodeManifest
 from src.pipeline_runtime import dataframe_fingerprint, fingerprint_mapping
+
+
+def compute_source_hash(fn: Callable) -> str:
+    """Return a stable short hash of ``fn``'s source code.
+
+    The hash captures every textual change to the function — including
+    whitespace and comments. This is intentional: any source-level change
+    invalidates the node cache so stale output is never served.
+
+    Falls back to ``repr(fn)`` for builtins and C-implemented callables
+    where source inspection fails.
+    """
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):
+        src = repr(fn)
+    return hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_multi_source_hash(*fns: Callable) -> str:
+    """Combine source hashes of multiple functions into one stable hash.
+
+    Use for composite stages whose output depends on more than one
+    underlying function (e.g. ``fvg_stack`` calls three).
+    """
+    joined = "|".join(compute_source_hash(fn) for fn in fns)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
 
 
 def _jsonify(value: Any) -> Any:

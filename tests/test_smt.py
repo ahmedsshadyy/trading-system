@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.indicators.smt import add_smt_divergence
 
@@ -51,6 +52,27 @@ def _set_high_event(
     df.loc[detect_idx, "swing_high_confirm_price"] = float(price)
 
 
+def test_duplicate_divergence_only_fires_once_per_swing_pair() -> None:
+    primary = _base_processed()
+    partner = _base_processed()
+    _set_low_event(primary, detect_idx=2, origin_idx=1, price=100.0)
+    _set_low_event(primary, detect_idx=4, origin_idx=3, price=90.0)
+    _set_low_event(partner, detect_idx=2, origin_idx=1, price=101.0)
+    _set_low_event(partner, detect_idx=4, origin_idx=3, price=103.0)
+
+    result = add_smt_divergence(
+        primary,
+        partner,
+        inverse=False,
+        partner_name="usd_jpy",
+        confirm_window=1,
+    )
+
+    assert result.loc[4, "xasset_smt_usd_jpy_bull_flag"] == 1
+    assert result.loc[5, "xasset_smt_usd_jpy_bull_flag"] == 0
+    assert int(result["xasset_smt_usd_jpy_bull_flag"].sum()) == 1
+
+
 def test_inverse_pair_bullish_divergence_is_detected() -> None:
     primary = _base_processed()
     partner = _base_processed()
@@ -96,6 +118,40 @@ def test_positive_pair_bearish_divergence_is_detected() -> None:
     assert 0.0 <= result.loc[4, "xasset_smt_usd_jpy_score"] <= 1.0
 
 
+def test_smt_score_and_metadata_use_strength_and_atr_when_available() -> None:
+    primary = _base_processed()
+    partner = _base_processed()
+    primary["swing_low_strength"] = np.full(len(primary), np.nan, dtype=float)
+    partner["swing_high_strength"] = np.full(len(partner), np.nan, dtype=float)
+    primary["atr_14"] = np.full(len(primary), 2.0, dtype=float)
+    partner["atr_14"] = np.full(len(partner), 4.0, dtype=float)
+
+    _set_low_event(primary, detect_idx=2, origin_idx=1, price=100.0)
+    _set_low_event(primary, detect_idx=4, origin_idx=3, price=90.0)
+    _set_high_event(partner, detect_idx=2, origin_idx=1, price=110.0)
+    _set_high_event(partner, detect_idx=4, origin_idx=3, price=105.0)
+    primary.loc[3, "swing_low_strength"] = 3.0
+    partner.loc[3, "swing_high_strength"] = 1.5
+
+    result = add_smt_divergence(
+        primary,
+        partner,
+        inverse=True,
+        partner_name="dxy",
+        confirm_window=1,
+    )
+
+    assert result.loc[4, "xasset_smt_dxy_expected_relation"] == -1
+    assert result.loc[4, "xasset_smt_dxy_primary_relation"] == -1
+    assert result.loc[4, "xasset_smt_dxy_partner_relation"] == 1
+    assert result.loc[4, "xasset_smt_dxy_primary_strength"] == 3.0
+    assert result.loc[4, "xasset_smt_dxy_partner_strength"] == 1.5
+    assert result.loc[4, "xasset_smt_dxy_primary_atr"] == 2.0
+    assert result.loc[4, "xasset_smt_dxy_partner_atr"] == 4.0
+    assert result.loc[4, "xasset_smt_dxy_event_gap"] == 0.0
+    assert result.loc[4, "xasset_smt_dxy_score"] == pytest.approx(0.9)
+
+
 def test_no_signal_emits_before_confirmation_window_matches() -> None:
     primary = _base_processed()
     partner = _base_processed()
@@ -115,6 +171,26 @@ def test_no_signal_emits_before_confirmation_window_matches() -> None:
     assert int(result["xasset_smt_usd_jpy_bull_flag"].sum()) == 0
     assert int(result["xasset_smt_usd_jpy_bear_flag"].sum()) == 0
     assert result["xasset_smt_usd_jpy_score"].dropna().empty
+
+
+def test_add_smt_divergence_rejects_misaligned_inputs() -> None:
+    primary = _base_processed(rows=4)
+    partner = _base_processed(rows=5)
+
+    with pytest.raises(
+        ValueError,
+        match="aligned frames with identical row counts",
+    ):
+        add_smt_divergence(primary, partner, inverse=True, partner_name="dxy")
+
+    partner = _base_processed(rows=4)
+    partner.loc[2, "timestamp"] = partner.loc[2, "timestamp"] + pd.Timedelta(minutes=1)
+
+    with pytest.raises(
+        ValueError,
+        match="identical timestamps on aligned frames",
+    ):
+        add_smt_divergence(primary, partner, inverse=True, partner_name="dxy")
 
 
 def test_add_smt_divergence_is_pure_and_dtype_stable() -> None:

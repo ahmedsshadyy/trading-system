@@ -1,0 +1,28 @@
+variant_label,ranking_family,score_formula,median_best_score
+baseline_current_live,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5955322140772844
+baseline_current_live,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.5049458097604373
+baseline_current_live,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.5108551883878767
+source_repair_last_opposing_before_bos,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5955322140772844
+source_repair_last_opposing_before_bos,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.5049458097604373
+source_repair_last_opposing_before_bos,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.5108551883878767
+source_repair_last_opposing_before_displacement,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5955322140772844
+source_repair_last_opposing_before_displacement,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.5049458097604373
+source_repair_last_opposing_before_displacement,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.5108551883878767
+source_repair_last_meaningful_opposing_before_impulse,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5959165210259043
+source_repair_last_meaningful_opposing_before_impulse,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.5059002016015598
+source_repair_last_meaningful_opposing_before_impulse,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.5125549228740232
+source_repair_cluster_base_before_break,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5929405682782206
+source_repair_cluster_base_before_break,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.5047912237287032
+source_repair_cluster_base_before_break,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.5109329044427815
+source_repair_source_freeze_on_pre_break_context,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5917368692157015
+source_repair_source_freeze_on_pre_break_context,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.502834665870345
+source_repair_source_freeze_on_pre_break_context,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.5089262840731036
+activation_repair_best_mild,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5966937180278031
+activation_repair_best_mild,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.5077167541667302
+activation_repair_best_mild,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.5154519342807158
+composite_source_freeze_plus_activation_best,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5914284995390366
+composite_source_freeze_plus_activation_best,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.5038828042067672
+composite_source_freeze_plus_activation_best,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.5118734338366535
+composite_cluster_base_plus_activation_best,monitorability_score_v1,0.28*distance + 0.20*freshness + 0.16*recency + 0.14*strength + 0.10*remaining + 0.07*confluence + 0.03*side_context + 0.02*(1-overlap),0.5922595899278292
+composite_cluster_base_plus_activation_best,monitorability_score_v2_distance_heavy,0.50*distance + 0.15*freshness + 0.10*recency + 0.10*strength + 0.10*remaining + 0.05*(1-overlap-consumed),0.5072049282779996
+composite_cluster_base_plus_activation_best,monitorability_score_v3_distance_recency_balance,0.35*distance + 0.25*recency + 0.15*freshness + 0.10*strength + 0.10*remaining + 0.05*confluence,0.514875930275539

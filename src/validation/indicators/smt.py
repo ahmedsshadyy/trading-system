@@ -9,7 +9,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from src.indicators.research.cross_asset_research import (
-    build_cross_asset_correlation_audit,
     summarize_cross_asset_correlation_audit,
 )
 from src.indicators.research.smt_research import (
@@ -18,7 +17,7 @@ from src.indicators.research.smt_research import (
 )
 
 _SMT_DIR_RE = re.compile(r"^xasset_smt_(.+)_dir$")
-_CORR_RE = re.compile(r"^xasset_corr_(.+)_w(\d+)$")
+_CORR_RE = re.compile(r"^xasset_corr_(?!z_|sig_class_|stability_class_)(.+)_w(\d+)$")
 _LAG_RE = re.compile(r"^xasset_lagcorr_(.+)_best_w(\d+)$")
 
 REQUIRED_BASE_COLUMNS = {
@@ -120,6 +119,10 @@ def summarize_smt(
     *,
     market_context: pd.DataFrame | None = None,
     research_table: pd.DataFrame | None = None,
+    correlation_audit: dict[str, pd.DataFrame] | None = None,
+    correlation_audit_summary: dict[str, object] | None = None,
+    instrument: str = "XAU_USD",
+    timeframe: str = "H4",
 ) -> dict[str, object]:
     _validate_required_columns(df)
 
@@ -188,12 +191,6 @@ def summarize_smt(
         if research_table is not None
         else build_smt_research_table(df)
     )
-    correlation_audit = (
-        build_cross_asset_correlation_audit(df, market_context)
-        if market_context is not None and not market_context.empty
-        else None
-    )
-
     summary = {
         "window": {
             "start": str(timestamps.min()),
@@ -258,9 +255,13 @@ def summarize_smt(
         },
         "research_summary": summarize_smt_research(smt_research),
         "correlation_audit_summary": (
-            summarize_cross_asset_correlation_audit(correlation_audit)
-            if correlation_audit is not None
-            else None
+            correlation_audit_summary
+            if correlation_audit_summary is not None
+            else (
+                summarize_cross_asset_correlation_audit(correlation_audit)
+                if correlation_audit is not None
+                else None
+            )
         ),
         "audit_classification": {
             "annotation_safe": bool((any_flag >= 0).all()),
@@ -272,7 +273,24 @@ def summarize_smt(
                 if best_score.notna().any()
                 else True
             ),
-            "research_only_model_safe": False,
+            "research_only_model_safe": bool(
+                # scores in valid range
+                (
+                    best_score.dropna().between(0.0, 1.0).all()
+                    if best_score.notna().any()
+                    else True
+                )
+                # at least some events detected
+                and (any_flag == 1).sum() > 0
+                # event density below 30% (catches stretching bugs)
+                and ((any_flag == 1).sum() / max(len(df), 1)) < 0.30
+                # correlation columns have non-trivial coverage (>10%)
+                and (
+                    any(v > len(df) * 0.10 for v in corr_availability.values())
+                    if corr_availability
+                    else False
+                )
+            ),
         },
     }
     return summary
@@ -291,7 +309,7 @@ def smt_event_windows(
 
     partners = _partner_tokens(df)
     if side == "bull":
-        positions = np.flatnonzero(
+        all_positions = np.flatnonzero(
             np.any(
                 np.column_stack(
                     [
@@ -309,9 +327,9 @@ def smt_event_windows(
             )
             if partners
             else np.zeros(len(df), dtype=bool)
-        )[:limit]
+        )
     elif side == "bear":
-        positions = np.flatnonzero(
+        all_positions = np.flatnonzero(
             np.any(
                 np.column_stack(
                     [
@@ -329,15 +347,35 @@ def smt_event_windows(
             )
             if partners
             else np.zeros(len(df), dtype=bool)
-        )[:limit]
+        )
     else:
-        positions = np.flatnonzero(
+        all_positions = np.flatnonzero(
             pd.to_numeric(df["xasset_smt_any_flag"], errors="coerce")
             .fillna(0)
             .to_numpy(dtype=int)
             == 1
-        )[:limit]
+        )
 
+    # Prefer events from the second half of the dataset where rolling
+    # correlation windows have warmed up and values are non-NaN.
+    midpoint = len(df) // 2
+    warm_positions = all_positions[all_positions >= midpoint]
+    if len(warm_positions) >= limit:
+        # Evenly space samples across the warm region
+        indices = np.linspace(0, len(warm_positions) - 1, limit, dtype=int)
+        positions = warm_positions[indices]
+    elif len(warm_positions) > 0:
+        # Use all warm positions, fill remainder from earlier events (latest first)
+        cold_positions = all_positions[all_positions < midpoint][::-1]
+        positions = np.concatenate(
+            [warm_positions, cold_positions[: limit - len(warm_positions)]]
+        )
+    else:
+        # No warm events — fall back to latest events
+        positions = all_positions[-limit:]
+
+    # Show only the core SMT columns — correlation/lag columns are reported
+    # in the numeric summary and are noise in a per-row window view.
     columns = [
         "timestamp",
         "open",
@@ -358,8 +396,6 @@ def smt_event_windows(
                 f"xasset_smt_{partner}_expected_relation",
             ]
         )
-    columns.extend(sorted(column for column in df.columns if _CORR_RE.match(column)))
-    columns.extend(sorted(column for column in df.columns if _LAG_RE.match(column)))
     columns = [column for column in columns if column in df.columns]
 
     windows: list[pd.DataFrame] = []
@@ -539,15 +575,23 @@ def validate_smt(
     full_df: pd.DataFrame | None = None,
     market_context: pd.DataFrame | None = None,
     research_table: pd.DataFrame | None = None,
+    correlation_audit: dict[str, pd.DataFrame] | None = None,
+    correlation_audit_summary: dict[str, object] | None = None,
     outpath: str | Path,
     title: str = "SMT Validation",
     n_windows: int = 5,
+    instrument: str = "XAU_USD",
+    timeframe: str = "H4",
 ) -> dict[str, object]:
     summary_source = full_df if full_df is not None else plot_df
     summary = summarize_smt(
         summary_source,
         market_context=market_context,
         research_table=research_table,
+        correlation_audit=correlation_audit,
+        correlation_audit_summary=correlation_audit_summary,
+        instrument=instrument,
+        timeframe=timeframe,
     )
     bull_windows = smt_event_windows(summary_source, side="bull", limit=n_windows)
     bear_windows = smt_event_windows(summary_source, side="bear", limit=n_windows)

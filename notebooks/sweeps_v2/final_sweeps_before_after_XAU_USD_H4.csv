@@ -1,0 +1,6 @@
+profile,confirmed_sweeps_count,accepted_breakouts_count,unresolved_breaches_count,same_bar_sweeps,delayed_rejection_sweeps,micro_interaction_sweeps,standard_liquidity_sweeps,displacement_confirmed_sweeps,tradeable_sweep_candidate_class,tradeable_candidates,tradeable_rate,followed_by_bos,followed_by_choch,followed_by_displacement,failed_breakout_reclaim,causality_violations
+step11d_current,2609,1704,5187,783,1826,13,1213,436,947,947,0.363,152,213,471,136,0
+step11e_dist0.25_exc0.50_rej0.60,2609,1704,5187,783,1826,450,1158,402,599,599,0.2296,152,213,471,136,0
+step11e_dist0.25_exc0.50_rej0.65,2609,1704,5187,783,1826,472,1148,396,593,593,0.2273,152,213,471,136,0
+step11e_dist0.25_exc0.60_rej0.65,2609,1704,5187,783,1826,549,1322,463,275,275,0.1054,152,213,471,136,0
+step11e_default_chosen,2609,1704,5187,783,1826,472,1148,396,593,593,0.2273,152,213,471,136,0

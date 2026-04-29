@@ -1,3 +1,12 @@
+"""CHoCH context feature layer.
+
+Repo stance:
+- CHoCH is already the superior structural reversal signal.
+- Any OB-related context in this module is optional enrichment only.
+- Strategies do not need OB in order to act on CHoCH when the CHoCH event
+  already expresses the structural reversal thesis.
+"""
+
 from __future__ import annotations
 
 import numpy as np

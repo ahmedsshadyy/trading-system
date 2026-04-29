@@ -20,13 +20,14 @@ from typing import Any, Mapping
 import pandas as pd
 
 from src.dag_runtime import execute_graph, GraphRunContext
+from src.dag_runtime import GraphRunResult
 from src.indicators._helpers.schema import normalize_candle_schema
 from src.indicators.features.cross_asset import (
     SMT_PARTNERS,
     SUPPORTED_CROSS_ASSET_TIMEFRAMES,
-    attach_cross_asset_context,
+    cross_asset_runtime_config_hash,
     persist_market_context,
-    resolve_cross_asset_inputs,
+    relevant_correlation_pairs,
 )
 from src.pipeline_runtime import (
     ArtifactWriteResult,
@@ -36,6 +37,7 @@ from src.pipeline_runtime import (
     ReplayPolicy,
     cleanup_temp_artifacts,
     dataframe_fingerprint,
+    fingerprint_mapping,
     load_partitioned_dataset,
     merge_recomputed_frontier,
     metadata_path,
@@ -86,9 +88,16 @@ from src.indicators.smc.equal_hl import add_equal_hl
 from src.indicators.smc.displacement import add_displacement_candle
 from src.indicators.smc.amd import add_amd_engine
 
+# --- Sweeps v2 (Steps 9-11) ---
+# sr_levels / unified_liquidity_sources / final_sweeps are intentionally NOT
+# wired into the live pipeline yet. Reason: sr_levels assigns sequential
+# zone IDs while walking the frame, so partial-replay slices yield
+# different ids than a full rebuild. The research pipeline (which always
+# walks the full frame) does run them. See `_live_stages` for context.
+
 LIVE_PIPELINE_NAME = "build_live"
 LIVE_SCHEMA_VERSION = 1
-LIVE_FEATURE_CONTRACT_VERSION = 2
+LIVE_FEATURE_CONTRACT_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -134,11 +143,31 @@ def _run_stage(
     return result
 
 
+def _record_partitioned_dataset_load(
+    profiler: PipelineRunProfiler | None,
+    *,
+    kind: str,
+):
+    if profiler is None:
+        return None
+
+    def _observer(path: Path, frame: pd.DataFrame) -> None:
+        profiler.record_read(
+            path=path,
+            rows=len(frame),
+            bytes_read=path.stat().st_size if path.exists() else None,
+            kind=kind,
+        )
+
+    return _observer
+
+
 def _live_stages(
     *,
     instrument: str,
     swing_window: int,
     include_vp: bool,
+    timeframe: str = "H4",
 ) -> list[PipelineStage]:
     stages: list[PipelineStage] = [
         PipelineStage(
@@ -205,7 +234,7 @@ def _live_stages(
         PipelineStage(
             "rsi_divergence",
             add_rsi_divergence,
-            ReplayPolicy("rsi_divergence", "B", replay_bars=220, warmup_bars=14),
+            ReplayPolicy("rsi_divergence", "B", replay_bars=200, warmup_bars=14),
         ),
         PipelineStage(
             "rolling_atr_ratio",
@@ -220,37 +249,37 @@ def _live_stages(
         PipelineStage(
             "fvg_stack",
             _run_fvg_stack,
-            ReplayPolicy("fvg_stack", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("fvg_stack", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "displacement",
             add_displacement_candle,
-            ReplayPolicy("displacement", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("displacement", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "order_blocks",
             add_ob,
-            ReplayPolicy("order_blocks", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("order_blocks", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "ob_mitigation",
             add_ob_mitigation,
-            ReplayPolicy("ob_mitigation", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("ob_mitigation", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "liquidity_sweeps",
             add_liquidity_sweep,
-            ReplayPolicy("liquidity_sweeps", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("liquidity_sweeps", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "equal_hl",
             add_equal_hl,
-            ReplayPolicy("equal_hl", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("equal_hl", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "amd_engine",
             lambda df: add_amd_engine(df, add_labels=False),
-            ReplayPolicy("amd_engine", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("amd_engine", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "prev_day_hl",
@@ -285,9 +314,22 @@ def _live_stages(
         PipelineStage(
             "regime",
             lambda df: add_regime(df, include_research_only=False),
-            ReplayPolicy("regime", "B", replay_bars=240, carried_state=True),
+            ReplayPolicy("regime", "B", replay_bars=200, carried_state=True),
         )
     )
+
+    # ── Sweeps v2 (Steps 9-11) — research pipeline only for now ──────────
+    # sr_levels assigns zone IDs sequentially as it walks the frame. Under
+    # partial replay (240 bars) the registry sees fewer historical zones,
+    # so the same physical zone gets a different numeric id than under a
+    # full rebuild. The live-incremental == full-rebuild parity test
+    # therefore fails for any column that depends on zone_id.
+    #
+    # The research pipeline always processes the full frame so it has no
+    # such issue. Live wiring is deferred until sr_levels grows
+    # zone-id stability under partial replay (e.g. content-hashed ids).
+    # Until then live sweeps would consume a degraded set of source
+    # families anyway, so the production line stays on research.
     return stages
 
 
@@ -320,7 +362,12 @@ def _partition_frontier_ts(metadata: PipelineMetadata | None) -> pd.Timestamp | 
     ts = pd.Timestamp(metadata.last_processed_ts)
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
-    return ts.to_period("M").start_time.tz_localize("UTC")
+    return (
+        ts.tz_convert("UTC")
+        .tz_localize(None)
+        .to_period("M")
+        .start_time.tz_localize("UTC")
+    )
 
 
 def _cross_asset_partner_fingerprint(
@@ -341,6 +388,140 @@ def _cross_asset_partner_fingerprint(
     return dataframe_fingerprint(pd.DataFrame(rows), strategy="content")
 
 
+def _cross_asset_peer_identity_payload(
+    *,
+    instrument: str,
+    timeframe: str,
+    peer_raw_frames: Mapping[str, pd.DataFrame] | None,
+    raw_data_root: str | Path | None,
+) -> dict[str, object]:
+    from src.indicators.features.cross_asset import CONTEXT_SYMBOLS
+
+    payload: dict[str, object] = {}
+    provided = dict(peer_raw_frames or {})
+    for symbol in CONTEXT_SYMBOLS:
+        if symbol == instrument:
+            continue
+        frame = provided.get(symbol)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            payload[symbol] = {
+                "source": "input",
+                "fingerprint": dataframe_fingerprint(frame, strategy="content"),
+            }
+            continue
+        if raw_data_root is None:
+            payload[symbol] = {"source": "missing"}
+            continue
+        path = Path(raw_data_root) / f"{symbol}_{timeframe}.parquet"
+        if not path.exists():
+            payload[symbol] = {"source": "missing"}
+            continue
+        stat = path.stat()
+        payload[symbol] = {
+            "source": "file",
+            "path": str(path.resolve()),
+            "bytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    return payload
+
+
+def _partner_source_hash(symbol: str) -> str:
+    from src.dag_runtime.builtin_graphs import _live_partner_source_hash
+
+    return _live_partner_source_hash(symbol)
+
+
+def _pregraph_cross_asset_fingerprints(
+    *,
+    normalized: pd.DataFrame,
+    instrument: str,
+    timeframe: str,
+    peer_raw_frames: Mapping[str, pd.DataFrame] | None,
+    raw_data_root: str | Path | None,
+) -> tuple[str, str]:
+    peer_inputs = _cross_asset_peer_identity_payload(
+        instrument=instrument,
+        timeframe=timeframe,
+        peer_raw_frames=peer_raw_frames,
+        raw_data_root=raw_data_root,
+    )
+    relevant_pairs = relevant_correlation_pairs(instrument)
+    market_context_fp = fingerprint_mapping(
+        {
+            "peer_inputs": peer_inputs,
+            "cross_asset_config_hash": cross_asset_runtime_config_hash(
+                timeframe=timeframe,
+                relevant_pairs=relevant_pairs,
+            ),
+        }
+    )
+    partner_fp = fingerprint_mapping(
+        {
+            "partners": [
+                {
+                    "symbol": symbol,
+                    "peer_input": peer_inputs.get(symbol),
+                    "source_hash": _partner_source_hash(symbol),
+                }
+                for symbol, _relation in SMT_PARTNERS.get(instrument, ())
+            ]
+        }
+    )
+    return market_context_fp, partner_fp
+
+
+def _execute_live_graph(
+    df: pd.DataFrame,
+    *,
+    instrument: str,
+    swing_window: int,
+    include_vp: bool,
+    timeframe: str,
+    include_cross_asset: bool,
+    peer_raw_frames: Mapping[str, pd.DataFrame] | None,
+    raw_data_root: str | Path | None,
+    force_graph_recompute: bool,
+    features_root: str | Path = "data/features",
+) -> GraphRunResult:
+    out = _coerce_ohlc(df)
+    from src.dag_runtime.builtin_graphs import build_live_stage_graph
+
+    graph = build_live_stage_graph(
+        instrument=instrument,
+        swing_window=swing_window,
+        include_vp=include_vp,
+        timeframe=timeframe,
+        include_cross_asset=include_cross_asset,
+    )
+    inputs: dict[str, Any] = {"raw_input": out}
+    if peer_raw_frames is not None:
+        inputs["peer_raw_frames"] = peer_raw_frames
+    return execute_graph(
+        graph,
+        context=GraphRunContext(
+            graph_name=graph.graph_name,
+            symbol=instrument,
+            timeframe=timeframe,
+            inputs=inputs,
+            config={
+                "instrument": instrument,
+                "timeframe": timeframe,
+                "swing_window": swing_window,
+                "include_vp": include_vp,
+                "include_cross_asset": include_cross_asset,
+                "raw_data_root": (
+                    str(raw_data_root) if raw_data_root is not None else None
+                ),
+            },
+            features_root=features_root,
+            cache_root="data/dag_cache",
+            force=force_graph_recompute,
+            invalidate_cache=force_graph_recompute,
+        ),
+    )
+
+
 def build_live_indicators(
     df: pd.DataFrame,
     instrument: str = "XAU_USD",
@@ -353,6 +534,7 @@ def build_live_indicators(
     processed_cross_asset_frames: Mapping[str, pd.DataFrame] | None = None,
     peer_raw_frames: Mapping[str, pd.DataFrame] | None = None,
     raw_data_root: str | Path | None = "data/raw",
+    force_graph_recompute: bool = False,
 ) -> pd.DataFrame:
     """Apply the causal-only indicator stack for live deployment.
 
@@ -377,69 +559,25 @@ def build_live_indicators(
     -------
     DataFrame with all live-safe indicator columns added.
     """
-    out = _coerce_ohlc(df)
-    from src.dag_runtime.builtin_graphs import build_live_stage_graph
-
-    graph = build_live_stage_graph(
-        instrument=instrument,
-        swing_window=swing_window,
-        include_vp=include_vp,
-    )
-    result = execute_graph(
-        graph,
-        context=GraphRunContext(
-            graph_name=graph.graph_name,
-            symbol=instrument,
-            timeframe="graph",
-            inputs={"raw_input": out},
-            config={
-                "instrument": instrument,
-                "swing_window": swing_window,
-                "include_vp": include_vp,
-            },
-            cache_root="data/dag_cache",
-            force=True,
-            invalidate_cache=True,
-        ),
-    )
-    primary_frame = result.primary_frame()
-    if not include_cross_asset:
-        return primary_frame
     if timeframe not in SUPPORTED_CROSS_ASSET_TIMEFRAMES:
         raise ValueError(
             f"Cross-asset context only supports {sorted(SUPPORTED_CROSS_ASSET_TIMEFRAMES)}"
         )
-
-    def _build_partner_frame(
-        raw_partner: pd.DataFrame, partner_symbol: str
-    ) -> pd.DataFrame:
-        return build_live_indicators(
-            raw_partner,
-            instrument=partner_symbol,
-            swing_window=swing_window,
-            include_vp=False,
-            profiler=None,
-            timeframe=timeframe,
-            include_cross_asset=False,
-        )
-
-    resolved_market_context, resolved_processed_frames = resolve_cross_asset_inputs(
+    result = _execute_live_graph(
         df,
         instrument=instrument,
+        swing_window=swing_window,
+        include_vp=include_vp,
         timeframe=timeframe,
-        market_context=market_context,
-        processed_frames=processed_cross_asset_frames,
+        include_cross_asset=include_cross_asset,
         peer_raw_frames=peer_raw_frames,
         raw_data_root=raw_data_root,
-        partner_builder=_build_partner_frame if instrument in SMT_PARTNERS else None,
+        force_graph_recompute=force_graph_recompute,
     )
-    return attach_cross_asset_context(
-        primary_frame,
-        instrument=instrument,
-        timeframe=timeframe,
-        market_context=resolved_market_context,
-        processed_frames=resolved_processed_frames,
-    )
+    if profiler is not None and include_cross_asset:
+        profiler.set_metric("cross_asset_off_graph_seconds", 0.0)
+        profiler.set_metric("live_cross_asset_dag", True)
+    return result.primary_frame()
 
 
 def run_live_pipeline(
@@ -460,6 +598,7 @@ def run_live_pipeline(
     processed_cross_asset_frames: Mapping[str, pd.DataFrame] | None = None,
     peer_raw_frames: Mapping[str, pd.DataFrame] | None = None,
     raw_data_root: str | Path | None = "data/raw",
+    force_graph_recompute: bool = False,
 ) -> PipelineExecutionResult:
     runtime_profiler = profiler or PipelineRunProfiler(
         pipeline=LIVE_PIPELINE_NAME,
@@ -469,7 +608,6 @@ def run_live_pipeline(
     normalized = normalize_candle_schema(df, require_volume=True)
     input_fingerprint = dataframe_fingerprint(normalized)
     resolved_market_context: pd.DataFrame | None = None
-    resolved_processed_frames: dict[str, pd.DataFrame] | None = None
     market_context_fingerprint: str | None = None
     partner_fingerprint: str | None = None
     if include_cross_asset:
@@ -478,38 +616,20 @@ def run_live_pipeline(
                 "Cross-asset context only supports "
                 f"{sorted(SUPPORTED_CROSS_ASSET_TIMEFRAMES)}"
             )
-
-        def _build_partner_frame(
-            raw_partner: pd.DataFrame,
-            partner_symbol: str,
-        ) -> pd.DataFrame:
-            return build_live_indicators(
-                raw_partner,
-                instrument=partner_symbol,
-                swing_window=swing_window,
-                include_vp=False,
-                profiler=None,
+        market_context_fingerprint, partner_fingerprint = (
+            _pregraph_cross_asset_fingerprints(
+                normalized=normalized,
+                instrument=instrument,
                 timeframe=timeframe,
-                include_cross_asset=False,
+                peer_raw_frames=peer_raw_frames,
+                raw_data_root=raw_data_root,
             )
-
-        resolved_market_context, resolved_processed_frames = resolve_cross_asset_inputs(
-            normalized,
-            instrument=instrument,
-            timeframe=timeframe,
-            market_context=market_context,
-            processed_frames=processed_cross_asset_frames,
-            peer_raw_frames=peer_raw_frames,
-            raw_data_root=raw_data_root,
-            partner_builder=(
-                _build_partner_frame if instrument in SMT_PARTNERS else None
-            ),
         )
-        if resolved_market_context is not None and not resolved_market_context.empty:
-            market_context_fingerprint = dataframe_fingerprint(resolved_market_context)
-        partner_fingerprint = _cross_asset_partner_fingerprint(
-            resolved_processed_frames
-        )
+        runtime_profiler.set_metric("cross_asset_off_graph_seconds", 0.0)
+        runtime_profiler.set_metric("live_cross_asset_dag", True)
+    extra_config = {
+        key: value for key, value in (config or {}).items() if key != "features_root"
+    }
     config_payload = {
         "instrument": instrument,
         "timeframe": timeframe,
@@ -518,11 +638,12 @@ def run_live_pipeline(
         "include_cross_asset": include_cross_asset,
         "cross_asset_market_context_fp": market_context_fingerprint,
         "cross_asset_partner_fp": partner_fingerprint,
-        **(config or {}),
+        **extra_config,
     }
     config_fingerprint = dataframe_fingerprint(
         pd.DataFrame([config_payload]), strategy="content"
     )
+    runtime_profiler.set_metric("workload_class", "incremental_or_full_live")
     max_replay_bars = (
         replay_bars_override
         if replay_bars_override is not None
@@ -532,6 +653,7 @@ def run_live_pipeline(
                 instrument=instrument,
                 swing_window=swing_window,
                 include_vp=include_vp,
+                timeframe=timeframe,
             )
         )
     )
@@ -544,7 +666,7 @@ def run_live_pipeline(
         input_fingerprint=input_fingerprint,
         config_fingerprint=config_fingerprint,
         replay_bars=max_replay_bars,
-        force_rebuild=force_rebuild,
+        force_rebuild=bool(force_rebuild or force_graph_recompute),
     )
     if plan.is_noop:
         return PipelineExecutionResult(
@@ -563,19 +685,29 @@ def run_live_pipeline(
         )
 
     working = slice_frame_for_plan(normalized, plan)
-    computed = build_live_indicators(
+    graph_result = _execute_live_graph(
         working,
         instrument=instrument,
         swing_window=swing_window,
         include_vp=include_vp,
-        profiler=runtime_profiler,
         timeframe=timeframe,
         include_cross_asset=include_cross_asset,
-        market_context=resolved_market_context,
-        processed_cross_asset_frames=resolved_processed_frames,
         peer_raw_frames=peer_raw_frames,
         raw_data_root=raw_data_root,
+        force_graph_recompute=force_graph_recompute,
+        features_root=(config or {}).get("features_root", "data/features"),
     )
+    computed = graph_result.primary_frame()
+    if include_cross_asset:
+        market_context_result = graph_result.node_results.get(
+            "live_market_context_source"
+        )
+        if market_context_result is not None:
+            resolved_market_context = market_context_result.primary_frame()
+            runtime_profiler.set_metric(
+                "market_context_cache_current",
+                bool(market_context_result.cache_hit),
+            )
     if existing_history is not None and plan.mode == "incremental":
         final_frame = merge_recomputed_frontier(
             existing_history,
@@ -624,6 +756,7 @@ def materialize_live_features(
     processed_cross_asset_frames: Mapping[str, pd.DataFrame] | None = None,
     peer_raw_frames: Mapping[str, pd.DataFrame] | None = None,
     raw_data_root: str | Path | None = "data/raw",
+    force_graph_recompute: bool = False,
 ) -> MaterializationResult:
     runtime_profiler = profiler or PipelineRunProfiler(
         pipeline=f"{LIVE_PIPELINE_NAME}_materialize",
@@ -645,7 +778,12 @@ def materialize_live_features(
             dataset="live",
             symbol=instrument,
             timeframe=timeframe,
+            read_observer=_record_partitioned_dataset_load(
+                runtime_profiler,
+                kind="load-existing-live-history",
+            ),
         )
+    runtime_config = {"features_root": str(features_root), **(config or {})}
     result = run_live_pipeline(
         raw_df,
         instrument=instrument,
@@ -654,7 +792,7 @@ def materialize_live_features(
         include_vp=include_vp,
         existing_history=existing_history,
         metadata=metadata,
-        config=config,
+        config=runtime_config,
         force_rebuild=force_rebuild,
         profiler=runtime_profiler,
         replay_bars_override=(
@@ -665,6 +803,7 @@ def materialize_live_features(
         processed_cross_asset_frames=processed_cross_asset_frames,
         peer_raw_frames=peer_raw_frames,
         raw_data_root=raw_data_root,
+        force_graph_recompute=force_graph_recompute,
     )
     if result.plan.is_noop:
         return MaterializationResult(
@@ -705,6 +844,7 @@ def materialize_live_features(
             kind="canonical-live",
         )
     if include_cross_asset and result.market_context is not None:
+        relevant = relevant_correlation_pairs(instrument)
         market_context_artifacts = persist_market_context(
             result.market_context,
             features_root=features_root,
@@ -716,6 +856,7 @@ def materialize_live_features(
                 else result.plan.replay_from_ts
             ),
             full_rebuild=bool(force_rebuild or result.plan.mode == "full"),
+            relevant_pairs=relevant,
         )
         artifacts.extend(market_context_artifacts)
         for artifact in market_context_artifacts:
@@ -750,6 +891,11 @@ def materialize_live_features(
             "plan_mode": result.plan.mode,
             "plan_reason": result.plan.reason,
             "include_cross_asset": include_cross_asset,
+            "live_cross_asset_dag": include_cross_asset,
+            "market_context_cache_current": result.profiler.summary()
+            .get("counters", {})
+            .get("market_context_cache_current"),
+            "cross_asset_node_cache_enabled": include_cross_asset,
         },
     )
     write_metadata_atomic(metadata_file, updated_metadata)

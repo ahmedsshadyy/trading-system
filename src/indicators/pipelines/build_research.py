@@ -19,18 +19,15 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from src.dag_runtime import execute_graph, GraphRunContext
+from src.dag_runtime import execute_graph, GraphRunContext, GraphRunResult
 from src.indicators._helpers.schema import normalize_candle_schema
 from src.indicators.features.cross_asset import (
     SMT_PARTNERS,
     SUPPORTED_CROSS_ASSET_TIMEFRAMES,
-    attach_cross_asset_context,
+    cross_asset_runtime_config_hash,
     persist_market_context,
-    resolve_cross_asset_inputs,
 )
 from src.indicators.research import (
-    build_cross_asset_correlation_audit,
-    build_smt_research_table,
     summarize_cross_asset_correlation_audit,
     summarize_smt_research,
 )
@@ -42,6 +39,7 @@ from src.pipeline_runtime import (
     ReplayPolicy,
     cleanup_temp_artifacts,
     dataframe_fingerprint,
+    fingerprint_mapping,
     load_partitioned_dataset,
     merge_recomputed_frontier,
     metadata_path,
@@ -95,9 +93,21 @@ from src.indicators.smc.equal_hl import add_equal_hl
 from src.indicators.smc.displacement import add_displacement_candle
 from src.indicators.smc.amd import add_amd_engine
 
+# --- Sweeps v2 (Steps 9-11): unified liquidity sources + final sweeps ---
+from src.indicators.foundation.sr_levels import add_sr_levels
+from src.indicators.sweeps_v2.unified_sources import add_unified_liquidity_sources
+from src.indicators.sweeps_v2.final_sweeps import add_final_sweeps
+
 RESEARCH_PIPELINE_NAME = "build_research"
 RESEARCH_SCHEMA_VERSION = 1
-RESEARCH_FEATURE_CONTRACT_VERSION = 2
+# Bumped 3 → 4 when sr_levels / unified_liquidity_sources / final_sweeps
+# stages were added.
+# Bumped 4 → 5 for Step 11B repair: persistent breach tracking, eligibility
+# filter against bar open (not close), penetration / wick-prominence /
+# cooldown / family-strength gates, and corrected followthrough column
+# linkage. Output ladder + sweeps schemas changed observably, so the bump
+# invalidates pipeline-level caches.
+RESEARCH_FEATURE_CONTRACT_VERSION = 5
 
 
 @dataclass(slots=True)
@@ -107,6 +117,7 @@ class PipelineExecutionResult:
     profiler: PipelineRunProfiler
     metadata_updates: dict[str, Any]
     market_context: pd.DataFrame | None = None
+    graph_result: GraphRunResult | None = None
 
 
 @dataclass(slots=True)
@@ -143,6 +154,25 @@ def _run_stage(
     return result
 
 
+def _record_partitioned_dataset_load(
+    profiler: PipelineRunProfiler | None,
+    *,
+    kind: str,
+):
+    if profiler is None:
+        return None
+
+    def _observer(path: Path, frame: pd.DataFrame) -> None:
+        profiler.record_read(
+            path=path,
+            rows=len(frame),
+            bytes_read=path.stat().st_size if path.exists() else None,
+            kind=kind,
+        )
+
+    return _observer
+
+
 def _run_fvg_stack(df: pd.DataFrame) -> pd.DataFrame:
     fvg_debug = collect_fvg_debug_tables(df)
     out = fvg_debug["frame"]
@@ -172,7 +202,23 @@ def _partition_frontier_ts(metadata: PipelineMetadata | None) -> pd.Timestamp | 
     ts = pd.Timestamp(metadata.last_processed_ts)
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
-    return ts.to_period("M").start_time.tz_localize("UTC")
+    return (
+        ts.tz_convert("UTC")
+        .tz_localize(None)
+        .to_period("M")
+        .start_time.tz_localize("UTC")
+    )
+
+
+def _effective_frontier_from_ts(
+    partition_frontier_ts: pd.Timestamp | None,
+    replay_from_ts: pd.Timestamp | None,
+) -> pd.Timestamp | None:
+    if replay_from_ts is None:
+        return partition_frontier_ts
+    if partition_frontier_ts is None or replay_from_ts < partition_frontier_ts:
+        return replay_from_ts
+    return partition_frontier_ts
 
 
 def _cross_asset_partner_fingerprint(
@@ -193,12 +239,152 @@ def _cross_asset_partner_fingerprint(
     return dataframe_fingerprint(pd.DataFrame(rows), strategy="content")
 
 
+def _cross_asset_peer_identity_payload(
+    *,
+    instrument: str,
+    timeframe: str,
+    peer_raw_frames: Mapping[str, pd.DataFrame] | None,
+    raw_data_root: str | Path | None,
+) -> dict[str, object]:
+    from src.indicators.features.cross_asset import CONTEXT_SYMBOLS
+
+    payload: dict[str, object] = {}
+    provided = dict(peer_raw_frames or {})
+    for symbol in CONTEXT_SYMBOLS:
+        if symbol == instrument:
+            continue
+        frame = provided.get(symbol)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            payload[symbol] = {
+                "source": "input",
+                "fingerprint": dataframe_fingerprint(frame, strategy="content"),
+            }
+            continue
+        if raw_data_root is None:
+            payload[symbol] = {"source": "missing"}
+            continue
+        path = Path(raw_data_root) / f"{symbol}_{timeframe}.parquet"
+        if not path.exists():
+            payload[symbol] = {"source": "missing"}
+            continue
+        stat = path.stat()
+        payload[symbol] = {
+            "source": "file",
+            "path": str(path.resolve()),
+            "bytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    return payload
+
+
+def _partner_source_hash(symbol: str) -> str:
+    from src.dag_runtime.builtin_graphs import _live_partner_source_hash
+
+    return _live_partner_source_hash(symbol)
+
+
+def _pregraph_cross_asset_fingerprints(
+    *,
+    normalized: pd.DataFrame,
+    instrument: str,
+    timeframe: str,
+    peer_raw_frames: Mapping[str, pd.DataFrame] | None,
+    raw_data_root: str | Path | None,
+) -> tuple[str, str]:
+    peer_inputs = _cross_asset_peer_identity_payload(
+        instrument=instrument,
+        timeframe=timeframe,
+        peer_raw_frames=peer_raw_frames,
+        raw_data_root=raw_data_root,
+    )
+    market_context_fp = fingerprint_mapping(
+        {
+            "peer_inputs": peer_inputs,
+            "cross_asset_config_hash": cross_asset_runtime_config_hash(
+                timeframe=timeframe,
+                relevant_pairs=None,
+            ),
+            "full_pair_matrix": True,
+        }
+    )
+    partner_fp = fingerprint_mapping(
+        {
+            "partners": [
+                {
+                    "symbol": symbol,
+                    "peer_input": peer_inputs.get(symbol),
+                    "source_hash": _partner_source_hash(symbol),
+                }
+                for symbol, _relation in SMT_PARTNERS.get(instrument, ())
+            ]
+        }
+    )
+    return market_context_fp, partner_fp
+
+
+def _execute_research_graph(
+    df: pd.DataFrame,
+    *,
+    instrument: str,
+    swing_window: int,
+    include_vp: bool,
+    include_avwap: bool,
+    timeframe: str,
+    include_cross_asset: bool,
+    peer_raw_frames: Mapping[str, pd.DataFrame] | None,
+    raw_data_root: str | Path | None,
+    force_graph_recompute: bool,
+    features_root: str | Path = "data/features",
+    target: str | None = None,
+) -> GraphRunResult:
+    out = _coerce_ohlc(df)
+    from src.dag_runtime.builtin_graphs import build_research_stage_graph
+
+    graph = build_research_stage_graph(
+        instrument=instrument,
+        swing_window=swing_window,
+        include_vp=include_vp,
+        include_avwap=include_avwap,
+        timeframe=timeframe,
+        include_cross_asset=include_cross_asset,
+    )
+    inputs: dict[str, Any] = {"raw_input": out}
+    if peer_raw_frames is not None:
+        inputs["peer_raw_frames"] = peer_raw_frames
+    return execute_graph(
+        graph,
+        target=target,
+        context=GraphRunContext(
+            graph_name=graph.graph_name,
+            symbol=instrument,
+            timeframe=timeframe,
+            inputs=inputs,
+            config={
+                "instrument": instrument,
+                "timeframe": timeframe,
+                "swing_window": swing_window,
+                "include_vp": include_vp,
+                "include_avwap": include_avwap,
+                "include_cross_asset": include_cross_asset,
+                "raw_data_root": (
+                    str(raw_data_root) if raw_data_root is not None else None
+                ),
+            },
+            features_root=features_root,
+            cache_root="data/dag_cache",
+            force=force_graph_recompute,
+            invalidate_cache=force_graph_recompute,
+        ),
+    )
+
+
 def _research_stages(
     *,
     instrument: str,
     swing_window: int,
     include_vp: bool,
     include_avwap: bool,
+    timeframe: str = "H4",
 ) -> list[PipelineStage]:
     stages: list[PipelineStage] = [
         PipelineStage(
@@ -260,7 +446,7 @@ def _research_stages(
         PipelineStage(
             "rsi_divergence",
             add_rsi_divergence,
-            ReplayPolicy("rsi_divergence", "B", replay_bars=220, warmup_bars=14),
+            ReplayPolicy("rsi_divergence", "B", replay_bars=200, warmup_bars=14),
         ),
         PipelineStage(
             "rolling_atr_ratio",
@@ -275,37 +461,37 @@ def _research_stages(
         PipelineStage(
             "fvg_stack",
             _run_fvg_stack,
-            ReplayPolicy("fvg_stack", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("fvg_stack", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "displacement",
             add_displacement_candle,
-            ReplayPolicy("displacement", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("displacement", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "order_blocks",
             add_ob,
-            ReplayPolicy("order_blocks", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("order_blocks", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "ob_mitigation",
             add_ob_mitigation,
-            ReplayPolicy("ob_mitigation", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("ob_mitigation", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "liquidity_sweeps",
             add_liquidity_sweep,
-            ReplayPolicy("liquidity_sweeps", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("liquidity_sweeps", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "equal_hl",
             add_equal_hl,
-            ReplayPolicy("equal_hl", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("equal_hl", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "amd_engine",
             lambda df: add_amd_engine(df, add_labels=False),
-            ReplayPolicy("amd_engine", "B", replay_bars=300, carried_state=True),
+            ReplayPolicy("amd_engine", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "prev_day_hl",
@@ -341,7 +527,7 @@ def _research_stages(
             PipelineStage(
                 "anchored_vwap",
                 lambda df: add_avwap_from_last_swing(df, include_research_only=True),
-                ReplayPolicy("anchored_vwap", "B", replay_bars=300, carried_state=True),
+                ReplayPolicy("anchored_vwap", "B", replay_bars=200, carried_state=True),
             )
         )
     stages.append(
@@ -351,7 +537,118 @@ def _research_stages(
             ReplayPolicy("regime", "C", replay_bars=240, carried_state=True),
         )
     )
+
+    # ── Sweeps v2 (Steps 9-11) ──────────────────────────────────────────
+    # Run S/R level extraction → unified liquidity sources → final sweeps
+    # *after* every source-producing stage so the unified framework sees
+    # the latest live-safe view of every family. The legacy
+    # ``liquidity_sweeps`` stage above is preserved for backward compat;
+    # downstream consumers should migrate to ``final_sweeps``.
+    stages.append(
+        PipelineStage(
+            "sr_levels",
+            lambda df: add_sr_levels(df, include_research_only=False),
+            ReplayPolicy("sr_levels", "B", replay_bars=400, carried_state=True),
+        )
+    )
+    stages.append(
+        PipelineStage(
+            "unified_liquidity_sources",
+            lambda df: add_unified_liquidity_sources(
+                df, scan_timeframe=timeframe, instrument=instrument
+            ),
+            ReplayPolicy(
+                "unified_liquidity_sources",
+                "B",
+                replay_bars=240,
+                carried_state=False,
+            ),
+        )
+    )
+    stages.append(
+        PipelineStage(
+            "final_sweeps",
+            add_final_sweeps,
+            ReplayPolicy("final_sweeps", "B", replay_bars=240, carried_state=True),
+        )
+    )
     return stages
+
+
+def _smt_partner_stages(
+    *,
+    swing_window: int,
+) -> list[PipelineStage]:
+    """Return only the stages needed by SMT partners (through swings).
+
+    SMT divergence reads: timestamp, OHLC, and swing_* columns.
+    These are all produced by the first 9 stages of the research chain.
+    Running the remaining 16+ stages (trend_state through regime) on
+    partner frames is pure waste.
+    """
+    return [
+        PipelineStage(
+            "normalize_candles",
+            lambda df: normalize_candle_schema(df, require_volume=True),
+            ReplayPolicy("normalize_candles", "A", replay_bars=0),
+        ),
+        PipelineStage(
+            "atr", add_atr, ReplayPolicy("atr", "A", replay_bars=150, warmup_bars=14)
+        ),
+        PipelineStage(
+            "ema", add_emas, ReplayPolicy("ema", "A", replay_bars=220, warmup_bars=200)
+        ),
+        PipelineStage(
+            "adx", add_adx, ReplayPolicy("adx", "A", replay_bars=150, warmup_bars=14)
+        ),
+        PipelineStage(
+            "rsi", add_rsi, ReplayPolicy("rsi", "A", replay_bars=150, warmup_bars=14)
+        ),
+        PipelineStage(
+            "macd",
+            add_macd,
+            ReplayPolicy("macd", "A", replay_bars=200, warmup_bars=26),
+        ),
+        PipelineStage(
+            "bb_width",
+            add_bb_width,
+            ReplayPolicy("bb_width", "A", replay_bars=150, warmup_bars=20),
+        ),
+        PipelineStage(
+            "body_ratio",
+            add_body_ratio,
+            ReplayPolicy("body_ratio", "A", replay_bars=16, warmup_bars=1),
+        ),
+        PipelineStage(
+            "swings",
+            lambda df: add_swings(df, window=swing_window),
+            ReplayPolicy(
+                "swings",
+                "B",
+                replay_bars=max(400, swing_window * 30),
+                warmup_bars=swing_window,
+                carried_state=True,
+            ),
+        ),
+    ]
+
+
+def build_smt_partner_indicators(
+    df: pd.DataFrame,
+    *,
+    swing_window: int = 6,
+) -> pd.DataFrame:
+    """Build only the indicators needed for SMT partner frames.
+
+    Runs the first 9 stages (normalize through swings) and stops.
+    This is ~3x faster than running the full 25-stage chain since
+    the downstream structural/SMC stages are never read by
+    ``add_smt_divergence``.
+    """
+    out = _coerce_ohlc(df)
+    for stage in _smt_partner_stages(swing_window=swing_window):
+        out = stage.fn(out)
+    return out
 
 
 def build_research_indicators(
@@ -367,6 +664,7 @@ def build_research_indicators(
     processed_cross_asset_frames: Mapping[str, pd.DataFrame] | None = None,
     peer_raw_frames: Mapping[str, pd.DataFrame] | None = None,
     raw_data_root: str | Path | None = "data/raw",
+    force_graph_recompute: bool = False,
 ) -> pd.DataFrame:
     """Apply the full indicator stack in dependency order.
 
@@ -388,73 +686,27 @@ def build_research_indicators(
     -------
     DataFrame with all indicator columns added.
     """
-    out = _coerce_ohlc(df)
-    from src.dag_runtime.builtin_graphs import build_research_stage_graph
-
-    graph = build_research_stage_graph(
+    if include_cross_asset and timeframe not in SUPPORTED_CROSS_ASSET_TIMEFRAMES:
+        raise ValueError(
+            f"Cross-asset context only supports {sorted(SUPPORTED_CROSS_ASSET_TIMEFRAMES)}"
+        )
+    graph_result = _execute_research_graph(
+        df,
         instrument=instrument,
         swing_window=swing_window,
         include_vp=include_vp,
         include_avwap=include_avwap,
-    )
-    result = execute_graph(
-        graph,
-        context=GraphRunContext(
-            graph_name=graph.graph_name,
-            symbol=instrument,
-            timeframe="graph",
-            inputs={"raw_input": out},
-            config={
-                "instrument": instrument,
-                "swing_window": swing_window,
-                "include_vp": include_vp,
-                "include_avwap": include_avwap,
-            },
-            cache_root="data/dag_cache",
-            force=True,
-            invalidate_cache=True,
-        ),
-    )
-    primary_frame = result.primary_frame()
-    if not include_cross_asset:
-        return primary_frame
-    if timeframe not in SUPPORTED_CROSS_ASSET_TIMEFRAMES:
-        raise ValueError(
-            f"Cross-asset context only supports {sorted(SUPPORTED_CROSS_ASSET_TIMEFRAMES)}"
-        )
-
-    def _build_partner_frame(
-        raw_partner: pd.DataFrame,
-        partner_symbol: str,
-    ) -> pd.DataFrame:
-        return build_research_indicators(
-            raw_partner,
-            instrument=partner_symbol,
-            swing_window=swing_window,
-            include_vp=False,
-            include_avwap=False,
-            profiler=None,
-            timeframe=timeframe,
-            include_cross_asset=False,
-        )
-
-    resolved_market_context, resolved_processed_frames = resolve_cross_asset_inputs(
-        df,
-        instrument=instrument,
         timeframe=timeframe,
-        market_context=market_context,
-        processed_frames=processed_cross_asset_frames,
+        include_cross_asset=include_cross_asset,
         peer_raw_frames=peer_raw_frames,
         raw_data_root=raw_data_root,
-        partner_builder=_build_partner_frame if instrument in SMT_PARTNERS else None,
+        force_graph_recompute=force_graph_recompute,
+        target=("research_feature_bundle" if include_cross_asset else None),
     )
-    return attach_cross_asset_context(
-        primary_frame,
-        instrument=instrument,
-        timeframe=timeframe,
-        market_context=resolved_market_context,
-        processed_frames=resolved_processed_frames,
-    )
+    if profiler is not None and include_cross_asset:
+        profiler.set_metric("cross_asset_off_graph_seconds", 0.0)
+        profiler.set_metric("research_cross_asset_dag", True)
+    return graph_result.primary_frame()
 
 
 def run_research_pipeline(
@@ -476,6 +728,7 @@ def run_research_pipeline(
     processed_cross_asset_frames: Mapping[str, pd.DataFrame] | None = None,
     peer_raw_frames: Mapping[str, pd.DataFrame] | None = None,
     raw_data_root: str | Path | None = "data/raw",
+    force_graph_recompute: bool = False,
 ) -> PipelineExecutionResult:
     runtime_profiler = profiler or PipelineRunProfiler(
         pipeline=RESEARCH_PIPELINE_NAME,
@@ -485,48 +738,29 @@ def run_research_pipeline(
     normalized = normalize_candle_schema(df, require_volume=True)
     input_fingerprint = dataframe_fingerprint(normalized)
     resolved_market_context: pd.DataFrame | None = None
-    resolved_processed_frames: dict[str, pd.DataFrame] | None = None
     market_context_fingerprint: str | None = None
     partner_fingerprint: str | None = None
+    build_cross_asset_audit = bool((config or {}).get("build_cross_asset_audit", False))
     if include_cross_asset:
         if timeframe not in SUPPORTED_CROSS_ASSET_TIMEFRAMES:
             raise ValueError(
                 "Cross-asset context only supports "
                 f"{sorted(SUPPORTED_CROSS_ASSET_TIMEFRAMES)}"
             )
-
-        def _build_partner_frame(
-            raw_partner: pd.DataFrame,
-            partner_symbol: str,
-        ) -> pd.DataFrame:
-            return build_research_indicators(
-                raw_partner,
-                instrument=partner_symbol,
-                swing_window=swing_window,
-                include_vp=False,
-                include_avwap=False,
-                profiler=None,
+        market_context_fingerprint, partner_fingerprint = (
+            _pregraph_cross_asset_fingerprints(
+                normalized=normalized,
+                instrument=instrument,
                 timeframe=timeframe,
-                include_cross_asset=False,
+                peer_raw_frames=peer_raw_frames,
+                raw_data_root=raw_data_root,
             )
-
-        resolved_market_context, resolved_processed_frames = resolve_cross_asset_inputs(
-            normalized,
-            instrument=instrument,
-            timeframe=timeframe,
-            market_context=market_context,
-            processed_frames=processed_cross_asset_frames,
-            peer_raw_frames=peer_raw_frames,
-            raw_data_root=raw_data_root,
-            partner_builder=(
-                _build_partner_frame if instrument in SMT_PARTNERS else None
-            ),
         )
-        if resolved_market_context is not None and not resolved_market_context.empty:
-            market_context_fingerprint = dataframe_fingerprint(resolved_market_context)
-        partner_fingerprint = _cross_asset_partner_fingerprint(
-            resolved_processed_frames
-        )
+        runtime_profiler.set_metric("cross_asset_off_graph_seconds", 0.0)
+        runtime_profiler.set_metric("research_cross_asset_dag", True)
+    extra_config = {
+        key: value for key, value in (config or {}).items() if key != "features_root"
+    }
     config_payload = {
         "instrument": instrument,
         "timeframe": timeframe,
@@ -534,13 +768,15 @@ def run_research_pipeline(
         "include_vp": include_vp,
         "include_avwap": include_avwap,
         "include_cross_asset": include_cross_asset,
+        "build_cross_asset_audit": build_cross_asset_audit,
         "cross_asset_market_context_fp": market_context_fingerprint,
         "cross_asset_partner_fp": partner_fingerprint,
-        **(config or {}),
+        **extra_config,
     }
     config_fingerprint = dataframe_fingerprint(
         pd.DataFrame([config_payload]), strategy="content"
     )
+    runtime_profiler.set_metric("workload_class", "incremental_or_full_research")
     persist_from_ts = _partition_frontier_ts(metadata)
     max_replay_bars = (
         replay_bars_override
@@ -552,6 +788,7 @@ def run_research_pipeline(
                 swing_window=swing_window,
                 include_vp=include_vp,
                 include_avwap=include_avwap,
+                timeframe=timeframe,
             )
         )
     )
@@ -563,7 +800,7 @@ def run_research_pipeline(
         input_fingerprint=input_fingerprint,
         config_fingerprint=config_fingerprint,
         replay_bars=max_replay_bars,
-        force_rebuild=force_rebuild,
+        force_rebuild=bool(force_rebuild or force_graph_recompute),
     )
     if plan.is_noop:
         return PipelineExecutionResult(
@@ -582,25 +819,44 @@ def run_research_pipeline(
         )
 
     working = slice_frame_for_plan(normalized, plan)
-    computed = build_research_indicators(
+    graph_result = _execute_research_graph(
         working,
         instrument=instrument,
         swing_window=swing_window,
         include_vp=include_vp,
         include_avwap=include_avwap,
-        profiler=runtime_profiler,
         timeframe=timeframe,
         include_cross_asset=include_cross_asset,
-        market_context=resolved_market_context,
-        processed_cross_asset_frames=resolved_processed_frames,
         peer_raw_frames=peer_raw_frames,
         raw_data_root=raw_data_root,
+        force_graph_recompute=force_graph_recompute,
+        features_root=(config or {}).get("features_root", "data/features"),
+        target=(
+            "research_full_bundle"
+            if include_cross_asset and build_cross_asset_audit
+            else ("research_feature_bundle" if include_cross_asset else None)
+        ),
     )
+    computed = graph_result.primary_frame()
+    if include_cross_asset:
+        market_context_result = graph_result.node_results.get(
+            "research_market_context_source"
+        )
+        if market_context_result is not None:
+            resolved_market_context = market_context_result.primary_frame()
+            runtime_profiler.set_metric(
+                "market_context_cache_current",
+                bool(market_context_result.cache_hit),
+            )
     if existing_history is not None and plan.mode == "incremental":
+        frontier_from_ts = _effective_frontier_from_ts(
+            persist_from_ts,
+            plan.replay_from_ts,
+        )
         final_frame = merge_recomputed_frontier(
             existing_history,
             computed,
-            frontier_from_ts=persist_from_ts,
+            frontier_from_ts=frontier_from_ts,
         )
     else:
         final_frame = computed
@@ -619,10 +875,20 @@ def run_research_pipeline(
             "config_fingerprint": config_fingerprint,
             "engine_version": "research-v1",
             "persist_from_ts": (
-                persist_from_ts.isoformat() if persist_from_ts is not None else None
+                _effective_frontier_from_ts(
+                    persist_from_ts,
+                    plan.replay_from_ts,
+                ).isoformat()
+                if _effective_frontier_from_ts(
+                    persist_from_ts,
+                    plan.replay_from_ts,
+                )
+                is not None
+                else None
             ),
         },
         market_context=resolved_market_context,
+        graph_result=graph_result,
     )
 
 
@@ -645,6 +911,8 @@ def materialize_research_features(
     processed_cross_asset_frames: Mapping[str, pd.DataFrame] | None = None,
     peer_raw_frames: Mapping[str, pd.DataFrame] | None = None,
     raw_data_root: str | Path | None = "data/raw",
+    force_graph_recompute: bool = False,
+    build_cross_asset_audit: bool = True,
 ) -> MaterializationResult:
     runtime_profiler = profiler or PipelineRunProfiler(
         pipeline=f"{RESEARCH_PIPELINE_NAME}_materialize",
@@ -666,8 +934,17 @@ def materialize_research_features(
             dataset="research",
             symbol=instrument,
             timeframe=timeframe,
+            read_observer=_record_partitioned_dataset_load(
+                runtime_profiler,
+                kind="load-existing-research-history",
+            ),
         )
-    preview = run_research_pipeline(
+    runtime_config = {
+        "features_root": str(features_root),
+        "build_cross_asset_audit": build_cross_asset_audit,
+        **(config or {}),
+    }
+    result = run_research_pipeline(
         raw_df,
         instrument=instrument,
         timeframe=timeframe,
@@ -676,7 +953,7 @@ def materialize_research_features(
         include_avwap=include_avwap,
         existing_history=existing_history,
         metadata=metadata,
-        config=config,
+        config=runtime_config,
         force_rebuild=force_rebuild,
         profiler=runtime_profiler,
         replay_bars_override=(
@@ -687,48 +964,21 @@ def materialize_research_features(
         processed_cross_asset_frames=processed_cross_asset_frames,
         peer_raw_frames=peer_raw_frames,
         raw_data_root=raw_data_root,
+        force_graph_recompute=force_graph_recompute,
     )
-    if preview.plan.is_noop:
+    if result.plan.is_noop:
         return MaterializationResult(
             frame=(
                 existing_history.copy()
                 if existing_history is not None
-                else preview.frame
+                else result.frame
             ),
-            plan=preview.plan,
-            profiler=preview.profiler,
+            plan=result.plan,
+            profiler=result.profiler,
             metadata=metadata,
             artifacts=[],
             metadata_file=str(metadata_file),
         )
-
-    if metadata is not None and not force_rebuild:
-        runtime_profiler = PipelineRunProfiler(
-            pipeline=f"{RESEARCH_PIPELINE_NAME}_materialize",
-            symbol=instrument,
-            timeframe=timeframe,
-        )
-        result = run_research_pipeline(
-            raw_df,
-            instrument=instrument,
-            timeframe=timeframe,
-            swing_window=swing_window,
-            include_vp=include_vp,
-            include_avwap=include_avwap,
-            existing_history=None,
-            metadata=None,
-            config=config,
-            force_rebuild=True,
-            profiler=runtime_profiler,
-            replay_bars_override=len(raw_df),
-            include_cross_asset=include_cross_asset,
-            market_context=market_context,
-            processed_cross_asset_frames=processed_cross_asset_frames,
-            peer_raw_frames=peer_raw_frames,
-            raw_data_root=raw_data_root,
-        )
-    else:
-        result = preview
 
     persist_kwargs: dict[str, Any] = {}
     if partition_writer is not None:
@@ -766,6 +1016,7 @@ def materialize_research_features(
                 else result.plan.replay_from_ts
             ),
             full_rebuild=bool(force_rebuild or result.plan.mode == "full"),
+            relevant_pairs=None,
         )
         artifacts.extend(market_context_artifacts)
         for artifact in market_context_artifacts:
@@ -775,8 +1026,17 @@ def materialize_research_features(
                 bytes_written=artifact.bytes_written,
                 kind="market-context-research",
             )
-
-        smt_research = build_smt_research_table(result.frame)
+        graph_result = result.graph_result
+        smt_node = (
+            graph_result.node_results.get("research_smt_research_table")
+            if graph_result is not None
+            else None
+        )
+        smt_research = (
+            smt_node.primary_frame()
+            if smt_node is not None and smt_node.primary_frame() is not None
+            else pd.DataFrame()
+        )
         if not smt_research.empty:
             smt_research_partitioned = smt_research.rename(
                 columns={"smt_detect_ts": "timestamp"}
@@ -802,9 +1062,13 @@ def materialize_research_features(
                     bytes_written=artifact.bytes_written,
                     kind="smt-research",
                 )
-
+            smt_summary = (
+                smt_node.output.payload.get("summary")
+                if smt_node is not None
+                else summarize_smt_research(smt_research)
+            )
             smt_summary_artifact = write_json_atomic(
-                summarize_smt_research(smt_research),
+                smt_summary,
                 Path(features_root)
                 / "research_smt_summary"
                 / instrument
@@ -819,44 +1083,51 @@ def materialize_research_features(
                 kind="smt-research-summary",
             )
 
-        audit_tables = build_cross_asset_correlation_audit(
-            result.frame,
-            result.market_context,
-        )
-        for table_name, table in audit_tables.items():
-            if table.empty:
-                continue
-            artifact = write_parquet_atomic(
-                table,
+        if build_cross_asset_audit:
+            audit_node = (
+                graph_result.node_results.get("research_cross_asset_audit")
+                if graph_result is not None
+                else None
+            )
+            audit_tables = audit_node.output.frames if audit_node is not None else {}
+            for table_name, table in audit_tables.items():
+                if table.empty:
+                    continue
+                artifact = write_parquet_atomic(
+                    table,
+                    Path(features_root)
+                    / "research_cross_asset_audit"
+                    / instrument
+                    / timeframe
+                    / f"{table_name}.parquet",
+                )
+                artifacts.append(artifact)
+                result.profiler.record_artifact(
+                    path=artifact.path,
+                    rows=artifact.rows,
+                    bytes_written=artifact.bytes_written,
+                    kind=f"cross-asset-audit-{table_name}",
+                )
+            audit_summary = (
+                audit_node.output.payload.get("summary")
+                if audit_node is not None
+                else summarize_cross_asset_correlation_audit(audit_tables)
+            )
+            audit_summary_artifact = write_json_atomic(
+                audit_summary,
                 Path(features_root)
                 / "research_cross_asset_audit"
                 / instrument
                 / timeframe
-                / f"{table_name}.parquet",
+                / "summary.json",
             )
-            artifacts.append(artifact)
+            artifacts.append(audit_summary_artifact)
             result.profiler.record_artifact(
-                path=artifact.path,
-                rows=artifact.rows,
-                bytes_written=artifact.bytes_written,
-                kind=f"cross-asset-audit-{table_name}",
+                path=audit_summary_artifact.path,
+                rows=audit_summary_artifact.rows,
+                bytes_written=audit_summary_artifact.bytes_written,
+                kind="cross-asset-audit-summary",
             )
-
-        audit_summary_artifact = write_json_atomic(
-            summarize_cross_asset_correlation_audit(audit_tables),
-            Path(features_root)
-            / "research_cross_asset_audit"
-            / instrument
-            / timeframe
-            / "summary.json",
-        )
-        artifacts.append(audit_summary_artifact)
-        result.profiler.record_artifact(
-            path=audit_summary_artifact.path,
-            rows=audit_summary_artifact.rows,
-            bytes_written=audit_summary_artifact.bytes_written,
-            kind="cross-asset-audit-summary",
-        )
     updated_metadata = PipelineMetadata(
         symbol=instrument,
         timeframe=timeframe,
@@ -883,6 +1154,7 @@ def materialize_research_features(
             "plan_reason": result.plan.reason,
             "include_avwap": include_avwap,
             "include_cross_asset": include_cross_asset,
+            "build_cross_asset_audit": build_cross_asset_audit,
         },
     )
     write_metadata_atomic(metadata_file, updated_metadata)

@@ -1,0 +1,16 @@
+{
+  "config_fingerprint": "76d5fc0f82703bfb7e217dd17822677b2bf39fa70b3ee494d77dd7239eb8f46f:1d56ec33ee3004fe1146aac0fd48454e6a411d86809383ad9b258ab1ba638b71",
+  "engine_version": "1",
+  "extra": {
+    "report_path": "notebooks/smc/ob_validation_XAU_USD_H4.html"
+  },
+  "feature_contract_version": 1,
+  "input_fingerprint": "76d5fc0f82703bfb7e217dd17822677b2bf39fa70b3ee494d77dd7239eb8f46f:1d56ec33ee3004fe1146aac0fd48454e6a411d86809383ad9b258ab1ba638b71",
+  "last_processed_ts": null,
+  "metadata_version": 1,
+  "pipeline": "ob_validation_XAU_USD_H4",
+  "schema_version": 1,
+  "symbol": "report",
+  "timeframe": "report",
+  "updated_at": null
+}

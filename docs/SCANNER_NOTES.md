@@ -72,25 +72,14 @@ The FVG detector identifies zones. The scanner must confirm:
 
 ---
 
-## OB Confirmation Stack (Strategy 6: Order Block Continuation)
+## OB Confirmation Stack (Deprecated For Strategy Use)
 
-1. **First retest only**
-   - `ob_first_retest` flag exists — scanner should only consider first retest
-   - Second/third retests have diminishing quality
-
-2. **Deceleration into OB**
-   - ATR of candles approaching OB should be below ATR of impulse candles
-   - Use `atr_ratio_rolling` or compute specifically for the approach
-
-3. **FVG above/below OB**
-   - The impulse that created the OB should also have left an FVG
-   - Check: is there a `fvg_bull` or `fvg_bear` within 1-3 candles of the OB?
-   - Feature: `ob_has_fvg` (binary)
-
-4. **1H rejection candle from OB zone**
-   - Load 1H data, check for hammer/engulfing at OB zone
-   - 1H MACD turning in OB direction
-   - 1H volume on rejection above average
+- BOS and CHoCH are superior to OB as primary structural signals.
+- OB does not need to be used in any strategy in this repo.
+- If OB remains available, it should be treated as optional execution research
+  only, not as a required scanner or strategy component.
+- Strategy work should prefer BOS / CHoCH directly instead of building a
+  dedicated OB continuation strategy.
 
 ---
 
@@ -189,6 +178,34 @@ These apply across multiple strategies:
 
 4. **Macro event proximity** — "no Tier-1 macro event within 48 hours."
    Requires ForexFactory data (not yet implemented). Add as deferred feature.
+
+---
+
+## Key Level Scope Note
+
+Exness-style "key levels that matter if broken" are not the same thing as
+plain static support/resistance.
+
+In this codebase, those should be modeled as a **composite breakout/reversal
+layer** built on top of multiple inputs:
+- HTF support/resistance
+- prior session/day/week levels
+- liquidity context
+- structure context
+- break/reclaim behavior
+
+So `sr_levels` should remain the base S/R engine. The higher-conviction
+"important if broken" interpretation belongs in scanner logic or in a future
+derived layer that combines `sr_levels` with structure and liquidity, rather
+than being treated as the direct meaning of raw `sr_levels` output.
+
+`sr_range_proxy` is the separate answer to a different question:
+"do the current S/R bands behave enough like a bounded range that downstream
+logic can treat them as a range-style proxy?"
+
+`key_levels` is the separate answer to the Exness-style question:
+"which current S/R levels look important enough that a break/reclaim should
+matter structurally?"
 
 ---
 

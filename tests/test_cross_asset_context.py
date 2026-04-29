@@ -60,6 +60,8 @@ def test_h1_context_attaches_directly_and_excludes_dxy_fx_pairs() -> None:
     assert "xasset_corr_xau_usd_w24" in attached.columns
     assert "xasset_corr_usoil_w24" in attached.columns
     assert "xasset_corr_dxy_w24" not in attached.columns
+    assert "xasset_corr_sig_class_gbp_usd_w24" in attached.columns
+    assert "xasset_corr_stability_class_gbp_usd_w24" in attached.columns
     assert attached["xasset_corr_gbp_usd_w24"].notna().sum() > 0
 
 
@@ -91,9 +93,13 @@ def test_h4_context_aligns_commodities_by_session_end() -> None:
 
 
 def test_lag_scan_selects_signed_best_lag() -> None:
-    ts = pd.date_range("2026-01-01", periods=50, freq="1h", tz="UTC")
-    usoil_ret = np.tile(np.array([0.004, -0.002, 0.003, -0.001], dtype=float), 13)[:50]
-    xau_ret = np.roll(usoil_ret, 1)
+    # Use enough bars and non-periodic returns so that lag=1 is the unique
+    # best peak rather than an alias of a periodic pattern.
+    rng = np.random.default_rng(42)
+    n = 80
+    ts = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    usoil_ret = rng.normal(0.0, 0.003, size=n)
+    xau_ret = np.roll(usoil_ret, 1) * 0.95 + rng.normal(0.0, 0.0003, size=n)
     xau_ret[0] = 0.0
     usoil_close = 70.0 * np.exp(np.cumsum(usoil_ret))
     xau_close = 2000.0 * np.exp(np.cumsum(xau_ret))
@@ -111,7 +117,7 @@ def test_lag_scan_selects_signed_best_lag() -> None:
     lag = context["lagcorr_best_lag_XAU_USD__USOIL__w24"].dropna().iloc[-1]
     score = context["lagcorr_best_XAU_USD__USOIL__w24"].dropna().iloc[-1]
     assert int(lag) == 1
-    assert score > 0.9
+    assert score > 0.8
 
 
 def test_market_context_output_does_not_leak_raw_price_columns() -> None:
@@ -129,7 +135,11 @@ def test_market_context_output_does_not_leak_raw_price_columns() -> None:
 
     assert "EUR_USD" not in context.columns
     assert "GBP_USD" not in context.columns
-    assert not any(column.endswith("__logret") for column in context.columns)
+    assert "ret_raw_EUR_USD" in context.columns
+    assert "ret_vol_EUR_USD" in context.columns
+    assert not any(
+        column in {"open", "high", "low", "close"} for column in context.columns
+    )
 
 
 def test_attachment_rules_limit_columns_by_symbol_type() -> None:

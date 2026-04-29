@@ -12,8 +12,28 @@ from src.dag_runtime.builtin_graphs import (
 )
 from scripts import validate_range_boundaries as vrb
 from scripts import validate_regime as vreg
-from scripts import validate_sr_levels as vsr
+from scripts import validate_ob as vob
+from scripts import validate_structure_context as vsc
 from scripts import validate_trend_state as vtrend
+from scripts import validate_swings as vsw
+from src.indicators._helpers.schema import normalize_candle_schema
+from src.indicators.foundation.session import add_session_features
+from src.indicators.foundation.sr_levels import (
+    add_sr_research_columns,
+    build_sr_level_registry,
+    project_sr_context,
+)
+from src.indicators.foundation.value import add_prev_day_hl, add_prev_week_hl
+from src.indicators.foundation.volatility import add_atr
+from src.indicators.foundation.volume_profile import add_volume_profile
+from src.indicators.smc.equal_hl import add_equal_hl
+from src.indicators.structure.swings import add_swings
+from src.validation.indicators.regime import validate_regime
+from src.validation.indicators.ob import build_ob_diagnostic_package, summarize_ob
+from src.validation.indicators.sr_levels import summarize_sr_levels
+from src.validation.indicators.structure_context import summarize_structure_context
+from src.validation.indicators.trend_state import validate_trend_state
+from src.validation.indicators.swings import summarize_swings, swing_event_windows
 
 
 def _sample_ohlcv(rows: int = 240) -> pd.DataFrame:
@@ -66,6 +86,8 @@ def _assert_nested_equal(left, right) -> None:
         for left_item, right_item in zip(left, right):
             _assert_nested_equal(left_item, right_item)
         return
+    if pd.isna(left) and pd.isna(right):
+        return
     assert _normalize(left) == _normalize(right)
 
 
@@ -95,7 +117,7 @@ def test_regime_validation_graph_matches_direct_summary(tmp_path: Path) -> None:
 
     live_df = vreg._build_context(raw.copy(), include_research_only=False)
     research_df = vreg._build_context(raw.copy(), include_research_only=True)
-    direct = vreg.validate_regime(
+    direct = validate_regime(
         research_df.tail(vreg.PLOT_ROWS),
         summary_df=research_df,
         live_df=live_df,
@@ -136,7 +158,7 @@ def test_trend_state_validation_graph_matches_direct_summary(tmp_path: Path) -> 
     )
 
     full_df = vtrend._build_context(raw.copy())
-    direct = vtrend.validate_trend_state(
+    direct = validate_trend_state(
         full_df.tail(vtrend.PLOT_ROWS),
         summary_df=full_df,
         outpath=None,
@@ -171,21 +193,153 @@ def test_sr_levels_validation_graph_matches_direct_summary(tmp_path: Path) -> No
 
     enriched = (
         raw.copy()
-        .pipe(vsr.normalize_candle_schema, require_volume=True)
-        .pipe(vsr.add_atr)
-        .pipe(vsr.add_swings)
-        .pipe(vsr.add_equal_hl)
-        .pipe(vsr.add_prev_day_hl)
-        .pipe(vsr.add_prev_week_hl)
-        .pipe(vsr.add_session_features)
-        .pipe(vsr.add_volume_profile)
+        .pipe(normalize_candle_schema, require_volume=True)
+        .pipe(add_atr)
+        .pipe(add_swings)
+        .pipe(add_equal_hl)
+        .pipe(add_prev_day_hl)
+        .pipe(add_prev_week_hl)
+        .pipe(add_session_features)
+        .pipe(add_volume_profile)
     )
-    registry = vsr.build_sr_level_registry(enriched)
-    live_df = vsr.project_sr_context(enriched.copy(), registry)
-    direct_summary = vsr.summarize_sr_levels(live_df, registry, live_df=live_df)
+    registry = build_sr_level_registry(enriched)
+    live_df = project_sr_context(enriched.copy(), registry)
+    research_df = add_sr_research_columns(live_df.copy(), registry)
+    direct_summary = summarize_sr_levels(research_df, registry, live_df=live_df)
+
+    for key in (
+        "checks",
+        "source_funnel",
+        "zone_geometry",
+        "interaction_quality",
+        "score_calibration",
+        "diagnostics",
+    ):
+        assert key in dag["summary"]
+        assert key in direct_summary
 
     _assert_nested_equal(dag["summary"], direct_summary)
     assert dag["row_count"] == len(live_df)
+    assert dag["html_path"] is None
+
+
+def test_structure_context_validation_graph_matches_direct_summary(
+    tmp_path: Path,
+) -> None:
+    raw = _sample_ohlcv(240)
+    graph = get_builtin_graph(
+        "validate_structure_context", instrument="XAU_USD", timeframe="H4"
+    )
+    context = GraphRunContext(
+        graph_name=graph.graph_name,
+        symbol="XAU_USD",
+        timeframe="H4",
+        inputs={"raw_input": raw},
+        config={
+            "plot_start": str(vsc.PLOT_START),
+            "html": False,
+            "out_dir": str(tmp_path),
+        },
+        cache_root=tmp_path,
+        force=True,
+        invalidate_cache=True,
+    )
+    dag = (
+        execute_graph(
+            graph, context=context, target="structure_context_validation_bundle"
+        )
+        .output()
+        .payload
+    )
+
+    direct_frame = vsc._build_context(raw.copy())
+    direct_view = direct_frame.loc[
+        pd.to_datetime(direct_frame["timestamp"], utc=True) >= vsc.PLOT_START
+    ].copy()
+    direct_summary = summarize_structure_context(direct_view)
+
+    _assert_nested_equal(dag["summary"], direct_summary)
+    assert dag["html_path"] is None
+
+
+def test_ob_validation_graph_matches_direct_summary(tmp_path: Path) -> None:
+    raw = _sample_ohlcv(240)
+    graph = get_builtin_graph("validate_ob", instrument="XAU_USD", timeframe="H4")
+    context = GraphRunContext(
+        graph_name=graph.graph_name,
+        symbol="XAU_USD",
+        timeframe="H4",
+        inputs={"raw_input": raw},
+        config={
+            "plot_start": str(vob.PLOT_START),
+            "html": False,
+            "out_dir": str(tmp_path),
+        },
+        cache_root=tmp_path,
+        force=True,
+        invalidate_cache=True,
+    )
+    dag_output = execute_graph(
+        graph, context=context, target="ob_validation_bundle"
+    ).output()
+    dag = dag_output.payload
+
+    full_df = vob._build_context(raw.copy())
+    direct_summary = summarize_ob(full_df)
+    direct_diagnostics = build_ob_diagnostic_package(
+        full_df,
+        instrument="XAU_USD",
+        timeframe="H4",
+    )
+
+    _assert_nested_equal(dag["summary"], direct_summary)
+    _assert_nested_equal(
+        dag["coverage_summary"], direct_diagnostics["coverage_summary"]
+    )
+    _assert_nested_equal(
+        dag_output.frames["bos_coverage_audit"],
+        direct_diagnostics["bos_coverage_audit"],
+    )
+    _assert_nested_equal(
+        dag_output.frames["execution_comparison"],
+        direct_diagnostics["execution_comparison"],
+    )
+    assert dag["html_path"] is None
+
+
+def test_swings_validation_graph_matches_direct_summary(tmp_path: Path) -> None:
+    raw = _sample_ohlcv(240)
+    graph = get_builtin_graph("validate_swings", instrument="XAU_USD", timeframe="H4")
+    context = GraphRunContext(
+        graph_name=graph.graph_name,
+        symbol="XAU_USD",
+        timeframe="H4",
+        inputs={"raw_input": raw},
+        config={
+            "html": False,
+            "out_dir": str(tmp_path),
+            "start_ts": "2026-01-01",
+            "end_ts": "2026-03-15",
+            "n_windows": 3,
+        },
+        cache_root=tmp_path,
+        force=True,
+        invalidate_cache=True,
+    )
+    dag = (
+        execute_graph(graph, context=context, target="swings_validation_bundle")
+        .output()
+        .payload
+    )
+
+    direct_frame = vsw._build_context(raw.copy())
+    direct_summary = summarize_swings(direct_frame)
+    direct_high = swing_event_windows(direct_frame, side="high", limit=3)
+    direct_low = swing_event_windows(direct_frame, side="low", limit=3)
+
+    _assert_nested_equal(dag["summary"], direct_summary)
+    _assert_nested_equal(dag["high_windows"], direct_high)
+    _assert_nested_equal(dag["low_windows"], direct_low)
     assert dag["html_path"] is None
 
 
@@ -369,15 +523,38 @@ def test_range_boundaries_graph_matches_legacy_selection_and_summaries(
         vrb._add_path_c2_candidate_scores(forensics)
     )
     geometry_audit = vrb._build_geometry_audit(full_df, event_table, candidate_table)
+    geometry_candidate_comparison, geometry_candidate_summary = (
+        vrb._build_geometry_candidate_comparison(full_df, geometry_audit)
+    )
     active_truth_audit, doctrine_report = vrb._build_active_truth_audit(
         full_df, geometry_audit
     )
+    geometry_candidate_truth_summary = (
+        vrb._build_geometry_candidate_active_truth_summary(
+            full_df,
+            geometry_audit,
+            active_truth_audit,
+        )
+    )
     ranking_report = vrb._build_ranking_disagreement_report(forensics)
+    geometry_ranking_preservation = vrb._build_geometry_ranking_preservation_report(
+        forensics,
+        geometry_candidate_comparison,
+    )
     ranking_repair_gates, ranking_repair_recommendation = (
         vrb._evaluate_path_c2_candidates(forensics)
     )
     downstream_usefulness, downstream_summary = vrb._build_downstream_usefulness_report(
         full_df, forensics
+    )
+    geometry_candidate_downstream_summary = (
+        vrb._build_geometry_candidate_downstream_summary(full_df, geometry_audit)
+    )
+    _, geometry_candidate_recommendation = vrb._build_geometry_candidate_gate_report(
+        geometry_candidate_summary,
+        geometry_candidate_truth_summary,
+        geometry_candidate_downstream_summary,
+        geometry_ranking_preservation,
     )
     path_summary = vrb._primary_path_from_reports(
         active_truth_audit,
@@ -397,6 +574,7 @@ def test_range_boundaries_graph_matches_legacy_selection_and_summaries(
         ),
         "pressure_audit": vrb._build_pressure_alignment_audit(short_high, long_medium),
         "path_summary": path_summary,
+        "geometry_candidate_recommendation": geometry_candidate_recommendation,
     }
 
     assert dag["selected_rung"]["reporting_label"] == reporting_label

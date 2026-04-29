@@ -79,6 +79,7 @@ from src.indicators.foundation.sr_levels import (
     SR_FAMILY_WEEK,
     SR_FAMILY_VP,
 )
+from src.indicators.foundation.sr_range_proxy import add_sr_range_proxy
 
 __all__ = [
     "compute_ema",
@@ -129,6 +130,7 @@ __all__ = [
     "compute_volume_profile",
     "add_volume_profile",
     "add_sr_levels",
+    "add_sr_range_proxy",
     "extract_sr_source_events",
     "build_sr_level_registry",
     "update_sr_lifecycle",

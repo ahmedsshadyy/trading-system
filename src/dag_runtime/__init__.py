@@ -9,6 +9,7 @@ from src.dag_runtime.contracts import (
 from src.dag_runtime.executor import GraphRunResult, execute_graph, explain_graph_run
 from src.dag_runtime.graph import GraphManifest, dependency_closure, topo_nodes
 from src.dag_runtime.node import (
+    ExecutionPolicy,
     GraphRunContext,
     NodeExecutionResult,
     NodeManifest,
@@ -19,6 +20,7 @@ from src.dag_runtime.validation import assert_frame_parity, validate_graph_parit
 
 __all__ = [
     "CachePolicy",
+    "ExecutionPolicy",
     "FailureRecoveryPolicy",
     "GraphManifest",
     "GraphRunContext",

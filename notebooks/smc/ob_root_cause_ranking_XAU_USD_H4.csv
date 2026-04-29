@@ -1,0 +1,10 @@
+cause,supporting_metrics,contradiction_metrics,confidence_score_0_to_1,estimated_impact_rank
+cause_freshness_dies_too_fast,"proportion_of_bars_with_any_fresh_ob=0.462, median_fresh_life_bars=13.500",endpoint_fresh_count=0,0.5377926771777277,1
+cause_displacement_overrestriction,"rejected_no_displacement_share=0.364, best_displacement_delta_ob_count=0",median_parent_displacement_score=0.794,0.36363636363636365,2
+cause_retirement_or_terminal_semantics_too_aggressive,"endpoint_active_count=2, retirement_share_not_directly_exposed=use_state_duration_audit",invalidated_fraction=0.324,0.26889633858886386,3
+cause_activation_overrestriction,best_activation_delta_ob_count=33,rejected_activation_failure=0,0.0829145728643216,4
+cause_bos_dependency_attrition,rejected_no_parent_bos=0,"current ontology starts from BOS rows, so parent-BOS attrition is structurally near-zero",0.0,5
+cause_endpoint_only_fresh_zero,"endpoint_fresh_count=0, proportion_of_bars_with_any_fresh_ob=0.462",fresh_count_p50=0.000,0.0,5
+cause_geometry_overrestriction,"rejected_bad_geometry_share=0.000, best_geometry_delta_ob_count=0",median_zone_height_atr=0.505,0.0,5
+cause_overlap_redundancy,"same_side_overlap_pair_count=362, younger_redundant_fraction=0.000",overlap_pair_count=700,0.0,5
+cause_sparse_raw_candidates,"raw_source_candidate_count=638, final_ob_count=398",best_relaxation_delta_ob_count=33,0.0,5

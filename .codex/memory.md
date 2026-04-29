@@ -1,5 +1,766 @@
 # Working Memory
 
+## Session Note: Production DAG Batch A Class B Materialization (2026-04-25)
+
+### Scope implemented
+
+This pass implemented Batch A of the production DAG completion program:
+
+- `trend_state`
+- `bos`
+- `choch`
+
+These nodes are now promoted into the production materialization whitelist for
+the live and research stage graphs. No replay-window changes, no indicator
+logic changes, and no algorithmic changes were made.
+
+### What changed
+
+`src/dag_runtime/builtin_graphs.py`
+
+Updated:
+
+- `_PIPELINE_MATERIALIZE_NODES`
+  - added `trend_state`
+  - added `bos`
+  - added `choch`
+- `_pipeline_stage_source_funcs(...)`
+  - added source-hash mapping for:
+    - `add_trend_state`
+    - `add_bos`
+    - `add_choch`
+
+Effect:
+
+- these three nodes now persist node-level outputs under the DAG cache
+- source edits to their underlying implementation functions invalidate the
+  node and downstream closure through the existing source-hash fingerprint path
+
+### Verification completed
+
+Syntax:
+
+- `python3 -m py_compile src/dag_runtime/builtin_graphs.py tests/dag_runtime/test_dag_node_caching.py tests/test_pipeline_incremental.py`
+
+Tests:
+
+- `poetry run python -m pytest tests/dag_runtime/test_dag_node_caching.py tests/test_pipeline_incremental.py -q`
+  - `16 passed`
+
+Added regression coverage:
+
+- `test_trend_state_source_hash_change_invalidates_structural_downstream`
+
+That test proves:
+
+- `swings` remains warm when only `trend_state` logic changes
+- `trend_state` misses cache
+- `bos` misses cache
+- `choch` misses cache
+
+Existing cache tests now also implicitly prove that:
+
+- unchanged reruns hit cache for the expanded materialization whitelist
+- pipeline incremental parity still holds with the new cache policy
+
+### Practical outcome
+
+What gets faster now:
+
+- warm reruns that pass through structural Batch A
+- incremental/live and research runs where `trend_state`, `bos`, and `choch`
+  would otherwise recompute unchanged
+
+What does not get materially faster yet:
+
+- cold rebuilds
+- live cross-asset off-graph work
+- later Class B families like FVG/OB/liquidity/AMD/regime
+- validator orchestration
+
+### What remains next
+
+Next production slice from the agreed plan:
+
+1. either continue Class B promotion with Batch B
+2. or start the live cross-asset DAG migration
+
+Current recommendation remains:
+
+- move to live cross-asset DAG next if the goal is the biggest production-path
+  architectural win
+- return to Batch B immediately after that
+
+### Exact files changed in this slice
+
+- `src/dag_runtime/builtin_graphs.py`
+- `tests/dag_runtime/test_dag_node_caching.py`
+
+## Session Note: SMT Validation Audit Fast Path (2026-04-25)
+
+### Problem addressed
+
+`scripts/validate_smt.py` was still slow in `--numeric-only` mode because the
+expensive cross-asset audit was being rebuilt inside
+`materialize_research_features(...)` before SMT validation even began.
+
+That meant:
+
+- `validate_smt.py` later trying to reuse cached audit tables was too late
+- `--numeric-only` still paid for the full 1.6M-row audit build path
+
+### What changed
+
+#### 1. Research materialization can now skip audit generation
+
+`src/indicators/pipelines/build_research.py`
+
+Added:
+
+- `build_cross_asset_audit: bool = True` to `materialize_research_features(...)`
+
+Behavior:
+
+- default remains unchanged for existing callers
+- when `False`, the expensive
+  `build_cross_asset_correlation_audit(...)` block is skipped entirely
+- metadata now records `build_cross_asset_audit`
+
+#### 2. SMT validation summary can now consume a precomputed audit summary
+
+`src/validation/indicators/smt.py`
+
+Added:
+
+- `correlation_audit_summary: dict[str, object] | None = None` to:
+  - `summarize_smt(...)`
+  - `validate_smt(...)`
+
+Behavior:
+
+- if a summary is passed, it is used directly
+- if no summary and no audit tables are passed, the old fallback behavior still
+  computes the audit from `market_context`
+
+This keeps backward compatibility while letting the validator use a much
+cheaper cached-summary path.
+
+#### 3. `validate_smt.py` now defaults to the fast path
+
+`scripts/validate_smt.py`
+
+Changed behavior:
+
+- `materialize_research_features(..., build_cross_asset_audit=False)` is now
+  used for SMT validation runs
+- cached audit summary is preferred from:
+  - `data/validation_cache/features/research_cross_asset_audit/.../summary.json`
+- if summary is absent:
+  - `--numeric-only` does not load all audit parquets just to rebuild the
+    summary in memory
+  - default behavior is fast-path skip
+- added opt-in slow path:
+  - `--rebuild-audit`
+
+When `--rebuild-audit` is set:
+
+- `build_cross_asset_correlation_audit(...)` runs explicitly in the script
+- parquet audit tables are written back to cache
+- `summary.json` is written back to cache
+
+#### 4. Added per-stage timing output in SMT validation
+
+`scripts/validate_smt.py` now prints timings for:
+
+- `materialize_research_features_seconds`
+- `cached_audit_load_seconds`
+- `build_smt_research_table_seconds`
+- `summarize_smt_seconds` in numeric mode
+- `validate_smt_seconds` in HTML mode
+- `rebuild_audit_seconds` when the slow path is used
+
+It also prints audit cache source:
+
+- `hit-summary`
+- `hit-parquet`
+- `rebuilt`
+- `miss`
+
+### Verification
+
+Syntax:
+
+- `python3 -m py_compile scripts/validate_smt.py src/indicators/pipelines/build_research.py src/validation/indicators/smt.py tests/test_cross_asset_pipeline.py`
+
+Tests:
+
+- `poetry run python -m pytest tests/test_cross_asset_pipeline.py tests/test_incremental_market_context.py tests/test_relevant_correlation_pairs.py -q`
+  - `25 passed`
+
+Added regression coverage:
+
+- `test_research_materialization_can_skip_cross_asset_audit`
+
+### Real command result
+
+Executed:
+
+- `/usr/bin/time -p poetry run python scripts/validate_smt.py --instrument XAU_USD --timeframe H1 --input-rows 1500 --numeric-only --n-windows 3`
+
+Observed after change:
+
+- `Audit cache: hit-summary`
+- `materialize_research_features_seconds: 3.942s`
+- `build_smt_research_table_seconds: 0.012s`
+- `cached_audit_load_seconds: 0.000s`
+- `summarize_smt_seconds: 0.007s`
+- wall time:
+  - `real 5.19`
+  - `user 4.81`
+  - `sys 0.78`
+
+This confirms the numeric SMT path is no longer rebuilding the full
+cross-asset audit on each run.
+
+### Practical outcome
+
+What is now faster:
+
+- `scripts/validate_smt.py --numeric-only` on cached runs
+- SMT validation runs where audit summary already exists
+- HTML mode when the cached audit summary/tables already exist
+
+What is only partially faster:
+
+- first SMT runs with no cached audit summary and no cached features
+- runs where `--rebuild-audit` is explicitly requested
+
+What is still not addressed by this slice:
+
+- cold research feature materialization cost unrelated to the audit
+- the broader research full-matrix compute surface
+- Class B carried-state DAG promotion
+- live cross-asset DAG migration
+
+### Exact files changed in this slice
+
+- `src/indicators/pipelines/build_research.py`
+- `src/validation/indicators/smt.py`
+- `scripts/validate_smt.py`
+- `tests/test_cross_asset_pipeline.py`
+
+## Session Note: Global Performance Plan Phase 0/1 Implementation (2026-04-25)
+
+### Scope implemented in this pass
+
+This pass implemented the first two execution layers of the global
+performance plan:
+
+- Phase 0: workload-class measurement and profiler enrichment
+- Phase 1: cross-asset I/O deduplication and cache-validity hardening
+
+This is not the full multi-wave performance program. It is the first
+production-facing slice intended to reduce repeated waste, make performance
+observable, and prevent semantically stale market-context reuse.
+
+### What landed
+
+#### 1. Pipeline profiler now captures read-side and CPU-side cost
+
+`src/pipeline_runtime/profiling.py`
+
+Added:
+
+- `ReadRecord`
+- `record_read(...)`
+- `increment_counter(...)`
+- `set_metric(...)`
+- summary metrics for:
+  - `process_cpu_seconds`
+  - `avg_cpu_utilization_pct`
+  - `bytes_read`
+  - `bytes_written`
+  - `parquet_reads`
+  - `artifact_writes`
+  - `counters`
+  - `artifacts_read`
+
+Effect:
+
+- pipeline runs can now distinguish read pressure from write pressure
+- CPU-heavy runs can be identified explicitly instead of inferred from wall time
+- later optimization waves now have a stable machine-readable contract for
+  “what got better”
+
+Workload-class metric now expected in profiler counters:
+
+- `incremental_or_full_live`
+- `incremental_or_full_research`
+- any future warm/cold benchmark harnesses can use the same field
+
+#### 2. Partitioned dataset loads can now report read activity
+
+`src/pipeline_runtime/artifact_store.py`
+
+`load_partitioned_dataset(...)` now accepts `read_observer`, allowing callers
+to record per-file parquet reads without changing dataset semantics.
+
+Effect:
+
+- persisted history loads
+- cached market-context loads
+
+can now be tracked in profiler summaries.
+
+#### 3. Cross-asset market-context caches are now semantically versioned
+
+`src/indicators/features/cross_asset.py`
+
+Added:
+
+- `cross_asset_runtime_config_hash(...)`
+- `market_context_summary_path(...)`
+- `read_market_context_summary(...)`
+- `market_context_cache_is_current(...)`
+
+The config hash covers:
+
+- supported timeframes
+- context universe
+- correlation horizons
+- lag-scan lags
+- lag-scan pair definitions
+- SMT partner map
+- volatility normalization constants
+- relevant-pairs mode
+
+Effect:
+
+- persisted market context is no longer considered reusable just because the
+  parquet exists
+- changing cross-asset semantics now invalidates stale cached context
+  deterministically
+
+#### 4. Persisted market context now emits a summary artifact
+
+`src/indicators/features/cross_asset.py`
+
+`persist_market_context(...)` now writes `summary.json` alongside the parquet
+partitions and returns that artifact in the artifact list.
+
+Summary payload includes:
+
+- `variant`
+- `timeframe`
+- `row_count`
+- `column_count`
+- `config_hash`
+
+Effect:
+
+- cache-validity decisions are cheap and explicit
+- profiler artifact accounting includes the summary write instead of silently
+  dropping it
+
+#### 5. Raw cross-asset frame loads now support run-scoped caching
+
+`src/indicators/features/cross_asset.py`
+
+Added:
+
+- `RawFrameCacheEntry`
+- `frame_cache` support in `load_raw_context_frames(...)`
+- runtime detail accounting for:
+  - `raw_frame_cache_hits`
+  - `raw_frame_disk_reads`
+  - `raw_frame_read_bytes`
+  - `raw_frame_symbols_loaded`
+
+Effect:
+
+- repeated raw peer-frame reads within the same pipeline execution can be
+  avoided
+- later benchmark harnesses can measure whether disk pressure is actually
+  dropping
+
+#### 6. Cross-asset resolution now reuses loaded/trimmed frames more tightly
+
+`src/indicators/features/cross_asset.py`
+
+`resolve_cross_asset_inputs(...)` now:
+
+- accepts `frame_cache`
+- accepts `runtime_details`
+- loads the raw universe once
+- trims peer frames once per symbol
+- reuses the same trimmed peer frames for partner builds
+- records:
+  - market-context source
+  - partner-build count
+  - built partner symbols
+  - relevant-pairs mode
+  - trimmed symbols
+  - market-context config hash when the context is built locally
+
+Effect:
+
+- lower repeated normalization/trimming overhead
+- more precise profiler visibility around cross-asset work
+
+#### 7. Live and research pipelines now track cross-asset reads and cache validity
+
+`src/indicators/pipelines/build_live.py`
+
+`src/indicators/pipelines/build_research.py`
+
+Added/changed:
+
+- `load_partitioned_dataset(...)` history loads now record parquet reads
+- cached market-context loads now record parquet reads
+- `cross_asset_resolve_inputs` is profiled explicitly
+- `cross_asset_off_graph_seconds` is emitted as a profiler metric
+- `market_context_cache_current` is emitted as a profiler metric
+- cached market context is only reused when `summary.json` hash matches
+- partial cached market-context coverage uses incremental rebuild only if the
+  cache is current
+- when the partial-coverage path already loads raw context frames, those peer
+  frames are reused for the immediately following pipeline call instead of
+  rereading them from disk
+
+Important live-vs-research behavior remains unchanged:
+
+- live uses relevant-pair filtered market context
+- research uses the full matrix because the audit path still needs it
+
+### What got faster, what did not, and when
+
+#### `src/pipeline_runtime`
+
+Gets faster:
+
+- warm reruns that load persisted partitions now have observable read cost and
+  narrower accounting
+
+Partially faster:
+
+- persistence logic itself is not algorithmically faster
+- benefits appear mostly from better skip/reuse decisions upstream
+
+When:
+
+- warm rerun: moderate operational gain
+- incremental/live: moderate operational gain
+- cold run: small direct gain
+
+#### `src/indicators/features`
+
+Gets faster:
+
+- cross-asset peer frame reuse within a run
+- repeated raw peer-frame reads during partial market-context rebuild flows
+- stale market-context cache reuse is prevented cheaply
+
+Partially faster:
+
+- full research correlation math is still expensive
+- rolling correlation construction is unchanged
+
+When:
+
+- first run: small to moderate gain
+- warm rerun: moderate gain
+- incremental/live: moderate to large gain
+
+#### `src/indicators/pipelines`
+
+Gets faster:
+
+- repeated live/research runs that can reuse current market-context artifacts
+- partial-coverage rebuild path avoids some redundant raw-peer reloads
+- profiler now separates off-graph cross-asset time from the rest of pipeline
+  behavior
+
+Partially faster:
+
+- research remains expensive on cold full-matrix builds
+- Class B carried-state stages still recompute
+
+When:
+
+- warm rerun: meaningful gain
+- incremental/live append: meaningful gain
+- cold run: modest at best
+
+#### `src/validation/indicators` and `scripts`
+
+Partially faster only:
+
+- any validator or script that depends on research/live materialization can
+  benefit indirectly from the cross-asset reuse and cache-validity changes
+
+Not fully faster:
+
+- `validate_smt.py` single-run cold research path is still heavy
+- procedural validators are still procedural
+- report-only flags like `--numeric-only` still do not skip core compute
+
+When:
+
+- repeated validation runs: partial gain
+- single cold SMT validation: still only partial gain
+
+#### Directories not materially sped up in this pass
+
+- `src/dag_runtime`
+- `src/indicators/structure`
+- `src/indicators/smc`
+- `src/scanner`
+- `src/models`
+- `src/dashboard`
+- `src/agents`
+
+Why:
+
+- this pass did not move more work into the DAG
+- this pass did not promote Class B nodes
+- this pass did not change downstream consumer logic
+
+### What did not land yet
+
+Still open:
+
+- Class B carried-state parity gating and selective materialization
+- live cross-asset decomposition into explicit DAG nodes
+- research-path containment beyond cache-validity/read-dedup
+- remaining validator-wrapper migrations
+- algorithmic hotspot reduction inside cross-asset column assembly
+
+### Verification completed
+
+Syntax:
+
+- `python3 -m py_compile src/pipeline_runtime/profiling.py src/pipeline_runtime/artifact_store.py src/indicators/features/cross_asset.py src/indicators/pipelines/build_live.py src/indicators/pipelines/build_research.py tests/pipeline_runtime/test_runtime.py tests/test_cross_asset_pipeline.py`
+
+Targeted tests:
+
+- `poetry run python -m pytest tests/pipeline_runtime/test_runtime.py tests/test_cross_asset_pipeline.py -q`
+  - `10 passed`
+- `poetry run python -m pytest tests/test_incremental_market_context.py tests/test_relevant_correlation_pairs.py -q`
+  - `19 passed`
+
+Warnings observed:
+
+- existing pandas fragmentation warnings from `src/indicators/features/cross_asset.py`
+- this is now a likely future Phase 4/5 algorithmic hotspot candidate, but it
+  was intentionally not changed in this pass
+
+### Exact files changed in this pass
+
+- `src/pipeline_runtime/profiling.py`
+- `src/pipeline_runtime/artifact_store.py`
+- `src/indicators/features/cross_asset.py`
+- `src/indicators/pipelines/build_live.py`
+- `src/indicators/pipelines/build_research.py`
+- `tests/pipeline_runtime/test_runtime.py`
+- `tests/test_cross_asset_pipeline.py`
+
+### Bottom line
+
+This pass did not “make everything fast.” It did make the cross-asset path
+less wasteful, safer to reuse, and measurable in a way that supports the next
+phase of real optimization.
+
+The biggest concrete improvements from this slice are:
+
+- fewer redundant raw peer-frame reads within a run
+- deterministic invalidation of cached market context when semantics change
+- visibility into bytes read, parquet read count, CPU time, and off-graph
+  cross-asset time
+- reuse of already-loaded peer frames when partial market-context rebuild is
+  immediately followed by feature materialization
+
+The next correct execution step remains:
+
+1. selectively parity-gate and materialize Class B production stages
+2. bring live cross-asset execution fully under DAG control
+3. only then decide whether SMT/research cold-path cost needs deeper semantic
+   narrowing or localized algorithmic optimization
+
+## Session Note: DAG Hardening Scope Reality Check (2026-04-25)
+
+### What the user asked for
+
+The ask was to implement the full "Full-Platform DAG Completion and Performance
+Hardening" program, which included:
+
+- standardizing DAG cache and invalidation semantics across graph families
+- hardening `range_boundaries`
+- graduating production Class B stages into DAG materialization after parity
+- moving cross-asset work into the DAG
+- migrating the remaining validation wrappers onto DAG contracts
+- then doing bounded algorithmic optimization
+
+### What I actually implemented
+
+I implemented the first coherent execution slice of that program:
+
+- added shared DAG helpers in `src/dag_runtime/builtin_graphs.py` for:
+  - scoped runtime-config fingerprinting
+  - explicit cache-policy declaration
+  - `config["source_hash"]` injection via `compute_multi_source_hash(...)`
+- kept the existing live/research pipeline stage cache path on explicit helper
+  functions rather than ad hoc inline logic
+- hardened `range_boundaries` so the materialized heavy path now declares cache
+  policy and source-hash invalidation explicitly:
+  - `range_context`
+  - all `range_rung_debug__*`
+  - `range_retune_gate`
+  - `range_selected_rung`
+  - `range_selected_debug`
+  - `range_forensics`
+  - `range_geometry_audit`
+  - `range_active_truth_audit`
+  - `range_coverage_regime_report`
+  - `range_ranking_bundle`
+  - `range_diagnostics_bundle`
+  - `range_downstream_usefulness`
+  - report nodes and CSV bundle
+- extended the same fingerprint-scope hardening to the already-migrated
+  validation graphs:
+  - `validate_regime`
+  - `validate_trend_state`
+  - `validate_sr_levels`
+- added/updated tests for:
+  - `range_boundaries` materialized nodes carrying source hashes
+  - warm-cache reuse of the `range_boundaries` geometry closure
+  - selective downstream invalidation when the heavy debug source changes
+  - parity tests for the migrated validation graphs after the helper refactor
+
+### What I did not implement
+
+I did **not** implement the rest of the platform program:
+
+- I did not materialize the production Class B carried-state stages
+- I did not move cross-asset execution into the DAG
+- I did not migrate the remaining procedural validators
+- I did not start algorithmic optimization inside the heavy compute path
+
+### Why the rest did not land in that pass
+
+This was not "I forgot". It was a scope and safety decision taken during
+execution, after hitting real repo constraints.
+
+#### 1. The requested plan is a multi-wave migration, not one patch set
+
+The plan spans several subsystems with different risk profiles:
+
+- DAG runtime semantics
+- validation graph invalidation policy
+- production indicator replay semantics
+- cross-asset orchestration topology
+- CLI wrapper migration
+
+Those are separable programs. Treating them as one atomic patch would have
+created a large, low-confidence change set with weak rollback boundaries.
+
+#### 2. `range_boundaries` and the existing built-in graphs were the safest
+first checkpoint
+
+`range_boundaries` was already DAG-backed and had freeze tests. That made it
+the best reference surface for:
+
+- explicit source-hash invalidation
+- explicit cache-policy declaration
+- report-vs-compute fingerprint scoping
+- warm-cache regression tests
+
+This let me land a meaningful checkpoint with real verification.
+
+#### 3. Expanding the helper layer immediately exposed existing repo issues
+
+While pushing the helper pattern into other migrated graphs, I hit real issues
+that had to be fixed before any broader migration could be trusted:
+
+- parity tests in this checkout referenced wrapper-module symbols that were not
+  actually exported
+- `sr_levels` had a payload (`SRLevel` objects) that is not JSON-serializable,
+  so it cannot simply be materialized like a normal bundle node
+- some validation graphs were still allowing runtime-config leakage into
+  upstream compute fingerprints
+- the existing `range_boundaries` parity assertion was out of date relative to
+  the current diagnostics payload shape
+
+I fixed those and re-greened the DAG/runtime validation suite. That work was
+necessary foundation work, but it consumed the budget that would otherwise have
+gone into additional migration waves.
+
+#### 4. The unimplemented phases require more than mechanical refactoring
+
+The remaining items are not just "wire it like range_boundaries":
+
+- **Class B production stages** need replay-window parity proof stage by stage.
+  Materializing them without that proof risks stale or drifted outputs across
+  frontier rebuilds.
+- **Cross-asset DAG migration** needs a topology decision for:
+  - live relevant-pair branch
+  - research full-matrix branch
+  - partner-build nodes
+  - incremental frontier rebuild
+  - audit attachment and cache boundaries
+- **Validator migration** needs per-wrapper target maps, parity tests, explain
+  behavior, and real-data closure tests.
+
+Those are separate implementation tracks, each with their own acceptance gate.
+
+#### 5. I should have stated the checkpoint more explicitly
+
+The mistake on my side was communication precision: after landing the first
+wave, I should have said clearly:
+
+- I implemented the foundational DAG-hardening slice
+- the rest of the program was not yet implemented
+- the next pass would need to pick one of:
+  - production Class B rollout
+  - cross-asset DAG migration
+  - validator migration wave
+
+Instead, I closed with a short summary that was accurate about what landed, but
+not explicit enough up front that the full multi-wave program was still open.
+
+### Exact files changed in the implemented slice
+
+- `src/dag_runtime/builtin_graphs.py`
+- `tests/dag_runtime/test_dag_node_caching.py`
+- `tests/dag_runtime/test_validation_graph_parity.py`
+
+### Verification completed for the implemented slice
+
+These passed after the changes:
+
+- `poetry run python -m pytest tests/dag_runtime/test_validation_graph_parity.py -q`
+- `poetry run python -m pytest tests/dag_runtime/test_range_boundaries_freeze.py tests/dag_runtime/test_dag_node_caching.py -q`
+
+Observed runtime noise:
+
+- existing pandas fragmentation warnings from `src/indicators/smc/ifvg.py`
+
+### The correct next execution order from here
+
+If continuing the program, the next safest order is:
+
+1. production Class B parity gating and selective materialization
+2. cross-asset DAG decomposition for live/research paths
+3. migration of remaining validation wrappers in the documented priority order
+4. only then bounded algorithmic optimization on the proven hotspot
+
+### Bottom line
+
+I implemented the foundation slice because it was the largest safe checkpoint
+that could be landed, verified, and explained in one pass. I did not implement
+the remainder because the rest of the plan crosses into separate migration
+tracks that need their own parity gates and would have been unsafe to batch
+together after the runtime and validation-scope issues surfaced.
+
 ## Project State
 
 - Repository: `trading-system`
@@ -3433,3 +4194,622 @@ Important included content:
 - report-only invalidation rule
 - safe / unsafe modification boundaries
 - paste-ready summary at the bottom
+
+## SMT validation fixes and performance behavior
+
+Updated SMT validation flow and confirmed the difference between hot-cache and cold-path behavior.
+
+### Validation schema fix
+
+In `src/validation/indicators/smt.py`:
+- tightened `_CORR_RE` so `xasset_corr_z_*` columns no longer pollute `corr_partner_windows`
+- `corr_partner_windows` now reports only real partner tokens
+
+### Validation performance fix
+
+In `scripts/validate_smt.py` and `src/validation/indicators/smt.py`:
+- `materialize_research_features(..., build_cross_asset_audit=False)` is used on the SMT validation path
+- `summarize_smt()` no longer implicitly rebuilds the full cross-asset audit when cache inputs are missing
+- audit cache reuse is now decoupled from `--force-graph-recompute true`
+- full cross-asset audit rebuild is now explicit via `--rebuild-audit`
+
+### Observed runtime behavior
+
+Confirmed with real runs:
+- warm-cache SMT validation can complete in about `2s`
+- prior slow path was about `130s+`
+- timing breakdown showed the old remaining bottleneck was not materialization anymore; it was the validation-side fallback audit rebuild inside `validate_smt() -> summarize_smt()`
+
+Key timing evidence from the slow path:
+- `materialize_research_features_seconds: ~5.45s`
+- `validate_smt_seconds: ~128.02s`
+
+Interpretation:
+- feature materialization is no longer the dominant problem on this path
+- the expensive step was the full `build_cross_asset_correlation_audit(...)` fallback
+- fast validation now depends on cached audit summary reuse unless `--rebuild-audit` is explicitly requested
+
+### Operational rule
+
+Use:
+- normal validation for fast cache-backed SMT checks
+- `--force-graph-recompute true` when graph features must be refreshed
+- `--rebuild-audit` only when the expensive cross-asset audit truly needs regeneration
+
+This means:
+- fast SMT validation and full audit regeneration are now separate concerns
+- cold-path audit cost still exists, but it is now opt-in instead of hidden
+
+## Live cross-asset DAG completion and remaining production cache rollout (2026-04-25)
+
+Implemented the next production DAG wave from the live-path plan.
+
+### What landed
+
+#### 1. Live cross-asset execution is now graph-owned
+
+In `src/dag_runtime/builtin_graphs.py` and `src/indicators/pipelines/build_live.py`:
+- `build_live_stage_graph(..., timeframe, include_cross_asset)` now builds two topologies:
+  - primary-only when `include_cross_asset=False`
+  - full live cross-asset topology when `include_cross_asset=True`
+- the live cross-asset topology now includes:
+  - `live_peer_context_source`
+  - `live_market_context_source`
+  - `live_partner_<symbol>` per SMT partner
+  - `live_cross_asset_attach`
+  - `live_feature_bundle`
+- `build_live_indicators(...)` now executes the live graph and returns the graph target output directly
+- `run_live_pipeline(...)` no longer owns a second off-graph cross-asset attach path
+- live metadata now records:
+  - `live_cross_asset_dag`
+  - `market_context_cache_current`
+  - `cross_asset_node_cache_enabled`
+
+Design boundary preserved:
+- research cross-asset was still off-graph at this checkpoint
+- no public signature changes to live pipeline entrypoints
+- no algorithmic changes
+
+#### 2. Live-node fingerprint scope was tightened
+
+Initial live DAG wiring worked, but partner node fingerprints were still coupled to the
+entire peer-context-source fingerprint. That would have over-invalidated unrelated
+partner nodes whenever any peer input changed.
+
+Fixed by tightening fingerprint inputs:
+- `live_market_context_source` now fingerprints only the relevant peer symbols for the
+  primary instrument, not the whole peer source bundle fingerprint
+- each `live_partner_<symbol>` node now fingerprints only its own trimmed partner input
+  instead of the entire peer bundle fingerprint
+
+Effect:
+- changing one partner builder invalidates only that partner node plus
+  `live_cross_asset_attach` / `live_feature_bundle`
+- changing one partner raw input keeps unaffected partner nodes warm
+- market-context invalidation is now tied to relevant symbols rather than all peers
+
+#### 3. Batch B and Batch C production node materialization is now enabled
+
+Expanded `_PIPELINE_MATERIALIZE_NODES` and `_pipeline_stage_source_funcs(...)` in
+`src/dag_runtime/builtin_graphs.py`.
+
+Newly materialized nodes:
+- Batch B:
+  - `fvg_stack`
+  - `order_blocks`
+  - `ob_mitigation`
+  - `liquidity_sweeps`
+  - `equal_hl`
+  - `displacement`
+  - `amd_engine`
+- Batch C:
+  - `rsi_divergence`
+  - `regime`
+  - `anchored_vwap`
+
+Source-hash coverage added for all of the above using their real underlying compute
+functions, including composite hashing for `fvg_stack`.
+
+This means the promoted production set now covers:
+- Class A
+- `swings`
+- Batch A structural nodes
+- Batch B SMC nodes
+- Batch C carried-state research/live nodes
+
+#### 4. Node-cache parquet round-trip now preserves object/string semantics
+
+While enabling `regime` / `anchored_vwap` materialization, tests exposed a real cache
+format issue:
+- cached parquet reloads could widen `object` columns such as `raw_regime_label` into
+  Arrow-backed string columns with `NaN` instead of `None`
+
+Fixed in `src/dag_runtime/cache_store.py`:
+- cached node payloads now store original per-frame column dtypes
+- cache load restores `object` columns and rehydrates nulls to `None`
+- string columns are restored as pandas `string` dtype when originally stored that way
+
+Effect:
+- first-run and warm-cache node outputs now match again
+- pipeline parity tests no longer fail after promoted node caches are warm
+
+### Tests added / expanded
+
+In `tests/test_cross_asset_pipeline.py`:
+- live graph topology includes cross-asset nodes when enabled
+- live graph omits them when disabled
+- graph-owned live output matches the prior manual attach semantics
+- warm reruns hit cache for `live_market_context_source` and partner nodes
+- changing one partner source hash invalidates only that partner closure
+- changing one partner raw input rebuilds only the affected partner node and downstream attach/bundle
+
+In `tests/dag_runtime/test_dag_node_caching.py`:
+- `fvg_stack` source-hash invalidation now proves downstream SMC closure invalidation
+- `anchored_vwap` source-hash invalidation now proves downstream research closure invalidation
+
+Existing generic cache tests also automatically expanded coverage because the new nodes
+were added to `_PIPELINE_MATERIALIZE_NODES`.
+
+### Verification run
+
+Executed:
+
+```bash
+python3 -m py_compile \
+  src/dag_runtime/cache_store.py \
+  src/dag_runtime/builtin_graphs.py \
+  src/indicators/pipelines/build_live.py \
+  tests/test_cross_asset_pipeline.py \
+  tests/dag_runtime/test_dag_node_caching.py
+
+poetry run python -m pytest \
+  tests/test_cross_asset_pipeline.py \
+  tests/dag_runtime/test_dag_node_caching.py \
+  tests/test_pipeline_incremental.py \
+  tests/test_incremental_market_context.py \
+  tests/test_relevant_correlation_pairs.py \
+  -q
+```
+
+Result:
+- `49 passed`
+
+Known warnings during the run:
+- existing pandas fragmentation warnings in `cross_asset.py` and `ifvg.py`
+- explicitly deferred because this wave forbids algorithmic/DataFrame rewrite work
+
+### What remains deferred
+
+Still intentionally out of scope for this wave:
+- research cross-asset fully inside the DAG
+- broad validator migration
+- replay-window retuning
+- scheduler / parallel executor redesign
+- deep algorithmic optimization / DataFrame reshaping cleanup
+
+### Practical outcome
+
+After this wave:
+- live cross-asset is no longer a second off-graph execution path
+- warm live reruns can reuse node cache for market context and SMT partner builds
+- promoted Batch B/C nodes now participate in source-hash invalidation and warm-cache reuse
+- cache serialization no longer corrupts parity for object/string-heavy node outputs
+
+## Research DAG, Replay, Scheduler, Validator Follow-up (2026-04-25)
+
+### Scope actually completed in this session
+
+This session did not finish the entire four-workstream program. It landed the
+research-DAG migration, a bounded scheduler, a conservative replay-window
+retuning pass, and the first two validator migrations in the frozen order.
+
+What is complete now:
+- research cross-asset is graph-owned end to end
+- the DAG executor has an opt-in bounded-parallel thread scheduler
+- replay-window values were retuned only where parity held
+- `validate_structure_context.py` and `validate_swings.py` are now DAG-backed wrappers
+
+What remains deferred:
+- the rest of the procedural validator migrations
+- broader replay-window shrink work where exact parity was not proven
+- enabling bounded parallelism on validators
+- any algorithmic / DataFrame rewrite work
+
+### 1. Research cross-asset is now fully DAG-owned
+
+Files:
+- `src/indicators/pipelines/build_research.py`
+- `src/dag_runtime/builtin_graphs.py`
+
+What changed:
+- `build_research_indicators(...)` now executes the research graph rather than
+  running a second off-graph cross-asset orchestration path
+- `run_research_pipeline(...)` now routes research cross-asset through graph targets:
+  - `research_feature_bundle` for the default audit-skip path
+  - `research_full_bundle` only when `build_cross_asset_audit=True`
+- `materialize_research_features(...)` now persists:
+  - market context from `research_market_context_source`
+  - SMT research tables from `research_smt_research_table`
+  - audit tables/summary from `research_cross_asset_audit`
+
+New research graph nodes in `build_research_stage_graph(...)`:
+- `research_peer_context_source`
+- `research_market_context_source`
+- `research_partner_<symbol>`
+- `research_cross_asset_attach`
+- `research_smt_research_table`
+- `research_cross_asset_audit`
+- `research_feature_bundle`
+- `research_full_bundle`
+
+Behavioral result:
+- the default SMT fast path remains audit-skip
+- research cross-asset cache/invalidation is now graph-visible
+- partner invalidation is now isolated to the affected partner closure
+
+Important correctness fix discovered during rollout:
+- downstream research SMT/audit fingerprints originally depended only on attached
+  frame content, which was too weak for source-hash invalidation
+- fixed by including `research_cross_asset_attach` fingerprint directly in the
+  SMT/audit fingerprint helpers
+
+### 2. Replay-window retuning landed conservatively
+
+Files:
+- `src/indicators/pipelines/build_live.py`
+- `src/indicators/pipelines/build_research.py`
+- `src/dag_runtime/builtin_graphs.py`
+- `tests/test_pipeline_incremental.py`
+
+Policy used:
+- only keep a smaller replay window if the current parity tests still pass
+- if a shrink failed once, revert to the last passing value immediately
+
+Final replay-window changes that stayed:
+- live:
+  - `fvg_stack`: `300 -> 240`
+  - `displacement`: `300 -> 240`
+  - `order_blocks`: `300 -> 240`
+  - `ob_mitigation`: `300 -> 240`
+  - `liquidity_sweeps`: `300 -> 240`
+  - `equal_hl`: `300 -> 240`
+  - `amd_engine`: `300 -> 240`
+  - `rsi_divergence`: `220 -> 200`
+  - `regime`: `240 -> 200`
+- research:
+  - `fvg_stack`: `300 -> 240`
+  - `displacement`: `300 -> 240`
+  - `order_blocks`: `300 -> 240`
+  - `ob_mitigation`: `300 -> 240`
+  - `liquidity_sweeps`: `300 -> 240`
+  - `equal_hl`: `300 -> 240`
+  - `amd_engine`: `300 -> 240`
+  - `rsi_divergence`: `220 -> 200`
+  - `anchored_vwap`: `300 -> 200`
+
+Retuning attempts that were explicitly rejected and reverted:
+- `swings`: kept at `400`
+- `trend_state`: kept at `400`
+- `bos`: kept at `400`
+- `choch`: kept at `400`
+- research `regime`: kept at `240`
+
+Why those stayed larger:
+- exact-parity checks failed when those windows were reduced
+- the program rule was to keep the last passing value, not to accept bounded drift
+
+Research cross-asset node replay metadata added:
+- `research_market_context_source`: `200`
+- `research_partner_<symbol>`: `200`
+- `research_cross_asset_attach`: `200`
+- `research_smt_research_table`: `200`
+
+Important non-replay fix discovered during this work:
+- research/live pregraph cross-asset config fingerprints were including the
+  primary input fingerprint, which forced `config-changed` full rebuilds on new bars
+- fixed by making those metadata fingerprints depend only on peer identities and
+  cross-asset config, not current primary input contents
+
+### 3. Bounded-parallel DAG scheduler landed
+
+Files:
+- `src/dag_runtime/node.py`
+- `src/dag_runtime/executor.py`
+- `src/dag_runtime/profiling.py`
+- `src/dag_runtime/__init__.py`
+- `tests/dag_runtime/test_dag_runtime.py`
+
+What changed:
+- added `ExecutionPolicy`:
+  - `scheduler_mode`
+  - `max_workers`
+  - `max_concurrent_cache_writes`
+- `GraphRunContext` now carries `execution_policy`
+- `execute_graph(...)` now supports:
+  - `serial` mode as the default and fallback
+  - `bounded_parallel` mode using threads
+
+Scheduler behavior:
+- only independent ready nodes are run concurrently
+- cache hits and explain-only nodes are still resolved on the main thread
+- result integration order remains deterministic by topological order
+- cache writes are throttled via a semaphore
+- write throttling defaults to one concurrent cache write
+
+Profiler additions:
+- `scheduler_mode`
+- `worker_count`
+- `metrics.max_concurrent_cache_writes`
+- per-node `runnable_queue_wait_seconds`
+- per-node `cache_write_wait_seconds` where applicable
+
+Tests added:
+- bounded-parallel output matches serial output
+- scheduler metadata is recorded in the profiler summary
+- node-result closure order remains deterministic
+- cache-write throttling caps concurrent writes at one
+- failure on one branch surfaces deterministically and prevents later ready work
+
+### 4. Validator migration advanced by two wrappers
+
+Files:
+- `scripts/validate_structure_context.py`
+- `scripts/validate_swings.py`
+- `src/dag_runtime/builtin_graphs.py`
+- `tests/dag_runtime/test_validation_graph_parity.py`
+
+New validation graph families:
+- `validate_structure_context`
+- `validate_swings`
+
+New targets:
+- `structure_context_validation_bundle`
+- `swings_validation_bundle`
+
+Migration shape:
+- wrappers now parse CLI flags, build `GraphRunContext`, execute the DAG target,
+  print summary output, and write profiler JSON
+- compute ownership moved into DAG nodes
+- HTML generation is report-scoped rather than upstream-compute-scoped
+
+Structure context graph nodes:
+- `raw_input`
+- `structure_context_frame`
+- `structure_context_view`
+- `structure_context_summary`
+- `structure_context_chart`
+- `structure_context_validation_bundle`
+
+Swings graph nodes:
+- `raw_input`
+- `swings_context_frame`
+- `swings_summary`
+- `swings_chart`
+- `swings_validation_bundle`
+
+Parity tests added:
+- `validate_structure_context` graph matches direct summary output
+- `validate_swings` graph matches direct summary plus sampled event windows
+
+Test helper fix required:
+- nested parity assertions now treat `NaN` vs `NaN` as equal in summary payloads
+
+### Verification
+
+Executed successfully:
+
+```bash
+python3 -m py_compile \
+  src/dag_runtime/node.py \
+  src/dag_runtime/profiling.py \
+  src/dag_runtime/executor.py \
+  src/dag_runtime/builtin_graphs.py \
+  src/indicators/pipelines/build_live.py \
+  src/indicators/pipelines/build_research.py \
+  scripts/validate_structure_context.py \
+  scripts/validate_swings.py \
+  tests/test_pipeline_incremental.py \
+  tests/dag_runtime/test_dag_runtime.py \
+  tests/dag_runtime/test_validation_graph_parity.py
+
+poetry run python -m pytest \
+  tests/dag_runtime/test_validation_graph_parity.py \
+  tests/test_pipeline_incremental.py \
+  tests/dag_runtime/test_dag_runtime.py \
+  tests/test_cross_asset_pipeline.py \
+  -q
+```
+
+Result:
+- `38 passed`
+
+Warnings that remain:
+- existing pandas fragmentation warnings in `cross_asset.py` and `ifvg.py`
+- these are still intentionally deferred to a later algorithmic pass
+
+### Repo-truth outcome after this session
+
+- research cross-asset is no longer an off-graph special case
+- replay retuning is now evidence-based rather than aspirational
+- bounded-parallel graph execution exists, but is still opt-in
+- the validator migration backlog has moved from four migrated wrappers to six:
+  - already migrated before: `range_boundaries`, `regime`, `trend_state`, `sr_levels`
+  - migrated now: `structure_context`, `swings`
+
+### Explicit remaining gaps
+
+Still not done from the original program:
+- migrate the rest of the validator backlog:
+  - `validate_bos.py`
+  - `validate_bos_context.py`
+  - `validate_choch.py`
+  - `validate_choch_context.py`
+  - medium-priority validators
+  - `validate_indicators.py`
+  - `validate_detectors.py`
+- enable bounded-parallel execution on production pipelines by default
+- decide whether any research-tail replay windows can be shrunk further without drift
+- move validator families onto bounded-parallel only after their own freeze gates are green
+
+## Carried-State Cache Rollback (2026-04-26)
+
+Claude review surfaced a real regression in `tests/test_pipeline_persistence.py`:
+
+- `test_multi_bar_append_preserves_parity_with_full_rebuild`
+- failure column: `r_regime_dwell_final`
+- reproduced locally on current code before rollback
+
+Observed failure example:
+- incremental persisted rebuild: `305.0`
+- full rebuild: `312.0`
+
+Root cause:
+- `_PIPELINE_MATERIALIZE_NODES` had been expanded to include carried-state Class B
+  nodes (`trend_state`, `bos`, `choch`, `fvg_stack`, `displacement`,
+  `order_blocks`, `ob_mitigation`, `liquidity_sweeps`, `equal_hl`,
+  `amd_engine`, `anchored_vwap`, `regime`)
+- node fingerprints included replay policy and upstream fingerprints, but not a
+  replay-history/carry-state snapshot strong enough to guarantee parity across
+  persistence/incremental reuse scenarios
+- result: warm cache reuse was possible in contexts where a deeper replay
+  history was actually required
+
+Fix applied:
+- reverted the carried-state Class B nodes out of `_PIPELINE_MATERIALIZE_NODES`
+- kept the safe promoted set as:
+  - Class A nodes
+  - `swings`
+  - non-carried `rsi_divergence`
+- left source-hash plumbing intact elsewhere, but non-materialized nodes no
+  longer persist and therefore cannot serve stale node-cache output
+
+Files changed in the rollback:
+- `src/dag_runtime/builtin_graphs.py`
+- `tests/dag_runtime/test_dag_node_caching.py`
+- `docs/DATA_ENGINEERING.md`
+- `.codex/memory.md`
+
+Also corrected:
+- the stale memory contradiction claiming research cross-asset remained off-graph
+  after the later research-DAG migration
+
+Verification after rollback:
+
+```bash
+poetry run python -m pytest \
+  tests/test_pipeline_persistence.py \
+  tests/dag_runtime/test_dag_node_caching.py \
+  tests/test_pipeline_incremental.py \
+  tests/test_cross_asset_pipeline.py \
+  -q
+```
+
+Expected outcome of the rollback:
+- persistence parity restored for the carried-state research/live tails
+- node cache remains active only on the proven-safe subset
+- research/live cross-asset DAG work remains in place
+
+Correct repo-truth after rollback:
+- research cross-asset is DAG-owned
+- live cross-asset is DAG-owned
+- carried-state Class B nodes are **not** materialized pending a proper replay-
+  context parity gate
+
+### Follow-up correction
+
+The whitelist rollback was necessary but not sufficient by itself.
+
+After reverting carried-state Class B materialization, the persistence failure
+still reproduced. The remaining bug was in frontier merge/persist scope:
+
+- research materialization was replaying from the full raw history in some
+  incremental cases
+- but the persisted frontier boundary still used the older month partition
+  frontier
+- this froze earlier historical partitions even when the replay scope had moved
+  earlier than that frontier
+
+Fix applied:
+- in `src/indicators/pipelines/build_research.py`, the effective persisted
+  frontier is now `min(partition_frontier_ts, replay_from_ts)` when replay
+  starts earlier than the partition boundary
+- this preserves exact parity with full rebuilds for research persistence
+
+Important boundary:
+- this correction was applied to research only
+- the same change was explicitly **not** kept on live, because live persistence
+  tests require ordinary appends to touch only the frontier partition and keep
+  historical partitions immutable
+
+Final verification after the full fix:
+
+```bash
+poetry run python -m pytest \
+  tests/test_pipeline_persistence.py \
+  tests/dag_runtime/test_dag_node_caching.py \
+  tests/test_pipeline_incremental.py \
+  tests/test_cross_asset_pipeline.py \
+  -q
+```
+
+Result:
+- `44 passed`
+
+## SMT divergence freeze accepted (2026-04-26)
+
+Scope accepted as frozen:
+
+- indicator: `smt_divergence`
+- validation scope: `XAU_USD H1`
+- acceptance bar used: H1 validation is sufficient for the current project phase
+
+Why this was accepted:
+
+- SMT direct behavior now has regression coverage for:
+  - duplicate event suppression on the same swing pair
+  - score and metadata fields
+  - timestamp and row-alignment hard failures
+- SMT research outcome logic was corrected and covered:
+  - `"failed"` and `"reversal"` are no longer conflated
+- SMT validation schema was corrected:
+  - fake `xasset_corr_z_*` partners no longer pollute
+    `corr_partner_windows`
+- SMT validation performance/orchestration was hardened:
+  - graph recompute and audit rebuild are now separate concerns
+  - cache-backed validation is fast
+  - full audit rebuild is explicit via:
+    - `--rebuild-audit`
+    - `--force-rebuild-audit`
+
+Accepted data-quality reading from the validation pass:
+
+- `sanity_checks` were all `True`
+- partner set was coherent and expected:
+  - `dxy`
+  - `usd_jpy`
+- feature availability was populated across the expected correlation and lag
+  columns
+- event counts and sample windows looked plausible rather than empty,
+  contradictory, or structurally degenerate
+- validation output was stable after the schema and fast-path fixes
+
+Frozen operational interpretation:
+
+- SMT divergence is now treated as a frozen indicator for current downstream
+  work
+- the accepted freeze evidence is the `XAU_USD H1` validation pass
+- the indicator contract is considered stable unless a future defect forces an
+  intentional reopen
+
+What is not implied by this freeze:
+
+- it is not a claim that every instrument/timeframe universe has been signed
+  off
+- it is not a claim that research/audit caches never need regeneration
+- it is not a claim that broader cross-asset doctrine is globally frozen
+
+Practical rule going forward:
+
+- normal SMT use should rely on the frozen indicator contract
+- rerun validation or rebuild audit only when intentionally checking data drift,
+  cache state, or a newly introduced change

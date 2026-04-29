@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
@@ -14,6 +15,25 @@ class ArtifactWriteResult:
     rows: int | None
     bytes_written: int
     partition: str | None = None
+
+
+def _json_safe_frame_attrs(frame: pd.DataFrame) -> dict[str, object]:
+    safe_attrs: dict[str, object] = {}
+    for key, value in frame.attrs.items():
+        if isinstance(value, pd.DataFrame):
+            continue
+        try:
+            json.dumps(value)
+        except TypeError:
+            continue
+        safe_attrs[str(key)] = value
+    return safe_attrs
+
+
+def _parquet_safe_frame(df: pd.DataFrame) -> pd.DataFrame:
+    safe = df.copy(deep=False)
+    safe.attrs = _json_safe_frame_attrs(df)
+    return safe
 
 
 def canonical_dataset_root(
@@ -78,6 +98,7 @@ def load_partitioned_dataset(
     dataset: str,
     symbol: str,
     timeframe: str,
+    read_observer: Callable[[Path, pd.DataFrame], None] | None = None,
 ) -> pd.DataFrame:
     parts = list_partition_paths(
         base_dir,
@@ -87,7 +108,12 @@ def load_partitioned_dataset(
     )
     if not parts:
         return pd.DataFrame()
-    frames = [pd.read_parquet(path) for path in parts]
+    frames = []
+    for path in parts:
+        frame = pd.read_parquet(path)
+        if read_observer is not None:
+            read_observer(path, frame)
+        frames.append(frame)
     combined = pd.concat(frames, ignore_index=True)
     if "timestamp" in combined.columns:
         combined = combined.sort_values("timestamp").drop_duplicates(
@@ -101,7 +127,7 @@ def write_parquet_atomic(df: pd.DataFrame, path: str | Path) -> ArtifactWriteRes
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target.with_suffix(target.suffix + ".tmp")
-    df.to_parquet(tmp_path, index=False)
+    _parquet_safe_frame(df).to_parquet(tmp_path, index=False)
     os.replace(tmp_path, target)
     return ArtifactWriteResult(
         path=target,

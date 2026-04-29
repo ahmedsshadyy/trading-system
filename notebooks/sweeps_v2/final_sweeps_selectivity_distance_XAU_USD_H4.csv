@@ -1,0 +1,25 @@
+pre_breach_distance_bucket,selectivity_class,sweep_count,tradeable_count
+"[0.00, 0.10)",displacement_confirmed_sweep,19,0
+"[0.00, 0.10)",micro_interaction_sweep,177,0
+"[0.00, 0.10)",standard_liquidity_sweep,52,0
+"[0.00, 0.10)",tradeable_sweep_candidate,58,58
+"[0.10, 0.25)",displacement_confirmed_sweep,31,0
+"[0.10, 0.25)",micro_interaction_sweep,287,0
+"[0.10, 0.25)",standard_liquidity_sweep,80,0
+"[0.10, 0.25)",tradeable_sweep_candidate,80,80
+"[0.25, 0.50)",displacement_confirmed_sweep,151,0
+"[0.25, 0.50)",micro_interaction_sweep,0,0
+"[0.25, 0.50)",standard_liquidity_sweep,400,0
+"[0.25, 0.50)",tradeable_sweep_candidate,177,177
+"[0.50, 1.00)",displacement_confirmed_sweep,140,0
+"[0.50, 1.00)",micro_interaction_sweep,0,0
+"[0.50, 1.00)",standard_liquidity_sweep,411,0
+"[0.50, 1.00)",tradeable_sweep_candidate,188,188
+"[1.00, 2.00)",displacement_confirmed_sweep,52,0
+"[1.00, 2.00)",micro_interaction_sweep,0,0
+"[1.00, 2.00)",standard_liquidity_sweep,180,0
+"[1.00, 2.00)",tradeable_sweep_candidate,70,70
+"[2.00, inf)",displacement_confirmed_sweep,3,0
+"[2.00, inf)",micro_interaction_sweep,0,0
+"[2.00, inf)",standard_liquidity_sweep,23,0
+"[2.00, inf)",tradeable_sweep_candidate,17,17

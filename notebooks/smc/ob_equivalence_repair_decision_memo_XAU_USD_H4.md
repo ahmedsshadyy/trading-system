@@ -1,0 +1,20 @@
+# OB Equivalence Repair Decision Memo — XAU_USD H4
+
+- Baseline matched count: `1 / 9`.
+- Best repaired matched count: `1 / 9`.
+- Best repaired exact fraction: `0.0`.
+- Decision case: `Case 4`.
+
+## Best-case reference mapping
+```text
+                          variant_label  reference_case_id reference_side  reference_source_idx  reference_zone_low  reference_zone_high                 best_live_match_variant  best_live_match_ob_id                          match_class  source_lag_bars  activation_lag_bars  geometry_drift_atr     failure_primary_reason                      failure_secondary_reason  match_rank
+                  baseline_current_live                  1           bull               18880.0            4985.425             5001.805                   baseline_current_live                    NaN                            unmatched              NaN                  NaN                 NaN no_nearby_candidate_exists not_representable_under_current_live_ontology           0
+                  baseline_current_live                  2           bull               18907.0            5157.880             5186.485                   baseline_current_live                    NaN                            unmatched              NaN                  NaN                 NaN no_nearby_candidate_exists not_representable_under_current_live_ontology           0
+                  baseline_current_live                  3           bull               18912.0            5172.225             5197.830                   baseline_current_live                    NaN                            unmatched              NaN                  NaN                 NaN no_nearby_candidate_exists not_representable_under_current_live_ontology           0
+                  baseline_current_live                  4           bull               18950.0            5079.930             5096.515                   baseline_current_live                    NaN                            unmatched              NaN                  NaN                 NaN no_nearby_candidate_exists not_representable_under_current_live_ontology           0
+                  baseline_current_live                  5           bear               18845.0            5063.665             5078.385                   baseline_current_live                    NaN                            unmatched              NaN                  NaN                 NaN no_nearby_candidate_exists not_representable_under_current_live_ontology           0
+                  baseline_current_live                  6           bear               18858.0            4990.765             5017.445                   baseline_current_live                    NaN                            unmatched              NaN                  NaN                 NaN no_nearby_candidate_exists not_representable_under_current_live_ontology           0
+                  baseline_current_live                  7           bear               18921.0            5306.955             5346.580                   baseline_current_live                    NaN                            unmatched              NaN                  NaN                 NaN no_nearby_candidate_exists not_representable_under_current_live_ontology           0
+                  baseline_current_live                  8           bear               18934.0            5152.645             5186.490                   baseline_current_live                    NaN                            unmatched              NaN                  NaN                 NaN no_nearby_candidate_exists not_representable_under_current_live_ontology           0
+source_repair_cluster_base_before_break                  9           bear               18971.0            5084.860             5115.390 source_repair_cluster_base_before_break                  395.0 nearby_source_relaxed_geometry_match              2.0                  4.0            0.188421 source_candle_substitution                                           NaN           2
+```

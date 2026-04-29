@@ -1,0 +1,3 @@
+profile,confirmed_sweeps_count,accepted_breakouts_count,unresolved_breaches_count,same_bar_sweeps,delayed_rejection_sweeps,tradeable_candidates,tradeable_rate,followed_by_bos,followed_by_choch,followed_by_displacement,failed_breakout_reclaim,causality_violations
+step11c_cooldown_5,3784,2324,6563,1020,2764,1476,0.3901,284,307,712,197,0
+step11c_cooldown_10,3762,2322,6565,1010,2752,1469,0.3905,283,295,711,197,0

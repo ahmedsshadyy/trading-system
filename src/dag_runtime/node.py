@@ -32,6 +32,13 @@ class NodeOutput:
 
 
 @dataclass(slots=True)
+class ExecutionPolicy:
+    scheduler_mode: str = "serial"
+    max_workers: int = 1
+    max_concurrent_cache_writes: int = 1
+
+
+@dataclass(slots=True)
 class GraphRunContext:
     graph_name: str
     symbol: str
@@ -44,6 +51,7 @@ class GraphRunContext:
     force: bool = False
     invalidate_cache: bool = False
     explain_only: bool = False
+    execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
 
 
 ComputeFn = Callable[[GraphRunContext, dict[str, "NodeExecutionResult"]], NodeOutput]

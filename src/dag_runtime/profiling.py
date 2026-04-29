@@ -43,14 +43,25 @@ class GraphRunProfiler:
         self.started_at = datetime.now(UTC)
         self._nodes: list[NodeProfile] = []
         self._artifacts: list[NodeArtifactRecord] = []
+        self.scheduler_mode = "serial"
+        self.worker_count = 1
+        self.metrics: dict[str, Any] = {}
+
+    def set_scheduler(self, *, scheduler_mode: str, worker_count: int) -> None:
+        self.scheduler_mode = scheduler_mode
+        self.worker_count = worker_count
+
+    def set_metric(self, name: str, value: Any) -> None:
+        self.metrics[name] = value
 
     def record_node(
         self,
         *,
         node_name: str,
         node_kind: str,
-        started_at: float,
+        started_at: float | None = None,
         cache_hit: bool,
+        seconds: float | None = None,
         rows_out: int | None = None,
         estimated_memory_bytes: int | None = None,
         fingerprint: str | None = None,
@@ -60,7 +71,11 @@ class GraphRunProfiler:
             NodeProfile(
                 node_name=node_name,
                 node_kind=node_kind,
-                seconds=time.perf_counter() - started_at,
+                seconds=(
+                    seconds
+                    if seconds is not None
+                    else time.perf_counter() - (started_at or time.perf_counter())
+                ),
                 cache_hit=cache_hit,
                 rows_out=rows_out,
                 estimated_memory_bytes=estimated_memory_bytes,
@@ -94,9 +109,12 @@ class GraphRunProfiler:
             "graph_name": self.graph_name,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scheduler_mode": self.scheduler_mode,
+            "worker_count": self.worker_count,
             "started_at": self.started_at.isoformat(),
             "ended_at": ended_at.isoformat(),
             "total_seconds": (ended_at - self.started_at).total_seconds(),
+            "metrics": dict(self.metrics),
             "nodes": [asdict(node) for node in self._nodes],
             "artifacts_written": [asdict(artifact) for artifact in self._artifacts],
         }

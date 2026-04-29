@@ -1,0 +1,10 @@
+reference_case_id,reference_side,reference_side_int,reference_source_ts,reference_source_idx,reference_zone_low,reference_zone_high,best_live_match_variant,best_live_match_ob_id,match_class,source_lag_bars,activation_lag_bars,geometry_drift_atr,failure_primary_reason,failure_secondary_reason
+1,bull,1,2026-02-19 22:00:00+00:00,18880.0,4985.425,5001.805,canonical_bos,,unmatched,,,,no_nearby_candidate_exists,legacy_nonlive_may_be_noncausal
+2,bull,1,2026-02-26 10:00:00+00:00,18907.0,5157.88,5186.485,canonical_bos,,unmatched,,,,no_nearby_candidate_exists,legacy_nonlive_may_be_noncausal
+3,bull,1,2026-02-27 06:00:00+00:00,18912.0,5172.225,5197.83,canonical_bos,,unmatched,,,,no_nearby_candidate_exists,legacy_nonlive_may_be_noncausal
+4,bull,1,2026-03-09 09:00:00+00:00,18950.0,5079.93,5096.515,canonical_bos,,unmatched,,,,no_nearby_candidate_exists,legacy_nonlive_may_be_noncausal
+5,bear,-1,2026-02-12 02:00:00+00:00,18845.0,5063.665,5078.385,canonical_bos,,unmatched,,,,no_nearby_candidate_exists,legacy_nonlive_may_be_noncausal
+6,bear,-1,2026-02-16 06:00:00+00:00,18858.0,4990.765,5017.445,canonical_bos,,unmatched,,,,no_nearby_candidate_exists,legacy_nonlive_may_be_noncausal
+7,bear,-1,2026-03-02 18:00:00+00:00,18921.0,5306.955,5346.58,canonical_bos,,unmatched,,,,no_nearby_candidate_exists,legacy_nonlive_may_be_noncausal
+8,bear,-1,2026-03-04 22:00:00+00:00,18934.0,5152.645,5186.49,canonical_bos,,unmatched,,,,no_nearby_candidate_exists,legacy_nonlive_may_be_noncausal
+9,bear,-1,2026-03-12 21:00:00+00:00,18971.0,5084.86,5115.39,canonical_bos,602.0,nearby_source_relaxed_geometry_match,3.0,4.0,0.7576381250460745,,

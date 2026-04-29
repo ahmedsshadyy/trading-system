@@ -105,13 +105,16 @@ def build_smt_research_table(
                     mfe = np.nanmax(window_high) - detect_close
                     mae = detect_close - np.nanmin(window_low)
                     hold_flag = close[end] > detect_close
-                    reversal_flag = np.nanmin(window_low) < detect_close
+                    failed_flag = np.nanmin(window_low) < detect_close
+                    reversal_flag = close[end] < detect_close
                 else:
                     mfe = detect_close - np.nanmin(window_low)
                     mae = np.nanmax(window_high) - detect_close
                     hold_flag = close[end] < detect_close
-                    reversal_flag = np.nanmax(window_high) > detect_close
-                failed_flag = bool(reversal_flag and not hold_flag)
+                    failed_flag = np.nanmax(window_high) > detect_close
+                    reversal_flag = close[end] > detect_close
+                failed_flag = bool(failed_flag)
+                reversal_flag = bool(reversal_flag)
                 row[f"smt_hold_{horizon}"] = bool(hold_flag)
                 row[f"smt_failed_{horizon}"] = bool(failed_flag)
                 row[f"smt_reversal_{horizon}"] = bool(reversal_flag)

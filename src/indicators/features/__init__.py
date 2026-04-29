@@ -14,8 +14,10 @@ from src.indicators.features.cross_asset import (
     persist_market_context,
     resolve_cross_asset_inputs,
 )
+from src.indicators.features.key_levels import add_key_levels
 
 __all__ = [
+    "add_key_levels",
     "CONTEXT_SYMBOLS",
     "FX_SYMBOLS",
     "GLOBAL_CONTEXT_SYMBOL",

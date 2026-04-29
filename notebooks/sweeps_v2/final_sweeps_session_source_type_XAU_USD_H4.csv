@@ -1,0 +1,7 @@
+session_source_scope,session_source_type,sweep_count,tradeable_count
+completed_previous_session_only,prev_ny_low,189,36
+completed_previous_session_only,prev_london_low,135,42
+completed_previous_session_only,prev_ny_high,132,30
+completed_previous_session_only,prev_asia_low,123,30
+completed_previous_session_only,prev_london_high,105,26
+completed_previous_session_only,prev_asia_high,104,26
