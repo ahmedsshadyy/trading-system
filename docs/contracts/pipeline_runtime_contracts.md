@@ -70,7 +70,6 @@ Contract:
 - `displacement`
 - `order_blocks`
 - `ob_mitigation`
-- `liquidity_sweeps`
 - `equal_hl`
 - `amd_engine`
 - `anchored_vwap`

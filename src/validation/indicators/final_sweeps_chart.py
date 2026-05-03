@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from src.indicators.sweeps_v2.final_sweeps import (
+from src.indicators.smc.sweeps.final_sweeps import (
     SWEEP_CLASS_ACCEPTED_BREAKOUT,
     SWEEP_CLASS_DELAYED_REJECTION,
     SWEEP_CLASS_FAILED_BREAKOUT_RECLAIM,

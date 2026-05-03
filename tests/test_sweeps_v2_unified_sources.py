@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.indicators.sweeps_v2.unified_sources import (
+from src.indicators.smc.sweeps.unified_sources import (
     LIQ_DEPRECATED_FAMILIES,
     LIQ_FAMILY_PRECEDENCE,
     LIQ_GLOBAL_CROWDING_CAP,

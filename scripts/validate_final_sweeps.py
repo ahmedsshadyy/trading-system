@@ -34,21 +34,32 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 
 from src.indicators.pipelines.build_research import build_research_indicators
-from src.indicators.sweeps_v2.final_sweeps import (
+from src.indicators.smc.sweeps.final_sweeps import (
     FINAL_SWEEPS_COLUMNS,
     add_final_sweeps,
     step11d_default_kwargs,
     step11e_default_kwargs,
     step11e_profile_kwargs,
 )
-from src.indicators.sweeps_v2.mtf_policy import mtf_policy_summary
-from src.indicators.sweeps_v2.unified_sources import (
+from src.indicators.smc.sweeps.mtf_policy import mtf_policy_summary
+from src.indicators.smc.sweeps.unified_sources import (
     build_unified_liquidity_clusters_audit,
 )
 from src.validation.indicators.final_sweeps import (
     build_final_sweeps_diagnostics,
     print_final_sweeps_summary,
     summarize_final_sweeps,
+)
+from src.validation.indicators.swing_post_confirm import (
+    build_swing_post_confirm_diagnostics,
+)
+from src.validation.indicators.atr_bracket_first_hit import (
+    build_atr_bracket_first_hit_diagnostics,
+    print_atr_bracket_summary,
+)
+from src.validation.indicators.bracket_matrix_confluence import (
+    build_step11u_diagnostics,
+    print_step11u_summary,
 )
 from src.validation.indicators.final_sweeps_chart import render_final_sweeps_chart
 from src.validation.indicators.unified_sources import (
@@ -460,6 +471,10 @@ def _run_single(
     )
 
     diagnostics = build_final_sweeps_diagnostics(fs_df)
+    swing_diagnostics = build_swing_post_confirm_diagnostics(
+        df,
+        sweep_diagnostics=diagnostics,
+    )
     family_funnel = diagnostics["family_funnel"]
     age_buckets = diagnostics["age_buckets"]
     strength_buckets = diagnostics["strength_buckets"]
@@ -478,6 +493,38 @@ def _run_single(
     repeated_sweeps = diagnostics["repeated_sweeps"]
     family_group_rates = diagnostics["family_group_rates"]
     source_events = diagnostics["source_events"]
+    post_path_summary = diagnostics["post_path_summary"]
+    outcome_by_class_table = diagnostics["outcome_by_class_table"]
+    outcome_by_family_table = diagnostics["outcome_by_family_table"]
+    outcome_by_side_table = diagnostics["outcome_by_side_table"]
+    outcome_by_regime_table = diagnostics["outcome_by_regime_table"]
+    outcome_by_session_phase_table = diagnostics["outcome_by_session_phase_table"]
+    outcome_by_quality_bucket_table = diagnostics["outcome_by_quality_bucket_table"]
+    outcome_by_source_age_bucket_table = diagnostics[
+        "outcome_by_source_age_bucket_table"
+    ]
+    outcome_by_distance_bucket_table = diagnostics["outcome_by_distance_bucket_table"]
+    best_reversal_group_by_class = diagnostics["best_reversal_group_by_class"]
+    worst_continuation_group_by_class = diagnostics["worst_continuation_group_by_class"]
+    best_reversal_family = diagnostics["best_reversal_family"]
+    worst_continuation_family = diagnostics["worst_continuation_family"]
+    swing_contract = swing_diagnostics["contract"]
+    swing_summary = swing_diagnostics["summary"]
+    swing_events = swing_diagnostics["events"]
+    swing_by_side = swing_diagnostics["by_side"]
+    swing_by_latency = swing_diagnostics["by_latency"]
+    swing_by_strength = swing_diagnostics["by_strength"]
+    swing_by_regime = swing_diagnostics["by_regime"]
+    swing_by_session = swing_diagnostics["by_session"]
+    swing_by_volatility = swing_diagnostics["by_volatility"]
+    swing_by_distance = swing_diagnostics["by_distance"]
+    swing_comparison = swing_diagnostics["comparison_to_sweeps"]
+    best_swing_side = swing_diagnostics["best_swing_side"]
+    best_latency_bucket = swing_diagnostics["best_latency_bucket"]
+    best_regime = swing_diagnostics["best_regime"]
+    best_session_phase = swing_diagnostics["best_session_phase"]
+    best_distance_bucket = swing_diagnostics["best_distance_bucket"]
+    swing_memo_markdown = swing_diagnostics["memo_markdown"]
 
     _print_table("before_after", comparison)
     _print_table("family_conversion", family_funnel)
@@ -497,13 +544,86 @@ def _run_single(
     _print_table("session_source_type_table", session_source_type_table)
     _print_table("repeated_source_cooldown_impact", repeated_sweeps)
     _print_table("family_group_sweep_rates", family_group_rates)
+    print("\n=== STEP 11H POST-SWEEP PATH BEHAVIOR ===")
+    for key, value in post_path_summary.items():
+        print(f"{key}: {value}")
+    print(f"best_reversal_group_by_class: {best_reversal_group_by_class}")
+    print(f"worst_continuation_group_by_class: {worst_continuation_group_by_class}")
+    print(f"best_reversal_family: {best_reversal_family}")
+    print(f"worst_continuation_family: {worst_continuation_family}")
+    _print_table("step11h_outcome_by_class", outcome_by_class_table)
+    _print_table("step11h_outcome_by_family", outcome_by_family_table)
+    _print_table("step11h_outcome_by_side", outcome_by_side_table)
+    _print_table("step11h_outcome_by_regime", outcome_by_regime_table)
+    _print_table("step11h_outcome_by_session_phase", outcome_by_session_phase_table)
+    _print_table("step11h_outcome_by_quality_bucket", outcome_by_quality_bucket_table)
+    _print_table(
+        "step11h_outcome_by_source_age_bucket", outcome_by_source_age_bucket_table
+    )
+    _print_table("step11h_outcome_by_distance_bucket", outcome_by_distance_bucket_table)
+    print("\n=== STEP 11S SWING POST-CONFIRMATION EDGE AUDIT ===")
+    print("\nswing_confirmation_contract:")
+    for key, value in swing_contract.items():
+        print(f"  {key}: {value}")
+    for key, value in swing_summary.items():
+        print(f"{key}: {value}")
+    print(f"best_swing_side: {best_swing_side}")
+    print(f"best_latency_bucket: {best_latency_bucket}")
+    print(f"best_regime: {best_regime}")
+    print(f"best_session_phase: {best_session_phase}")
+    print(f"best_distance_bucket: {best_distance_bucket}")
+    _print_table("step11s_by_side", swing_by_side)
+    _print_table("step11s_by_latency", swing_by_latency)
+    _print_table("step11s_by_strength", swing_by_strength)
+    _print_table("step11s_by_regime", swing_by_regime)
+    _print_table("step11s_by_session", swing_by_session)
+    _print_table("step11s_by_volatility", swing_by_volatility)
+    _print_table("step11s_by_distance", swing_by_distance)
+    _print_table("step11s_comparison_to_sweeps", swing_comparison)
     print("\nnegative_nearest_distance_explanation:")
     print(f"  {diagnostics['negative_distance_explanation']}")
 
+    # Step 11T — ATR bracket first-hit audit. Reads only confirm-anchored
+    # forward bars; no production indicator mutation.
+    bracket_diagnostics = build_atr_bracket_first_hit_diagnostics(fs_df)
+    bracket_events = bracket_diagnostics["events"]
+    bracket_summary = bracket_diagnostics["summary"]
+    print()
+    print_atr_bracket_summary(bracket_summary)
+    _print_table("step11t_by_entity", bracket_diagnostics["by_entity"])
+    _print_table("step11t_by_sweep_class", bracket_diagnostics["by_sweep_class"])
+    _print_table("step11t_by_sweep_family", bracket_diagnostics["by_sweep_family"])
+    _print_table("step11t_by_swing_side", bracket_diagnostics["by_swing_side"])
+    _print_table("step11t_by_regime", bracket_diagnostics["by_regime"])
+    _print_table("step11t_by_session", bracket_diagnostics["by_session"])
+
+    # Step 11U — bracket matrix + confluence edge audit. Research-only;
+    # all confluence checks use confirmed-before-signal swings.
+    step11u = build_step11u_diagnostics(fs_df)
+    step11u_events = step11u["events"]
+    step11u_summary = step11u["summary"]
+    print()
+    print_step11u_summary(step11u_summary)
+    _print_table("step11u_by_confluence_type", step11u["by_confluence_type"])
+    _print_table("step11u_by_entity_type", step11u["by_entity_type"])
+    _print_table("step11u_by_sweep_class", step11u["by_sweep_class"])
+    _print_table("step11u_by_sweep_family", step11u["by_sweep_family"])
+    _print_table("step11u_by_swing_side", step11u["by_swing_side"])
+    _print_table("step11u_by_regime", step11u["by_regime"])
+    _print_table("step11u_by_session", step11u["by_session"])
+    _print_table("step11u_by_volume_confirmed", step11u["by_volume_confirmed"])
+    _print_table(
+        "step11u_by_displacement_confirmed", step11u["by_displacement_confirmed"]
+    )
+    _print_table("step11u_by_swing_confluent", step11u["by_swing_confluent"])
+    _print_table("step11u_by_confluence_regime", step11u["by_confluence_regime"])
+    _print_table("step11u_by_confluence_session", step11u["by_confluence_session"])
+    _print_table("step11u_by_confluence_volume", step11u["by_confluence_volume"])
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    events_cols = [c for c in FINAL_SWEEPS_COLUMNS if c in df.columns]
+    events_cols = [c for c in FINAL_SWEEPS_COLUMNS if c in fs_df.columns]
     keep_cols = ["timestamp", "open", "high", "low", "close", "atr_14", *events_cols]
-    keep_cols = [c for c in keep_cols if c in df.columns]
+    keep_cols = [c for c in keep_cols if c in fs_df.columns]
     events_path = out_dir / f"final_sweeps_events_{instrument}_{timeframe}.csv"
     fs_df.loc[fs_df["sweep_flag"].fillna(0) > 0, keep_cols].to_csv(
         events_path, index=False
@@ -640,6 +760,285 @@ def _run_single(
         timeframe,
         source_events,
     )
+    outcome_events_path = _write_table(
+        out_dir,
+        "final_sweeps_post_path_events",
+        instrument,
+        timeframe,
+        source_events,
+    )
+    outcome_by_class_path = _write_table(
+        out_dir,
+        "final_sweeps_outcome_by_class",
+        instrument,
+        timeframe,
+        outcome_by_class_table,
+    )
+    outcome_by_family_path = _write_table(
+        out_dir,
+        "final_sweeps_outcome_by_family",
+        instrument,
+        timeframe,
+        outcome_by_family_table,
+    )
+    outcome_by_quality_path = _write_table(
+        out_dir,
+        "final_sweeps_outcome_by_quality_bucket",
+        instrument,
+        timeframe,
+        outcome_by_quality_bucket_table,
+    )
+    outcome_by_side_path = _write_table(
+        out_dir,
+        "final_sweeps_outcome_by_side",
+        instrument,
+        timeframe,
+        outcome_by_side_table,
+    )
+    outcome_by_regime_path = _write_table(
+        out_dir,
+        "final_sweeps_outcome_by_regime",
+        instrument,
+        timeframe,
+        outcome_by_regime_table,
+    )
+    outcome_by_session_phase_path = _write_table(
+        out_dir,
+        "final_sweeps_outcome_by_session_phase",
+        instrument,
+        timeframe,
+        outcome_by_session_phase_table,
+    )
+    outcome_by_source_age_path = _write_table(
+        out_dir,
+        "final_sweeps_outcome_by_source_age_bucket",
+        instrument,
+        timeframe,
+        outcome_by_source_age_bucket_table,
+    )
+    outcome_by_distance_path = _write_table(
+        out_dir,
+        "final_sweeps_outcome_by_distance_bucket",
+        instrument,
+        timeframe,
+        outcome_by_distance_bucket_table,
+    )
+    swing_events_path = _write_table(
+        out_dir,
+        "swing_post_confirm_events",
+        instrument,
+        timeframe,
+        swing_events,
+    )
+    swing_by_side_path = _write_table(
+        out_dir,
+        "swing_post_confirm_by_side",
+        instrument,
+        timeframe,
+        swing_by_side,
+    )
+    swing_by_latency_path = _write_table(
+        out_dir,
+        "swing_post_confirm_by_latency",
+        instrument,
+        timeframe,
+        swing_by_latency,
+    )
+    swing_by_strength_path = _write_table(
+        out_dir,
+        "swing_post_confirm_by_strength",
+        instrument,
+        timeframe,
+        swing_by_strength,
+    )
+    swing_by_regime_path = _write_table(
+        out_dir,
+        "swing_post_confirm_by_regime",
+        instrument,
+        timeframe,
+        swing_by_regime,
+    )
+    swing_by_session_path = _write_table(
+        out_dir,
+        "swing_post_confirm_by_session",
+        instrument,
+        timeframe,
+        swing_by_session,
+    )
+    swing_by_volatility_path = _write_table(
+        out_dir,
+        "swing_post_confirm_by_volatility",
+        instrument,
+        timeframe,
+        swing_by_volatility,
+    )
+    swing_by_distance_path = _write_table(
+        out_dir,
+        "swing_post_confirm_by_distance",
+        instrument,
+        timeframe,
+        swing_by_distance,
+    )
+    swing_comparison_path = _write_table(
+        out_dir,
+        "swing_post_confirm_comparison_to_sweeps",
+        instrument,
+        timeframe,
+        swing_comparison,
+    )
+    swing_memo_path = (
+        out_dir / f"swing_post_confirm_audit_memo_{instrument}_{timeframe}.md"
+    )
+    swing_memo_path.write_text(swing_memo_markdown)
+    bracket_events_path = _write_table(
+        out_dir,
+        "atr_bracket_first_hit_events",
+        instrument,
+        timeframe,
+        bracket_events,
+    )
+    bracket_by_entity_path = _write_table(
+        out_dir,
+        "atr_bracket_first_hit_by_entity",
+        instrument,
+        timeframe,
+        bracket_diagnostics["by_entity"],
+    )
+    bracket_by_sweep_class_path = _write_table(
+        out_dir,
+        "atr_bracket_first_hit_by_sweep_class",
+        instrument,
+        timeframe,
+        bracket_diagnostics["by_sweep_class"],
+    )
+    bracket_by_sweep_family_path = _write_table(
+        out_dir,
+        "atr_bracket_first_hit_by_sweep_family",
+        instrument,
+        timeframe,
+        bracket_diagnostics["by_sweep_family"],
+    )
+    bracket_by_swing_side_path = _write_table(
+        out_dir,
+        "atr_bracket_first_hit_by_swing_side",
+        instrument,
+        timeframe,
+        bracket_diagnostics["by_swing_side"],
+    )
+    bracket_by_regime_path = _write_table(
+        out_dir,
+        "atr_bracket_first_hit_by_regime",
+        instrument,
+        timeframe,
+        bracket_diagnostics["by_regime"],
+    )
+    bracket_by_session_path = _write_table(
+        out_dir,
+        "atr_bracket_first_hit_by_session",
+        instrument,
+        timeframe,
+        bracket_diagnostics["by_session"],
+    )
+    step11u_paths = {
+        "events": _write_table(
+            out_dir,
+            "final_sweeps_step11u_events",
+            instrument,
+            timeframe,
+            step11u_events,
+        ),
+        "by_confluence_type": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_confluence_type",
+            instrument,
+            timeframe,
+            step11u["by_confluence_type"],
+        ),
+        "by_entity_type": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_entity_type",
+            instrument,
+            timeframe,
+            step11u["by_entity_type"],
+        ),
+        "by_sweep_class": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_sweep_class",
+            instrument,
+            timeframe,
+            step11u["by_sweep_class"],
+        ),
+        "by_sweep_family": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_sweep_family",
+            instrument,
+            timeframe,
+            step11u["by_sweep_family"],
+        ),
+        "by_swing_side": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_swing_side",
+            instrument,
+            timeframe,
+            step11u["by_swing_side"],
+        ),
+        "by_regime": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_regime",
+            instrument,
+            timeframe,
+            step11u["by_regime"],
+        ),
+        "by_session": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_session",
+            instrument,
+            timeframe,
+            step11u["by_session"],
+        ),
+        "by_volume_confirmed": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_volume_confirmed",
+            instrument,
+            timeframe,
+            step11u["by_volume_confirmed"],
+        ),
+        "by_displacement_confirmed": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_displacement_confirmed",
+            instrument,
+            timeframe,
+            step11u["by_displacement_confirmed"],
+        ),
+        "by_swing_confluent": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_swing_confluent",
+            instrument,
+            timeframe,
+            step11u["by_swing_confluent"],
+        ),
+        "by_confluence_regime": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_confluence_regime",
+            instrument,
+            timeframe,
+            step11u["by_confluence_regime"],
+        ),
+        "by_confluence_session": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_confluence_session",
+            instrument,
+            timeframe,
+            step11u["by_confluence_session"],
+        ),
+        "by_confluence_volume": _write_table(
+            out_dir,
+            "final_sweeps_step11u_by_confluence_volume",
+            instrument,
+            timeframe,
+            step11u["by_confluence_volume"],
+        ),
+    }
     chart_paths = _render_final_sweeps_charts(
         df=fs_df,
         out_dir=out_dir,
@@ -665,6 +1064,43 @@ def _run_single(
     print(f"Wrote session source-type table → {session_type_path}")
     print(f"Wrote family-group rate table → {group_rates_path}")
     print(f"Wrote enriched source-events table → {source_events_path}")
+    print(f"Wrote post-path events table → {outcome_events_path}")
+    print(f"Wrote outcome-by-class table → {outcome_by_class_path}")
+    print(f"Wrote outcome-by-family table → {outcome_by_family_path}")
+    print(f"Wrote outcome-by-side table → {outcome_by_side_path}")
+    print(f"Wrote outcome-by-regime table → {outcome_by_regime_path}")
+    print(f"Wrote outcome-by-session-phase table → {outcome_by_session_phase_path}")
+    print(f"Wrote outcome-by-quality-bucket table → {outcome_by_quality_path}")
+    print(f"Wrote outcome-by-source-age-bucket table → {outcome_by_source_age_path}")
+    print(f"Wrote outcome-by-distance-bucket table → {outcome_by_distance_path}")
+    print(f"Wrote swing post-confirm events table → {swing_events_path}")
+    print(f"Wrote swing post-confirm by-side table → {swing_by_side_path}")
+    print(f"Wrote swing post-confirm by-latency table → {swing_by_latency_path}")
+    print(f"Wrote swing post-confirm by-strength table → {swing_by_strength_path}")
+    print(f"Wrote swing post-confirm by-regime table → {swing_by_regime_path}")
+    print(f"Wrote swing post-confirm by-session table → {swing_by_session_path}")
+    print(f"Wrote swing post-confirm by-volatility table → {swing_by_volatility_path}")
+    print(f"Wrote swing post-confirm by-distance table → {swing_by_distance_path}")
+    print(f"Wrote swing post-confirm comparison table → {swing_comparison_path}")
+    print(f"Wrote swing audit memo → {swing_memo_path}")
+    print(f"Wrote ATR bracket first-hit events table → {bracket_events_path}")
+    print(f"Wrote ATR bracket first-hit by-entity table → {bracket_by_entity_path}")
+    print(
+        f"Wrote ATR bracket first-hit by-sweep-class table → "
+        f"{bracket_by_sweep_class_path}"
+    )
+    print(
+        f"Wrote ATR bracket first-hit by-sweep-family table → "
+        f"{bracket_by_sweep_family_path}"
+    )
+    print(
+        f"Wrote ATR bracket first-hit by-swing-side table → "
+        f"{bracket_by_swing_side_path}"
+    )
+    print(f"Wrote ATR bracket first-hit by-regime table → {bracket_by_regime_path}")
+    print(f"Wrote ATR bracket first-hit by-session table → {bracket_by_session_path}")
+    for label, path in step11u_paths.items():
+        print(f"Wrote step 11U {label} table → {path}")
     for chart_path in chart_paths:
         print(f"Wrote chart → {chart_path}")
 
@@ -674,6 +1110,10 @@ def _run_single(
     if fs_summary.get("deprecated_families_in_attribution"):
         failures += 1
     if us_summary.get("deprecated_families_present"):
+        failures += 1
+    if fs_summary.get("forward_outcomes_in_production_schema"):
+        failures += 1
+    if fs_summary.get("forward_outcome_prefix_violations"):
         failures += 1
     return failures
 

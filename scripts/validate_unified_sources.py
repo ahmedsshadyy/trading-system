@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 
 from src.indicators.pipelines.build_research import build_research_indicators
-from src.indicators.sweeps_v2.unified_sources import (
+from src.indicators.smc.sweeps.unified_sources import (
     build_unified_liquidity_clusters_audit,
 )
 from src.validation.indicators.unified_sources import (

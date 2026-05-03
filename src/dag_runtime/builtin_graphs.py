@@ -171,7 +171,6 @@ def _pipeline_stage_source_funcs(stage_name: str) -> tuple[Any, ...]:
     from src.indicators.smc.ifvg import add_ifvg
     from src.indicators.smc.ob import add_ob
     from src.indicators.smc.ob_mitigation import add_ob_mitigation
-    from src.indicators.smc.sweeps import add_liquidity_sweep
     from src.indicators.structure.bos import add_bos
     from src.indicators.structure.choch import add_choch
     from src.indicators.structure.trend_state import add_trend_state
@@ -184,10 +183,10 @@ def _pipeline_stage_source_funcs(stage_name: str) -> tuple[Any, ...]:
         project_sr_context,
         update_sr_lifecycle,
     )
-    from src.indicators.sweeps_v2.unified_sources import (
+    from src.indicators.smc.sweeps.unified_sources import (
         add_unified_liquidity_sources,
     )
-    from src.indicators.sweeps_v2.final_sweeps import add_final_sweeps
+    from src.indicators.smc.sweeps.final_sweeps import add_final_sweeps
 
     table: dict[str, tuple[Any, ...]] = {
         "normalize_candles": (normalize_candle_schema,),
@@ -209,7 +208,6 @@ def _pipeline_stage_source_funcs(stage_name: str) -> tuple[Any, ...]:
         "displacement": (add_displacement_candle,),
         "order_blocks": (add_ob,),
         "ob_mitigation": (add_ob_mitigation,),
-        "liquidity_sweeps": (add_liquidity_sweep,),
         "equal_hl": (add_equal_hl,),
         "amd_engine": (add_amd_engine,),
         "prev_day_hl": (add_prev_day_hl,),

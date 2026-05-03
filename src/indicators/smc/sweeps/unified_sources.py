@@ -29,7 +29,7 @@ overlays, and golden tests.
 
 All sources are stamped with ``source_timeframe = scan_timeframe``. The MTF
 policy (Step 9) is enforced at the boundary: see
-:func:`src.indicators.sweeps_v2.mtf_policy.assert_same_timeframe_sources`.
+:func:`src.indicators.smc.sweeps.mtf_policy.assert_same_timeframe_sources`.
 
 Causality contract
 ------------------
@@ -50,7 +50,7 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from src.indicators.sweeps_v2.mtf_policy import (
+from src.indicators.smc.sweeps.mtf_policy import (
     SWEEP_MTF_POLICY,
     assert_known_timeframe,
     assert_same_timeframe_sources,

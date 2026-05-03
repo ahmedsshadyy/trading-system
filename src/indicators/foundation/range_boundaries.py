@@ -4,8 +4,8 @@ Canonical causal range boundary detector.
 .. deprecated::
     **Range boundaries are excluded from production sweep source families
     in v1.** The unified liquidity source framework
-    (:mod:`src.indicators.sweeps_v2.unified_sources`) and the final sweeps
-    detector (:mod:`src.indicators.sweeps_v2.final_sweeps`) do **not**
+    (:mod:`src.indicators.smc.sweeps.unified_sources`) and the final sweeps
+    detector (:mod:`src.indicators.smc.sweeps.final_sweeps`) do **not**
     consume any column produced by this module. The code is preserved for
     research backtests and chart audits only.
 
@@ -18,15 +18,15 @@ Canonical causal range boundary detector.
     Re-introducing range_boundary as a sweep source requires:
 
     * promoting the family in
-      :data:`src.indicators.sweeps_v2.unified_sources.LIQ_SOURCE_FAMILIES`,
+      :data:`src.indicators.smc.sweeps.unified_sources.LIQ_SOURCE_FAMILIES`,
     * removing it from
-      :data:`src.indicators.sweeps_v2.unified_sources.LIQ_DEPRECATED_FAMILIES`,
+      :data:`src.indicators.smc.sweeps.unified_sources.LIQ_DEPRECATED_FAMILIES`,
     * adding an explicit precedence rank, and
     * updating the SweepsPlan doctrine.
 
     Until then, the framework will hard-fail if a row tagged with the
     family ``range_boundary_high``/``range_boundary_low`` reaches it — see
-    :func:`src.indicators.sweeps_v2.unified_sources._cluster_sources` for
+    :func:`src.indicators.smc.sweeps.unified_sources._cluster_sources` for
     the runtime guard.
 
 Doctrine

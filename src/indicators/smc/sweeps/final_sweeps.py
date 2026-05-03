@@ -8,7 +8,7 @@ A sweep is **not** any level breach. It requires four ingredients:
 4. deterministic classification as sweep / breakout / unresolved.
 
 This module consumes only the dense ladder columns produced by
-:mod:`src.indicators.sweeps_v2.unified_sources` (``liq_above_l*_*`` and
+:mod:`src.indicators.smc.sweeps.unified_sources` (``liq_above_l*_*`` and
 ``liq_below_l*_*``). It does not reach into raw upstream stages — the
 unified framework is the single source of truth.
 
@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from src.indicators.sweeps_v2.unified_sources import (
+from src.indicators.smc.sweeps.unified_sources import (
     LIQ_LADDER_DEPTH,
 )
 
@@ -277,6 +277,9 @@ DEFAULT_SESSION_TRADEABLE_REQUIRE_VOLUME_OR_DISPLACEMENT: bool = True
 DEFAULT_STANDARD_MIN_PRE_BREACH_DISTANCE_ATR: float = 0.25
 DEFAULT_STANDARD_EXCEPTIONAL_PENETRATION_ATR: float = 0.50
 DEFAULT_STANDARD_EXCEPTIONAL_REJECTION_COMPONENT: float = 0.65
+DEFAULT_RESEARCH_OUTCOME_WINDOW_BARS: int = 5
+DEFAULT_RESEARCH_OUTCOME_HORIZONS: tuple[int, ...] = (1, 2, 3, 4, 5)
+DEFAULT_RESEARCH_FIRST_HIT_THRESHOLDS_ATR: tuple[float, ...] = (0.25, 0.5, 1.0, 1.5)
 DEFAULT_TRADEABLE_FAMILY_MIN_PENETRATION_ATR: dict[str, float] = {
     "resistance": 0.30,
     "support": 0.30,
@@ -379,6 +382,36 @@ FINAL_SWEEPS_FOLLOWTHROUGH_COLUMNS: tuple[str, ...] = (
     "sweep_choch_strength",
 )
 
+FINAL_SWEEPS_RESEARCH_OUTCOME_COLUMNS: tuple[str, ...] = (
+    "sweep_fwd_reference_close",
+    "sweep_fwd_atr_ref",
+    "sweep_fwd_confirm_high",
+    "sweep_fwd_confirm_low",
+    *(
+        f"sweep_fwd_close_ret_atr_{horizon}"
+        for horizon in DEFAULT_RESEARCH_OUTCOME_HORIZONS
+    ),
+    *(f"sweep_fwd_mfe_atr_{horizon}" for horizon in DEFAULT_RESEARCH_OUTCOME_HORIZONS),
+    *(f"sweep_fwd_mae_atr_{horizon}" for horizon in DEFAULT_RESEARCH_OUTCOME_HORIZONS),
+    *(f"sweep_fwd_net_edge_{horizon}" for horizon in DEFAULT_RESEARCH_OUTCOME_HORIZONS),
+    *(
+        f"sweep_fwd_path_label_{horizon}"
+        for horizon in DEFAULT_RESEARCH_OUTCOME_HORIZONS
+    ),
+    "sweep_first_favorable_0p25_bar",
+    "sweep_first_adverse_0p25_bar",
+    "sweep_first_favorable_0p5_bar",
+    "sweep_first_adverse_0p5_bar",
+    "sweep_first_favorable_1p0_bar",
+    "sweep_first_adverse_1p0_bar",
+    "sweep_first_favorable_1p5_bar",
+    "sweep_first_adverse_1p5_bar",
+    "sweep_reversed_by_5",
+    "sweep_continued_by_5",
+    "sweep_reversal_speed_bucket",
+    "sweep_continuation_speed_bucket",
+)
+
 #: Interaction phase column — one per source ladder slot per side.
 FINAL_SWEEPS_INTERACTION_COLUMNS: tuple[str, ...] = tuple(
     f"sweep_interaction_phase_{side}_l{rank}"
@@ -386,14 +419,27 @@ FINAL_SWEEPS_INTERACTION_COLUMNS: tuple[str, ...] = tuple(
     for rank in range(1, LIQ_LADDER_DEPTH + 1)
 )
 
-#: All columns this stage emits (canonical, ordered).
-FINAL_SWEEPS_COLUMNS: tuple[str, ...] = (
-    FINAL_SWEEPS_LIVE_COLUMNS
+FINAL_SWEEPS_PRODUCTION_COLUMNS: tuple[str, ...] = (
+    tuple(
+        col
+        for col in FINAL_SWEEPS_LIVE_COLUMNS
+        if col != "sweep_research_followthrough_available"
+    )
     + FINAL_SWEEPS_BREACH_COLUMNS
     + FINAL_SWEEPS_QUALITY_COLUMNS
     + FINAL_SWEEPS_SELECTIVITY_COLUMNS
-    + FINAL_SWEEPS_FOLLOWTHROUGH_COLUMNS
     + FINAL_SWEEPS_INTERACTION_COLUMNS
+)
+
+FINAL_SWEEPS_RESEARCH_COLUMNS: tuple[str, ...] = (
+    ("sweep_research_followthrough_available",)
+    + FINAL_SWEEPS_FOLLOWTHROUGH_COLUMNS
+    + FINAL_SWEEPS_RESEARCH_OUTCOME_COLUMNS
+)
+
+#: All columns this stage emits (canonical, ordered).
+FINAL_SWEEPS_COLUMNS: tuple[str, ...] = (
+    FINAL_SWEEPS_PRODUCTION_COLUMNS + FINAL_SWEEPS_RESEARCH_COLUMNS
 )
 
 
@@ -615,12 +661,185 @@ def _component_volume(df: pd.DataFrame, idx: int) -> float:
     return 0.5
 
 
-def _component_regime(df: pd.DataFrame, idx: int) -> float:
-    if "regime" in df.columns:
-        v = float(pd.to_numeric(df["regime"].iat[idx], errors="coerce"))
-        if math.isfinite(v):
-            return 0.5  # regime info present; neutral pending calibration
-    return 0.5
+def _weighted_component_score(components: list[tuple[float, float]]) -> float:
+    finite = [(weight, value) for weight, value in components if math.isfinite(value)]
+    if not finite:
+        return float("nan")
+    weight_sum = sum(weight for weight, _ in finite)
+    if weight_sum <= 0:
+        return float("nan")
+    total = sum(weight * float(np.clip(value, 0.0, 1.0)) for weight, value in finite)
+    return float(np.clip(total / weight_sum, 0.0, 1.0))
+
+
+def _component_displacement_confirmation(
+    df: pd.DataFrame,
+    *,
+    idx: int,
+    reversal_direction: int,
+) -> float:
+    if idx < 0 or reversal_direction not in (-1, 1):
+        return 0.5
+    open_i = float(pd.to_numeric(df["open"].iat[idx], errors="coerce"))
+    high_i = float(pd.to_numeric(df["high"].iat[idx], errors="coerce"))
+    low_i = float(pd.to_numeric(df["low"].iat[idx], errors="coerce"))
+    close_i = float(pd.to_numeric(df["close"].iat[idx], errors="coerce"))
+    atr_i = float(pd.to_numeric(_safe_atr(df)[idx], errors="coerce"))
+    if not (
+        math.isfinite(open_i)
+        and math.isfinite(high_i)
+        and math.isfinite(low_i)
+        and math.isfinite(close_i)
+        and math.isfinite(atr_i)
+        and atr_i > 0
+    ):
+        return 0.5
+
+    bar_range = high_i - low_i
+    if not math.isfinite(bar_range) or bar_range <= 0:
+        return 0.5
+
+    signed_body_atr = (close_i - open_i) / atr_i
+    body_frac = abs(close_i - open_i) / bar_range
+    if reversal_direction > 0:
+        close_to_extreme_frac = (high_i - close_i) / bar_range
+        opposite_wick_frac = (max(open_i, close_i) - low_i) / bar_range
+    else:
+        close_to_extreme_frac = (close_i - low_i) / bar_range
+        opposite_wick_frac = (high_i - min(open_i, close_i)) / bar_range
+
+    aligned_body_atr = reversal_direction * signed_body_atr
+    candle_confirmation = _weighted_component_score(
+        [
+            (0.40, float(np.clip(aligned_body_atr / 1.0, 0.0, 1.0))),
+            (0.25, float(np.clip((body_frac - 0.30) / 0.50, 0.0, 1.0))),
+            (0.20, float(np.clip(1.0 - (close_to_extreme_frac / 0.35), 0.0, 1.0))),
+            (0.15, float(np.clip(1.0 - (opposite_wick_frac / 0.35), 0.0, 1.0))),
+        ]
+    )
+
+    displacement_direction = 0
+    if "displacement_direction" in df.columns:
+        direction_value = pd.to_numeric(
+            df["displacement_direction"].iat[idx], errors="coerce"
+        )
+        if math.isfinite(direction_value):
+            displacement_direction = int(direction_value)
+
+    raw_displacement_score = float("nan")
+    if "displacement_score" in df.columns:
+        raw_displacement_score = float(
+            pd.to_numeric(df["displacement_score"].iat[idx], errors="coerce")
+        )
+    if not math.isfinite(raw_displacement_score):
+        raw_displacement_score = candle_confirmation
+
+    if displacement_direction == reversal_direction:
+        aligned_displacement_score = raw_displacement_score
+    elif displacement_direction == 0:
+        aligned_displacement_score = 0.25 * raw_displacement_score
+    else:
+        aligned_displacement_score = 0.0
+
+    structure_hits: list[float] = []
+    if reversal_direction > 0:
+        if "bos_bull" in df.columns:
+            structure_hits.append(
+                float(pd.to_numeric(df["bos_bull"].iat[idx], errors="coerce") > 0)
+            )
+        if "choch_bull" in df.columns:
+            structure_hits.append(
+                float(pd.to_numeric(df["choch_bull"].iat[idx], errors="coerce") > 0)
+            )
+    else:
+        if "bos_bear" in df.columns:
+            structure_hits.append(
+                float(pd.to_numeric(df["bos_bear"].iat[idx], errors="coerce") > 0)
+            )
+        if "choch_bear" in df.columns:
+            structure_hits.append(
+                float(pd.to_numeric(df["choch_bear"].iat[idx], errors="coerce") > 0)
+            )
+    structure_score = (
+        float(np.clip(max(structure_hits), 0.0, 1.0))
+        if structure_hits
+        else float("nan")
+    )
+
+    score = _weighted_component_score(
+        [
+            (0.55, candle_confirmation),
+            (0.35, aligned_displacement_score),
+            (0.10, structure_score),
+        ]
+    )
+    return 0.5 if not math.isfinite(score) else score
+
+
+def _component_regime_context(
+    df: pd.DataFrame,
+    *,
+    idx: int,
+    reversal_direction: int,
+) -> float:
+    if "regime" not in df.columns:
+        return 0.5
+    regime = float(pd.to_numeric(df["regime"].iat[idx], errors="coerce"))
+    if not math.isfinite(regime):
+        return 0.5
+
+    regime_component = {
+        0: 0.55,  # ranging
+        1: 0.60,  # transitional
+        2: 0.30,  # trending
+    }.get(int(regime), 0.50)
+
+    confidence_component = float("nan")
+    if "regime_confidence" in df.columns:
+        confidence_component = float(
+            pd.to_numeric(df["regime_confidence"].iat[idx], errors="coerce")
+        )
+
+    persistence_component = float("nan")
+    if "bars_in_regime" in df.columns:
+        bars_in_regime = float(
+            pd.to_numeric(df["bars_in_regime"].iat[idx], errors="coerce")
+        )
+        if math.isfinite(bars_in_regime):
+            persistence_component = float(
+                np.clip((bars_in_regime - 1.0) / 4.0, 0.0, 1.0)
+            )
+
+    alignment_component = float("nan")
+    if "trend_state" in df.columns:
+        trend_state = float(pd.to_numeric(df["trend_state"].iat[idx], errors="coerce"))
+        if math.isfinite(trend_state):
+            trend_state_int = int(trend_state)
+            if trend_state_int == reversal_direction:
+                alignment_component = 0.75
+            elif trend_state_int == 0:
+                alignment_component = 0.55
+            else:
+                alignment_component = 0.25
+
+    score = _weighted_component_score(
+        [
+            (0.35, regime_component),
+            (0.25, confidence_component),
+            (0.20, persistence_component),
+            (0.20, alignment_component),
+        ]
+    )
+    if not math.isfinite(score):
+        score = 0.5
+
+    if "regime_boundary_flag" in df.columns:
+        if pd.to_numeric(df["regime_boundary_flag"].iat[idx], errors="coerce") > 0:
+            score *= 0.85
+    if "regime_context_caution" in df.columns:
+        if pd.to_numeric(df["regime_context_caution"].iat[idx], errors="coerce") > 0:
+            score *= 0.90
+    return float(np.clip(score, 0.0, 1.0))
 
 
 def _build_quality_components(
@@ -637,8 +856,16 @@ def _build_quality_components(
         "source_strength_component": float(np.clip(breach.source_strength, 0.0, 1.0)),
         "penetration_component": _component_penetration(breach.penetration_atr),
         "rejection_component": _component_rejection(breach.penetration_atr, latency),
-        "displacement_followthrough_component": 0.5,
-        "regime_context_component": _component_regime(df, i),
+        "displacement_followthrough_component": _component_displacement_confirmation(
+            df,
+            idx=i,
+            reversal_direction=(-1 if breach.side > 0 else 1),
+        ),
+        "regime_context_component": _component_regime_context(
+            df,
+            idx=i,
+            reversal_direction=(-1 if breach.side > 0 else 1),
+        ),
         "volume_confirmation_component": _component_volume(df, i),
         "crowding_component": _component_crowding(df, i),
     }
@@ -886,6 +1113,8 @@ def add_final_sweeps(
     *,
     confirmation_window_bars: int = DEFAULT_CONFIRMATION_WINDOW_BARS,
     follow_through_window_bars: int = DEFAULT_FOLLOW_THROUGH_WINDOW_BARS,
+    research_outcome_window_bars: int = DEFAULT_RESEARCH_OUTCOME_WINDOW_BARS,
+    research_outcome_horizons: tuple[int, ...] = DEFAULT_RESEARCH_OUTCOME_HORIZONS,
     min_penetration_atr_for_same_bar: float = DEFAULT_MIN_PENETRATION_ATR_FOR_SAME_BAR,
     min_wick_prominence: float = DEFAULT_MIN_WICK_PROMINENCE,
     cooldown_bars: int = DEFAULT_COOLDOWN_BARS,
@@ -911,7 +1140,7 @@ def add_final_sweeps(
     """Detect final sweeps off the unified liquidity ladder.
 
     The frame must already have the dense ladder columns produced by
-    :func:`src.indicators.sweeps_v2.unified_sources.add_unified_liquidity_sources`.
+    :func:`src.indicators.smc.sweeps.unified_sources.add_unified_liquidity_sources`.
 
     Step 11B repair (versus the original Step 11 sketch):
 
@@ -989,12 +1218,16 @@ def add_final_sweeps(
     # Initialize all output arrays.
     arr: dict[str, np.ndarray] = {}
     for col in FINAL_SWEEPS_COLUMNS:
-        if col in (
+        if "_path_label_" in col:
+            arr[col] = np.full(n, np.nan, dtype=object)
+        elif col in (
             "sweep_primary_family",
             "sweep_attribution_families",
             "sweep_breach_source_family",
             "sweep_selectivity_class",
-        ):
+            "sweep_reversal_speed_bucket",
+            "sweep_continuation_speed_bucket",
+        ) or col.endswith("_path"):
             arr[col] = np.full(n, "", dtype=object)
         elif col == "sweep_breach_timestamp":
             arr[col] = np.full(n, pd.NaT, dtype="object")
@@ -1392,6 +1625,12 @@ def add_final_sweeps(
     _attach_follow_through(
         out, arr, follow_through_window_bars=follow_through_window_bars
     )
+    _attach_research_outcomes(
+        out,
+        arr,
+        outcome_window_bars=research_outcome_window_bars,
+        outcome_horizons=research_outcome_horizons,
+    )
     _finalize_selectivity_classes(arr)
 
     # Single concat to keep the frame de-fragmented.
@@ -1708,6 +1947,243 @@ def _attach_follow_through(
         )
 
 
+def _attach_research_outcomes(
+    df: pd.DataFrame,
+    arr: dict[str, np.ndarray],
+    *,
+    outcome_window_bars: int,
+    outcome_horizons: tuple[int, ...],
+) -> None:
+    """Attach explicitly research-only post-confirmation path diagnostics."""
+
+    if outcome_window_bars <= 0:
+        return
+
+    n = len(df)
+    high = pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    atr = _safe_atr(df)
+    sweep_flag = arr["sweep_flag"]
+    sweep_side = arr["sweep_side"]
+
+    threshold_labels = {
+        0.25: "0p25",
+        0.5: "0p5",
+        1.0: "1p0",
+        1.5: "1p5",
+    }
+
+    def _touches_threshold(
+        *,
+        side: int,
+        ref_close: float,
+        atr_value: float,
+        threshold_atr: float,
+        bar_high: float,
+        bar_low: float,
+    ) -> tuple[bool, bool]:
+        favorable_level = (
+            ref_close - threshold_atr * atr_value
+            if side > 0
+            else ref_close + threshold_atr * atr_value
+        )
+        adverse_level = (
+            ref_close + threshold_atr * atr_value
+            if side > 0
+            else ref_close - threshold_atr * atr_value
+        )
+        if side > 0:
+            favorable = math.isfinite(bar_low) and bar_low <= favorable_level + 1e-12
+            adverse = math.isfinite(bar_high) and bar_high >= adverse_level - 1e-12
+        else:
+            favorable = math.isfinite(bar_high) and bar_high >= favorable_level - 1e-12
+            adverse = math.isfinite(bar_low) and bar_low <= adverse_level + 1e-12
+        return favorable, adverse
+
+    def _first_hit_bar(
+        *,
+        side: int,
+        ref_close: float,
+        atr_value: float,
+        threshold_atr: float,
+        start_idx: int,
+        end_idx: int,
+    ) -> tuple[float | None, float | None]:
+        favorable_bar: float | None = None
+        adverse_bar: float | None = None
+        for delay, j in enumerate(range(start_idx, end_idx + 1), start=1):
+            favorable_hit, adverse_hit = _touches_threshold(
+                side=side,
+                ref_close=ref_close,
+                atr_value=atr_value,
+                threshold_atr=threshold_atr,
+                bar_high=high[j],
+                bar_low=low[j],
+            )
+            if favorable_bar is None and favorable_hit:
+                favorable_bar = float(delay)
+            if adverse_bar is None and adverse_hit:
+                adverse_bar = float(delay)
+            if favorable_bar is not None and adverse_bar is not None:
+                break
+        return favorable_bar, adverse_bar
+
+    def _speed_bucket(first_bar: float | None) -> str:
+        if first_bar is None or not math.isfinite(first_bar):
+            return "none"
+        if first_bar <= 1.0:
+            return "immediate"
+        if first_bar <= 2.0:
+            return "fast"
+        if first_bar <= 4.0:
+            return "normal"
+        if first_bar <= 5.0:
+            return "slow"
+        return "none"
+
+    def _path_label(
+        *,
+        horizon: int,
+        favorable_1p0: float | None,
+        adverse_1p0: float | None,
+        favorable_0p5: float | None,
+        adverse_0p5: float | None,
+    ) -> str:
+        favorable_1p0_in = favorable_1p0 is not None and favorable_1p0 <= float(horizon)
+        adverse_1p0_in = adverse_1p0 is not None and adverse_1p0 <= float(horizon)
+        adverse_0p5_in = adverse_0p5 is not None and adverse_0p5 <= float(horizon)
+
+        if favorable_1p0_in and adverse_1p0_in:
+            if abs(float(favorable_1p0) - float(adverse_1p0)) <= 1e-12:
+                return "two_sided_volatile"
+            if float(favorable_1p0) < float(adverse_1p0):
+                if (not adverse_0p5_in) or float(favorable_1p0) < float(adverse_0p5):
+                    return "clean_reversal"
+                return "dirty_reversal"
+            return "continuation"
+        if favorable_1p0_in:
+            if (not adverse_0p5_in) or float(favorable_1p0) < float(adverse_0p5):
+                return "clean_reversal"
+            return "dirty_reversal"
+        if adverse_1p0_in:
+            return "continuation"
+        return "chop_no_resolution"
+
+    max_horizon = max(outcome_horizons)
+    first_hit_window = max(outcome_window_bars, max_horizon)
+
+    for i in range(n):
+        if not (math.isfinite(sweep_flag[i]) and sweep_flag[i] > 0):
+            continue
+        side = int(sweep_side[i]) if math.isfinite(sweep_side[i]) else 0
+        if side not in (-1, 1):
+            continue
+
+        ref_close = close[i]
+        ref_high = high[i]
+        ref_low = low[i]
+        atr_i = atr[i]
+        if not math.isfinite(ref_close):
+            continue
+
+        arr["sweep_fwd_reference_close"][i] = float(ref_close)
+        arr["sweep_fwd_confirm_high"][i] = float(ref_high)
+        arr["sweep_fwd_confirm_low"][i] = float(ref_low)
+        if math.isfinite(atr_i) and atr_i > 0:
+            arr["sweep_fwd_atr_ref"][i] = float(atr_i)
+        else:
+            continue
+
+        end_idx = i + first_hit_window
+        enough_first_hit_bars = end_idx < n
+        first_hits: dict[float, tuple[float | None, float | None]] = {}
+        if enough_first_hit_bars:
+            for threshold_atr in DEFAULT_RESEARCH_FIRST_HIT_THRESHOLDS_ATR:
+                favorable_bar, adverse_bar = _first_hit_bar(
+                    side=side,
+                    ref_close=ref_close,
+                    atr_value=atr_i,
+                    threshold_atr=threshold_atr,
+                    start_idx=i + 1,
+                    end_idx=end_idx,
+                )
+                first_hits[threshold_atr] = (favorable_bar, adverse_bar)
+                label = threshold_labels[threshold_atr]
+                if favorable_bar is not None:
+                    arr[f"sweep_first_favorable_{label}_bar"][i] = favorable_bar
+                if adverse_bar is not None:
+                    arr[f"sweep_first_adverse_{label}_bar"][i] = adverse_bar
+
+            favorable_1p0 = first_hits[1.0][0]
+            adverse_1p0 = first_hits[1.0][1]
+            arr["sweep_reversed_by_5"][i] = (
+                1.0 if favorable_1p0 is not None and favorable_1p0 <= 5.0 else 0.0
+            )
+            arr["sweep_continued_by_5"][i] = (
+                1.0 if adverse_1p0 is not None and adverse_1p0 <= 5.0 else 0.0
+            )
+            arr["sweep_reversal_speed_bucket"][i] = _speed_bucket(favorable_1p0)
+            arr["sweep_continuation_speed_bucket"][i] = _speed_bucket(adverse_1p0)
+
+        for horizon in outcome_horizons:
+            future_idx = i + horizon
+            if future_idx >= n:
+                continue
+            future_close = close[future_idx]
+            future_high = high[i + 1 : future_idx + 1]
+            future_low = low[i + 1 : future_idx + 1]
+            if (
+                not math.isfinite(future_close)
+                or future_high.size == 0
+                or future_low.size == 0
+            ):
+                continue
+
+            if side > 0:
+                close_ret_atr = (ref_close - future_close) / atr_i
+                mfe = ref_close - float(np.nanmin(future_low))
+                mae = float(np.nanmax(future_high)) - ref_close
+            else:
+                close_ret_atr = (future_close - ref_close) / atr_i
+                mfe = float(np.nanmax(future_high)) - ref_close
+                mae = ref_close - float(np.nanmin(future_low))
+            mfe_atr = float(max(mfe, 0.0) / atr_i)
+            mae_atr = float(max(mae, 0.0) / atr_i)
+
+            arr[f"sweep_fwd_close_ret_atr_{horizon}"][i] = float(close_ret_atr)
+            arr[f"sweep_fwd_mfe_atr_{horizon}"][i] = mfe_atr
+            arr[f"sweep_fwd_mae_atr_{horizon}"][i] = mae_atr
+            arr[f"sweep_fwd_net_edge_{horizon}"][i] = float(mfe_atr - mae_atr)
+            if enough_first_hit_bars:
+                favorable_1p0, adverse_1p0 = first_hits[1.0]
+                favorable_0p5, adverse_0p5 = first_hits[0.5]
+            else:
+                favorable_1p0, adverse_1p0 = _first_hit_bar(
+                    side=side,
+                    ref_close=ref_close,
+                    atr_value=atr_i,
+                    threshold_atr=1.0,
+                    start_idx=i + 1,
+                    end_idx=future_idx,
+                )
+                favorable_0p5, adverse_0p5 = _first_hit_bar(
+                    side=side,
+                    ref_close=ref_close,
+                    atr_value=atr_i,
+                    threshold_atr=0.5,
+                    start_idx=i + 1,
+                    end_idx=future_idx,
+                )
+            arr[f"sweep_fwd_path_label_{horizon}"][i] = _path_label(
+                horizon=horizon,
+                favorable_1p0=favorable_1p0,
+                adverse_1p0=adverse_1p0,
+                favorable_0p5=favorable_0p5,
+                adverse_0p5=adverse_0p5,
+            )
+
+
 def _finalize_selectivity_classes(arr: dict[str, np.ndarray]) -> None:
     """Upgrade confirmed sweeps into the Step 11E research classes."""
 
@@ -1908,6 +2384,9 @@ __all__ = [
     "DEFAULT_STANDARD_MIN_PRE_BREACH_DISTANCE_ATR",
     "DEFAULT_STANDARD_EXCEPTIONAL_PENETRATION_ATR",
     "DEFAULT_STANDARD_EXCEPTIONAL_REJECTION_COMPONENT",
+    "DEFAULT_RESEARCH_OUTCOME_WINDOW_BARS",
+    "DEFAULT_RESEARCH_OUTCOME_HORIZONS",
+    "DEFAULT_RESEARCH_FIRST_HIT_THRESHOLDS_ATR",
     "DEFAULT_TRADEABLE_MIN_QUALITY_BY_CLASS",
     "DEFAULT_TRADEABLE_MIN_PENETRATION_ATR_BY_CLASS",
     "DEFAULT_TRADEABLE_FAMILY_MIN_PENETRATION_ATR",
@@ -1941,7 +2420,10 @@ __all__ = [
     "FINAL_SWEEPS_QUALITY_COLUMNS",
     "FINAL_SWEEPS_SELECTIVITY_COLUMNS",
     "FINAL_SWEEPS_FOLLOWTHROUGH_COLUMNS",
+    "FINAL_SWEEPS_RESEARCH_OUTCOME_COLUMNS",
     "FINAL_SWEEPS_INTERACTION_COLUMNS",
+    "FINAL_SWEEPS_PRODUCTION_COLUMNS",
+    "FINAL_SWEEPS_RESEARCH_COLUMNS",
     "FINAL_SWEEPS_COLUMNS",
     "step11b_baseline_kwargs",
     "step11c_default_kwargs",

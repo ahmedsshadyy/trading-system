@@ -56,8 +56,11 @@ equal H/L clusters to form differently.
   Different swing levels = different BOS candles.
 - **CHoCH detector** (`add_choch`) — fires on first BOS against trend. Different
   BOS = different CHoCH.
-- **Liquidity Sweep detector** (`add_liquidity_sweep`) — checks sweeps against
-  `last_swing_high/low`. Different levels = different sweep detections.
+- **Liquidity Sweep detector** (`add_final_sweeps`, in
+  `src.indicators.smc.sweeps`) — checks breaches against the unified
+  liquidity ladder, which includes `swing_high`/`swing_low` levels among
+  other source families. Different swing levels feed different sweep
+  events.
 - **Trend State Machine** (`add_trend_state`) — tracks HH/HL/LH/LL from
   `swing_high_price/swing_low_price`. Different swing points = different trend
   state transitions.

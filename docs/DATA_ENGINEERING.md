@@ -421,7 +421,6 @@ Keep serial by default:
 - `displacement`
 - `order_blocks`
 - `ob_mitigation`
-- `liquidity_sweeps`
 - `equal_hl`
 - `amd_engine`
 
@@ -1265,7 +1264,7 @@ calls `build_research_indicators` on each partner with the full stage chain
 (25 stages). But partner frames are only consumed by `add_smt_divergence`, which
 needs: `timestamp`, `close`, `swing_*` columns. Stages like `volume_features`,
 `fvg_stack`, `displacement`, `order_blocks`, `ob_mitigation`,
-`liquidity_sweeps`, `equal_hl`, `amd_engine`, `regime`, etc. are computed and
+`equal_hl`, `amd_engine`, `regime`, etc. are computed and
 immediately discarded.
 
 **Impact.** Each unnecessary partner stage adds ~0.5-2s. With 2 partners

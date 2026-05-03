@@ -83,7 +83,6 @@ from src.indicators.smc.fvg_fill import add_fvg_fill
 from src.indicators.smc.ifvg import add_ifvg
 from src.indicators.smc.ob import add_ob
 from src.indicators.smc.ob_mitigation import add_ob_mitigation
-from src.indicators.smc.sweeps import add_liquidity_sweep
 from src.indicators.smc.equal_hl import add_equal_hl
 from src.indicators.smc.displacement import add_displacement_candle
 from src.indicators.smc.amd import add_amd_engine
@@ -265,11 +264,6 @@ def _live_stages(
             "ob_mitigation",
             add_ob_mitigation,
             ReplayPolicy("ob_mitigation", "B", replay_bars=240, carried_state=True),
-        ),
-        PipelineStage(
-            "liquidity_sweeps",
-            add_liquidity_sweep,
-            ReplayPolicy("liquidity_sweeps", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
             "equal_hl",

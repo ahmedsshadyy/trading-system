@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.indicators.sweeps_v2.mtf_policy import (
+from src.indicators.smc.sweeps.mtf_policy import (
     HTF_LIQUIDITY_PROJECTION_ENABLED,
     SWEEP_MTF_POLICY,
     assert_known_timeframe,

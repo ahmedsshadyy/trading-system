@@ -27,12 +27,12 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from src.indicators.sweeps_v2.mtf_policy import (
+from src.indicators.smc.sweeps.mtf_policy import (
     HTF_LIQUIDITY_PROJECTION_ENABLED,
     SWEEP_MTF_POLICY,
     assert_same_timeframe_sources,
 )
-from src.indicators.sweeps_v2.unified_sources import (
+from src.indicators.smc.sweeps.unified_sources import (
     LIQ_GLOBAL_CROWDING_CAP,
     LIQ_LADDER_DEPTH,
     LIQ_SOURCE_FAMILIES,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.indicators.sweeps_v2.final_sweeps import (
+from src.indicators.smc.sweeps.final_sweeps import (
     FINAL_SWEEPS_COLUMNS,
     SWEEP_CLASS_ACCEPTED_BREAKOUT,
     SWEEP_CLASS_DELAYED_REJECTION,
@@ -15,7 +15,7 @@ from src.indicators.sweeps_v2.final_sweeps import (
     step11d_default_kwargs,
     step11e_default_kwargs,
 )
-from src.indicators.sweeps_v2.unified_sources import (
+from src.indicators.smc.sweeps.unified_sources import (
     LIQ_LADDER_DEPTH,
     add_unified_liquidity_sources,
 )
@@ -445,8 +445,86 @@ def test_step11e_upgrades_standard_sweep_to_displacement_confirmed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Quality components stay in [0,1]
+# Quality and research labels
 # ---------------------------------------------------------------------------
+
+
+def test_quality_components_use_causal_displacement_and_regime_inputs() -> None:
+    df = _frame_with_one_above_source(
+        [
+            (99.0, 100.0, 98.5, 99.5),
+            (101.2, 102.1, 99.8, 100.4),  # bearish same-bar sweep above 101
+            (100.2, 100.6, 99.8, 100.0),
+        ],
+        source_level=101.0,
+        source_strength=0.8,
+    )
+    df["displacement_direction"] = np.array([0, -1, 0], dtype=float)
+    df["displacement_score"] = np.array([0.0, 0.9, 0.0], dtype=float)
+    df["bos_bear"] = np.array([0, 1, 0], dtype=float)
+    df["choch_bear"] = np.array([0, 0, 0], dtype=float)
+    df["regime"] = np.array([1, 1, 1], dtype=float)
+    df["regime_confidence"] = np.array([0.7, 0.8, 0.8], dtype=float)
+    df["bars_in_regime"] = np.array([3, 5, 6], dtype=float)
+    df["trend_state"] = np.array([-1, -1, -1], dtype=float)
+    out = add_final_sweeps(df)
+    assert int(out["sweep_flag"].iloc[1]) == 1
+    assert out["sweep_q_displacement_followthrough"].iloc[1] != 0.5
+    assert out["sweep_q_regime_context"].iloc[1] != 0.5
+    assert out["sweep_q_displacement_followthrough"].iloc[1] > 0.5
+    assert out["sweep_q_regime_context"].iloc[1] > 0.5
+
+
+def test_research_outcome_labels_are_attached_on_confirm_bar() -> None:
+    rows = [
+        (99.0, 100.0, 98.5, 99.5),
+        (101.1, 102.0, 99.8, 100.5),  # confirm same-bar sweep
+        (100.4, 100.6, 98.8, 99.0),  # hits +1 ATR immediately for bearish sweep
+        (99.0, 99.4, 98.6, 98.8),
+    ] + [(98.8, 99.1, 98.4, 98.7)] * 20
+    df = _frame_with_one_above_source(
+        rows,
+        source_level=101.0,
+        source_strength=0.8,
+    )
+    bos_bear = np.zeros(len(df), dtype=float)
+    choch_bear = np.zeros(len(df), dtype=float)
+    bos_bear[2] = 1.0
+    choch_bear[3] = 1.0
+    df["bos_bear"] = bos_bear
+    df["choch_bear"] = choch_bear
+    out = add_final_sweeps(df)
+    assert int(out["sweep_flag"].iloc[1]) == 1
+    assert out["sweep_fwd_close_ret_atr_1"].iloc[1] > 0.0
+    assert out["sweep_fwd_close_ret_atr_3"].iloc[1] > 0.0
+    assert out["sweep_fwd_mfe_atr_1"].iloc[1] > 0.0
+    assert out["sweep_fwd_mae_atr_1"].iloc[1] >= 0.0
+    assert out["sweep_fwd_path_label_1"].iloc[1] == "clean_reversal"
+    assert out["sweep_first_favorable_1p0_bar"].iloc[1] == 1.0
+    assert int(out["sweep_reversed_by_5"].iloc[1]) == 1
+    assert int(out["sweep_continued_by_5"].iloc[1]) == 0
+    assert out["sweep_reversal_speed_bucket"].iloc[1] == "immediate"
+
+
+def test_research_failure_breakout_continuation_marks_post_sweep_invalidation() -> None:
+    rows = [
+        (99.0, 100.0, 98.5, 99.5),
+        (101.1, 102.0, 99.8, 100.5),  # confirm same-bar sweep
+        (100.6, 102.4, 100.4, 101.8),  # re-breaks above level and hits -1 ATR first
+        (101.8, 102.2, 101.4, 101.9),
+    ] + [(101.7, 101.9, 101.1, 101.5)] * 20
+    df = _frame_with_one_above_source(
+        rows,
+        source_level=101.0,
+        source_strength=0.8,
+    )
+    out = add_final_sweeps(df)
+    assert int(out["sweep_flag"].iloc[1]) == 1
+    assert out["sweep_fwd_path_label_1"].iloc[1] == "continuation"
+    assert out["sweep_first_adverse_1p0_bar"].iloc[1] == 1.0
+    assert int(out["sweep_reversed_by_5"].iloc[1]) == 0
+    assert int(out["sweep_continued_by_5"].iloc[1]) == 1
+    assert out["sweep_continuation_speed_bucket"].iloc[1] == "immediate"
 
 
 def test_quality_score_bounded_zero_to_one() -> None:

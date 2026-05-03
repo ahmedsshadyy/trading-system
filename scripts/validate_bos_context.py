@@ -15,7 +15,6 @@ from src.indicators.structure.swings import add_swings
 from src.indicators.structure.trend_state import add_trend_state
 from src.indicators.structure.wedges import add_wedges
 from src.indicators.structure.bos import add_bos
-from src.indicators.smc.sweeps import add_liquidity_sweep
 from src.indicators.smc.displacement import add_displacement_candle
 from src.indicators.smc.fvg import add_fvg
 from src.indicators.smc.ob import add_ob
@@ -73,7 +72,6 @@ def main() -> None:
         min_break_distance_atr=0.05,
         min_body_atr=0.10,
     )
-    df = add_liquidity_sweep(df)
     df = add_displacement_candle(df)
     df = add_fvg(df)
     df = add_ob(df)

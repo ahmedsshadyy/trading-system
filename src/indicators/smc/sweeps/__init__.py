@@ -28,7 +28,7 @@ All stages are causal and same-timeframe-only. HTF projection is gated by the
 
 from __future__ import annotations
 
-from src.indicators.sweeps_v2.final_sweeps import (
+from src.indicators.smc.sweeps.final_sweeps import (
     FINAL_SWEEPS_COLUMNS,
     SWEEP_CLASS_ACCEPTED_BREAKOUT,
     SWEEP_CLASS_DELAYED_REJECTION,
@@ -46,13 +46,13 @@ from src.indicators.sweeps_v2.final_sweeps import (
     SWEEP_INTERACTION_UNTOUCHED,
     add_final_sweeps,
 )
-from src.indicators.sweeps_v2.mtf_policy import (
+from src.indicators.smc.sweeps.mtf_policy import (
     HTF_LIQUIDITY_PROJECTION_ENABLED,
     SWEEP_MTF_POLICY,
     assert_same_timeframe_sources,
     mtf_policy_summary,
 )
-from src.indicators.sweeps_v2.unified_sources import (
+from src.indicators.smc.sweeps.unified_sources import (
     LIQ_LADDER_DEPTH,
     LIQ_SOURCE_FAMILIES,
     LIQ_STATE_ACTIVE,

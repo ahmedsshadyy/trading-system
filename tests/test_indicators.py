@@ -2631,17 +2631,6 @@ class TestSMC:
         assert "ob_bear" in result.columns
         assert "ob_width_atr" in result.columns
 
-    def test_add_liquidity_sweep(self, sample_df):
-        from src.indicators.structure.swings import add_swings
-        from src.indicators.foundation.volatility import add_atr
-        from src.indicators.smc.sweeps import add_liquidity_sweep
-
-        result = add_atr(sample_df)
-        result = add_swings(result)
-        result = add_liquidity_sweep(result)
-        assert "sweep_high" in result.columns
-        assert "sweep_low" in result.columns
-
     def test_add_equal_hl(self, sample_df):
         from src.indicators.structure.swings import add_swings
         from src.indicators.foundation.volatility import add_atr
@@ -2760,7 +2749,7 @@ class TestFullPipeline:
             "choch_bull",
             "fvg_bull",
             "ob_bull",
-            "sweep_high",
+            "sweep_flag",
             "regime",
             "vol_ratio",
         ]
@@ -2782,6 +2771,11 @@ class TestFullPipeline:
             sample_df, instrument="XAU_USD", include_vp=False
         )
         assert len(result) == len(sample_df)
+        # NOTE: ``sweep_flag`` / canonical sweep columns are not yet emitted
+        # by ``build_live`` because the unified-liquidity-source / final-sweep
+        # chain is gated on ``sr_levels`` partial-replay determinism (see
+        # ``src/indicators/pipelines/build_live.py``). When that lands the
+        # smoke check should add ``"sweep_flag"`` here.
         expected = [
             "ema_20",
             "adx_14",
@@ -2793,7 +2787,6 @@ class TestFullPipeline:
             "choch_bull",
             "fvg_bull",
             "ob_bull",
-            "sweep_high",
             "regime",
             "amd_phase",
         ]
@@ -2839,16 +2832,6 @@ class TestPurityContract:
         prepped = add_atr(sample_df)
         original = prepped.copy()
         add_ob(prepped)
-        pd.testing.assert_frame_equal(prepped, original)
-
-    def test_add_liquidity_sweep_purity(self, sample_df):
-        from src.indicators.foundation.volatility import add_atr
-        from src.indicators.structure.swings import add_swings
-        from src.indicators.smc.sweeps import add_liquidity_sweep
-
-        prepped = add_swings(add_atr(sample_df))
-        original = prepped.copy()
-        add_liquidity_sweep(prepped)
         pd.testing.assert_frame_equal(prepped, original)
 
     def test_get_atr_array_purity(self, sample_df):

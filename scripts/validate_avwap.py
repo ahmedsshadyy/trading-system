@@ -17,7 +17,6 @@ from src.indicators.structure.swings import add_swings
 from src.indicators.structure.trend_state import add_trend_state
 from src.indicators.structure.bos import add_bos
 from src.indicators.structure.choch import add_choch
-from src.indicators.smc.sweeps import add_liquidity_sweep
 from src.validation.indicators.value import validate_avwap
 
 OUT_DIR = Path("notebooks/foundation")
@@ -89,7 +88,11 @@ def _build_anchor_family_context(df: pd.DataFrame) -> pd.DataFrame:
     out = add_trend_state(out)
     out = add_bos(out)
     out = add_choch(out)
-    out = add_liquidity_sweep(out)
+    # The sweep anchor family was wired against the legacy detector schema
+    # (``sweep_confirm_flag`` / ``sweep_detect_idx`` / ``sweep_direction``).
+    # Migration to the canonical ``add_final_sweeps`` chain requires the
+    # full research pipeline upstream and is tracked separately; the
+    # sweep_detect_to_confirm_hybrid family is currently disabled here.
     return out
 
 
@@ -212,36 +215,8 @@ def _build_family_frames(df: pd.DataFrame) -> dict[str, list[pd.DataFrame] | Non
             )
         family_frames["choch_event_live_safe"] = frames
 
-    sweep_confirm_mask = (
-        pd.to_numeric(context["sweep_confirm_flag"], errors="coerce").fillna(0).eq(1)
-    )
-    sweep_candidates = np.flatnonzero(sweep_confirm_mask.to_numpy())
-    sweep_confirm_positions = _select_anchor_positions(sweep_candidates, total_rows=n)
-    if len(sweep_confirm_positions):
-        frames = []
-        for sweep_confirm_idx in sweep_confirm_positions:
-            row = context.iloc[sweep_confirm_idx]
-            detect_idx_val = pd.to_numeric(row["sweep_detect_idx"], errors="coerce")
-            if np.isfinite(detect_idx_val):
-                detect_idx = int(detect_idx_val)
-                direction = int(pd.to_numeric(row["sweep_direction"], errors="coerce"))
-                frames.append(
-                    add_anchored_vwap(
-                        context,
-                        anchor_idx=detect_idx,
-                        anchor_label=(
-                            "sweep_bull_detect"
-                            if direction == 1
-                            else "sweep_bear_detect"
-                        ),
-                        anchor_class="hybrid",
-                        anchor_origin_idx=detect_idx,
-                        anchor_confirm_idx=sweep_confirm_idx,
-                        anchor_live_from_idx=sweep_confirm_idx,
-                    )
-                )
-        if frames:
-            family_frames["sweep_detect_to_confirm_hybrid"] = frames
+    # sweep_detect_to_confirm_hybrid family disabled pending migration to
+    # canonical sweep schema (see _build_anchor_family_context).
 
     if n >= 4:
         synthetic_offsets = (40, 80, 120)

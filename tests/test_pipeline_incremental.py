@@ -148,7 +148,6 @@ def test_replay_window_regression_values_are_locked():
     assert live_policies["displacement"] == 240
     assert live_policies["order_blocks"] == 240
     assert live_policies["ob_mitigation"] == 240
-    assert live_policies["liquidity_sweeps"] == 240
     assert live_policies["equal_hl"] == 240
     assert live_policies["amd_engine"] == 240
     assert live_policies["rsi_divergence"] == 200
@@ -162,7 +161,6 @@ def test_replay_window_regression_values_are_locked():
     assert research_policies["displacement"] == 240
     assert research_policies["order_blocks"] == 240
     assert research_policies["ob_mitigation"] == 240
-    assert research_policies["liquidity_sweeps"] == 240
     assert research_policies["equal_hl"] == 240
     assert research_policies["amd_engine"] == 240
     assert research_policies["rsi_divergence"] == 200

@@ -42,10 +42,10 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from src.indicators.sweeps_v2.final_sweeps import (
+from src.indicators.smc.sweeps.final_sweeps import (
     DEFAULT_CONFIRMATION_WINDOW_BARS,
 )
-from src.indicators.sweeps_v2.unified_sources import LIQ_LADDER_DEPTH
+from src.indicators.smc.sweeps.unified_sources import LIQ_LADDER_DEPTH
 
 # Funnel stage labels, in canonical order. Each interaction terminates at
 # exactly one of these (the *deepest* stage it reaches).

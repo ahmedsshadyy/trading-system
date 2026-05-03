@@ -29,8 +29,10 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from src.indicators.sweeps_v2.final_sweeps import (
+from src.indicators.smc.sweeps.final_sweeps import (
     FINAL_SWEEPS_COLUMNS,
+    FINAL_SWEEPS_PRODUCTION_COLUMNS,
+    FINAL_SWEEPS_RESEARCH_COLUMNS,
     SWEEP_CLASS_ACCEPTED_BREAKOUT,
     SWEEP_CLASS_DELAYED_REJECTION,
     SWEEP_CLASS_FAILED_BREAKOUT_RECLAIM,
@@ -40,8 +42,8 @@ from src.indicators.sweeps_v2.final_sweeps import (
     SWEEP_CLASS_SWEEP_THEN_BREAK,
     SWEEP_CLASS_UNRESOLVED,
 )
-from src.indicators.sweeps_v2.funnel_audit import build_interaction_audit
-from src.indicators.sweeps_v2.unified_sources import (
+from src.indicators.smc.sweeps.funnel_audit import build_interaction_audit
+from src.indicators.smc.sweeps.unified_sources import (
     LIQ_SOURCE_FAMILIES,
     build_unified_liquidity_clusters_audit,
 )
@@ -88,6 +90,9 @@ _SESSION_SOURCE_COLUMNS: dict[str, tuple[str, ...]] = {
     "session_high": ("prev_asia_high", "prev_london_high", "prev_ny_high"),
     "session_low": ("prev_asia_low", "prev_london_low", "prev_ny_low"),
 }
+_STEP11H_HORIZONS: tuple[int, ...] = (1, 2, 3, 4, 5)
+_QUALITY_BUCKETS: tuple[float, ...] = (0.0, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 1.01)
+_OUTCOME_PREFIXES: tuple[str, ...] = ("sweep_fwd_", "sweep_first_")
 
 
 def _quantiles(series: pd.Series) -> dict[str, float]:
@@ -130,6 +135,26 @@ def _safe_int(value: object) -> int | None:
     if pd.isna(num):
         return None
     return int(num)
+
+
+def _research_outcome_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c.startswith(_OUTCOME_PREFIXES)]
+
+
+def _bool_rate(series: pd.Series) -> float:
+    numeric = pd.to_numeric(series, errors="coerce")
+    valid = numeric.dropna()
+    if valid.empty:
+        return float("nan")
+    return float(valid.gt(0).mean())
+
+
+def _rate_of_value(series: pd.Series, target: str) -> float:
+    valid = series.dropna().astype(str)
+    valid = valid[valid != ""]
+    if valid.empty:
+        return float("nan")
+    return float(valid.eq(target).mean())
 
 
 def build_sweep_source_event_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -344,6 +369,67 @@ def build_sweep_source_event_table(df: pd.DataFrame) -> pd.DataFrame:
             f"{active_start_idx if active_start_idx is not None else -1}"
         )
         matched["family_group"] = _FAMILY_GROUPS.get(str(matched["family"]), "other")
+        sweep_side_value = pd.to_numeric(row.get("sweep_side"), errors="coerce")
+        matched["sweep_side_value"] = float(sweep_side_value)
+        matched["sweep_side_name"] = (
+            "above_buy_side"
+            if np.isfinite(sweep_side_value) and int(sweep_side_value) == 1
+            else (
+                "below_sell_side"
+                if np.isfinite(sweep_side_value) and int(sweep_side_value) == -1
+                else ""
+            )
+        )
+        matched["regime"] = (
+            float(pd.to_numeric(df.at[confirm_idx, "regime"], errors="coerce"))
+            if "regime" in df.columns
+            else np.nan
+        )
+        matched["regime_label"] = (
+            str(df.at[confirm_idx, "regime_label"])
+            if "regime_label" in df.columns
+            and pd.notna(df.at[confirm_idx, "regime_label"])
+            else ""
+        )
+        matched["confirm_session_phase"] = (
+            str(df.at[confirm_idx, "session_name"])
+            if "session_name" in df.columns
+            and pd.notna(df.at[confirm_idx, "session_name"])
+            else ""
+        )
+        matched["sweep_q_source_strength"] = float(
+            pd.to_numeric(row.get("sweep_q_source_strength"), errors="coerce")
+        )
+        matched["sweep_q_penetration"] = float(
+            pd.to_numeric(row.get("sweep_q_penetration"), errors="coerce")
+        )
+        matched["sweep_q_rejection"] = float(
+            pd.to_numeric(row.get("sweep_q_rejection"), errors="coerce")
+        )
+        matched["sweep_q_displacement_followthrough"] = float(
+            pd.to_numeric(
+                row.get("sweep_q_displacement_followthrough"), errors="coerce"
+            )
+        )
+        matched["sweep_q_regime_context"] = float(
+            pd.to_numeric(row.get("sweep_q_regime_context"), errors="coerce")
+        )
+        matched["sweep_q_volume_confirmation"] = float(
+            pd.to_numeric(row.get("sweep_q_volume_confirmation"), errors="coerce")
+        )
+        matched["sweep_q_crowding"] = float(
+            pd.to_numeric(row.get("sweep_q_crowding"), errors="coerce")
+        )
+        for outcome_col in _research_outcome_columns(df):
+            value = row.get(outcome_col)
+            if (
+                outcome_col.endswith("_path")
+                or "_path_label_" in outcome_col
+                or outcome_col.endswith("_bucket")
+            ):
+                matched[outcome_col] = "" if pd.isna(value) else str(value)
+            else:
+                matched[outcome_col] = float(pd.to_numeric(value, errors="coerce"))
         rows.append(matched)
 
     if not rows:
@@ -353,6 +439,142 @@ def build_sweep_source_event_table(df: pd.DataFrame) -> pd.DataFrame:
         .sort_values(["confirm_idx", "breach_idx"])
         .reset_index(drop=True)
     )
+
+
+def _prepare_post_path_frame(source_events: pd.DataFrame) -> pd.DataFrame:
+    frame = source_events.copy()
+    frame["quality_bucket"] = _bucketize(
+        pd.to_numeric(frame["quality"], errors="coerce"), _QUALITY_BUCKETS
+    ).astype(str)
+    frame["source_age_bucket"] = _bucketize(
+        pd.to_numeric(frame["age_bars"], errors="coerce"), _AGE_BUCKETS
+    ).astype(str)
+    frame["distance_bucket"] = _bucketize(
+        pd.to_numeric(frame["pre_breach_distance_atr"], errors="coerce"),
+        _DISTANCE_BUCKETS,
+    ).astype(str)
+    return frame
+
+
+def _path_metrics_for_group(group: pd.DataFrame) -> dict[str, object]:
+    metrics: dict[str, object] = {"count": int(len(group))}
+    for horizon in _STEP11H_HORIZONS:
+        ret_col = f"sweep_fwd_close_ret_atr_{horizon}"
+        mfe_col = f"sweep_fwd_mfe_atr_{horizon}"
+        mae_col = f"sweep_fwd_mae_atr_{horizon}"
+        net_edge_col = f"sweep_fwd_net_edge_{horizon}"
+        path_col = f"sweep_fwd_path_label_{horizon}"
+        available = group[pd.to_numeric(group[ret_col], errors="coerce").notna()].copy()
+        metrics[f"mean_fwd_close_ret_atr_{horizon}"] = float(
+            pd.to_numeric(available[ret_col], errors="coerce").mean()
+        )
+        metrics[f"mean_mfe_atr_{horizon}"] = float(
+            pd.to_numeric(available[mfe_col], errors="coerce").mean()
+        )
+        metrics[f"mean_mae_atr_{horizon}"] = float(
+            pd.to_numeric(available[mae_col], errors="coerce").mean()
+        )
+        metrics[f"mean_net_edge_atr_{horizon}"] = float(
+            pd.to_numeric(available[net_edge_col], errors="coerce").mean()
+        )
+        metrics[f"clean_reversal_rate_{horizon}"] = _rate_of_value(
+            available[path_col], "clean_reversal"
+        )
+        metrics[f"dirty_reversal_rate_{horizon}"] = _rate_of_value(
+            available[path_col], "dirty_reversal"
+        )
+        metrics[f"continuation_rate_{horizon}"] = _rate_of_value(
+            available[path_col], "continuation"
+        )
+        metrics[f"chop_rate_{horizon}"] = _rate_of_value(
+            available[path_col], "chop_no_resolution"
+        )
+        metrics[f"two_sided_volatile_rate_{horizon}"] = _rate_of_value(
+            available[path_col], "two_sided_volatile"
+        )
+        clean_rate = metrics[f"clean_reversal_rate_{horizon}"]
+        dirty_rate = metrics[f"dirty_reversal_rate_{horizon}"]
+        metrics[f"reversal_rate_{horizon}"] = (
+            float(clean_rate + dirty_rate)
+            if np.isfinite(clean_rate) and np.isfinite(dirty_rate)
+            else float("nan")
+        )
+    return metrics
+
+
+def _grouped_post_path_table(
+    frame: pd.DataFrame,
+    *,
+    group_column: str,
+    output_column: str,
+    ordered_values: tuple[str, ...] | None = None,
+    sort_by_count: bool = True,
+) -> pd.DataFrame:
+    if frame.empty or group_column not in frame.columns:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    if ordered_values is not None:
+        for value in ordered_values:
+            group = frame[frame[group_column].astype(str) == value]
+            rows.append({output_column: value, **_path_metrics_for_group(group)})
+    else:
+        for value, group in frame.groupby(group_column, dropna=False, observed=False):
+            if value in ("", "nan") or pd.isna(value):
+                continue
+            rows.append({output_column: str(value), **_path_metrics_for_group(group)})
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return table
+    if sort_by_count:
+        return table.sort_values(
+            ["count", output_column], ascending=[False, True]
+        ).reset_index(drop=True)
+    return table.reset_index(drop=True)
+
+
+def _build_post_path_summary(source_events: pd.DataFrame) -> dict[str, object]:
+    if source_events.empty:
+        return {}
+    summary: dict[str, object] = {"total_confirmed_sweeps": int(len(source_events))}
+    metrics = _path_metrics_for_group(source_events)
+    for horizon in _STEP11H_HORIZONS:
+        summary[f"mean_fwd_close_ret_atr_{horizon}"] = metrics[
+            f"mean_fwd_close_ret_atr_{horizon}"
+        ]
+        summary[f"reversal_rate_{horizon}"] = metrics[f"reversal_rate_{horizon}"]
+        summary[f"continuation_rate_{horizon}"] = metrics[
+            f"continuation_rate_{horizon}"
+        ]
+        summary[f"chop_rate_{horizon}"] = metrics[f"chop_rate_{horizon}"]
+        summary[f"two_sided_rate_{horizon}"] = metrics[
+            f"two_sided_volatile_rate_{horizon}"
+        ]
+        summary[f"clean_reversal_rate_{horizon}"] = metrics[
+            f"clean_reversal_rate_{horizon}"
+        ]
+        summary[f"mean_mfe_{horizon}"] = metrics[f"mean_mfe_atr_{horizon}"]
+        summary[f"mean_mae_{horizon}"] = metrics[f"mean_mae_atr_{horizon}"]
+        summary[f"mean_net_edge_{horizon}"] = metrics[f"mean_net_edge_atr_{horizon}"]
+    return summary
+
+
+def _best_group_name(table: pd.DataFrame, *, group_col: str, metric_col: str) -> str:
+    if table.empty or metric_col not in table.columns:
+        return ""
+    ranked = table.dropna(subset=[metric_col])
+    if ranked.empty:
+        return ""
+    return str(ranked.sort_values(metric_col, ascending=False).iloc[0][group_col])
+
+
+def _worst_group_name(table: pd.DataFrame, *, group_col: str, metric_col: str) -> str:
+    if table.empty or metric_col not in table.columns:
+        return ""
+    ranked = table.dropna(subset=[metric_col])
+    if ranked.empty:
+        return ""
+    return str(ranked.sort_values(metric_col, ascending=False).iloc[0][group_col])
 
 
 def build_final_sweeps_diagnostics(df: pd.DataFrame) -> dict[str, object]:
@@ -376,6 +598,19 @@ def build_final_sweeps_diagnostics(df: pd.DataFrame) -> dict[str, object]:
             "repeated_sweeps": pd.DataFrame(),
             "family_group_rates": pd.DataFrame(),
             "source_events": pd.DataFrame(),
+            "post_path_summary": {},
+            "outcome_by_class_table": pd.DataFrame(),
+            "outcome_by_family_table": pd.DataFrame(),
+            "outcome_by_side_table": pd.DataFrame(),
+            "outcome_by_regime_table": pd.DataFrame(),
+            "outcome_by_session_phase_table": pd.DataFrame(),
+            "outcome_by_quality_bucket_table": pd.DataFrame(),
+            "outcome_by_source_age_bucket_table": pd.DataFrame(),
+            "outcome_by_distance_bucket_table": pd.DataFrame(),
+            "best_reversal_group_by_class": "",
+            "worst_continuation_group_by_class": "",
+            "best_reversal_family": "",
+            "worst_continuation_family": "",
             "negative_distance_explanation": "",
         }
 
@@ -733,6 +968,79 @@ def build_final_sweeps_diagnostics(df: pd.DataFrame) -> dict[str, object]:
     else:
         family_group_rates = pd.DataFrame()
 
+    post_path_frame = _prepare_post_path_frame(source_events)
+    ordered_classes = (
+        "tradeable_sweep_candidate",
+        "displacement_confirmed_sweep",
+        "micro_interaction_sweep",
+        "standard_liquidity_sweep",
+    )
+    post_path_summary = _build_post_path_summary(post_path_frame)
+    outcome_by_class_table = _grouped_post_path_table(
+        post_path_frame,
+        group_column="selectivity_class",
+        output_column="selectivity_class",
+        ordered_values=ordered_classes,
+    )
+    outcome_by_family_table = _grouped_post_path_table(
+        post_path_frame,
+        group_column="family",
+        output_column="family",
+    )
+    outcome_by_side_table = _grouped_post_path_table(
+        post_path_frame,
+        group_column="sweep_side_name",
+        output_column="sweep_side",
+    )
+    outcome_by_regime_table = _grouped_post_path_table(
+        post_path_frame,
+        group_column="regime_label",
+        output_column="regime_label",
+    )
+    outcome_by_session_phase_table = _grouped_post_path_table(
+        post_path_frame,
+        group_column="breach_session_phase",
+        output_column="breach_session_phase",
+    )
+    outcome_by_quality_bucket_table = _grouped_post_path_table(
+        post_path_frame,
+        group_column="quality_bucket",
+        output_column="quality_bucket",
+        sort_by_count=False,
+    )
+    outcome_by_source_age_bucket_table = _grouped_post_path_table(
+        post_path_frame,
+        group_column="source_age_bucket",
+        output_column="source_age_bucket",
+        sort_by_count=False,
+    )
+    outcome_by_distance_bucket_table = _grouped_post_path_table(
+        post_path_frame,
+        group_column="distance_bucket",
+        output_column="distance_bucket",
+        sort_by_count=False,
+    )
+    best_reversal_group_by_class = _best_group_name(
+        outcome_by_class_table,
+        group_col="selectivity_class",
+        metric_col="reversal_rate_5",
+    )
+    worst_continuation_group_by_class = _worst_group_name(
+        outcome_by_class_table,
+        group_col="selectivity_class",
+        metric_col="continuation_rate_5",
+    )
+    best_reversal_family = _best_group_name(
+        outcome_by_family_table,
+        group_col="family",
+        metric_col="reversal_rate_5",
+    )
+    worst_continuation_family = _worst_group_name(
+        outcome_by_family_table,
+        group_col="family",
+        metric_col="continuation_rate_5",
+    )
+
     negative_distance_explanation = (
         "Expected, not a bug: unified sources are admitted on the correct side of "
         "price at bar start (open / prior close fallback), but nearest distances "
@@ -759,6 +1067,19 @@ def build_final_sweeps_diagnostics(df: pd.DataFrame) -> dict[str, object]:
         "repeated_sweeps": repeated_sweeps,
         "family_group_rates": family_group_rates,
         "source_events": source_events,
+        "post_path_summary": post_path_summary,
+        "outcome_by_class_table": outcome_by_class_table,
+        "outcome_by_family_table": outcome_by_family_table,
+        "outcome_by_side_table": outcome_by_side_table,
+        "outcome_by_regime_table": outcome_by_regime_table,
+        "outcome_by_session_phase_table": outcome_by_session_phase_table,
+        "outcome_by_quality_bucket_table": outcome_by_quality_bucket_table,
+        "outcome_by_source_age_bucket_table": outcome_by_source_age_bucket_table,
+        "outcome_by_distance_bucket_table": outcome_by_distance_bucket_table,
+        "best_reversal_group_by_class": best_reversal_group_by_class,
+        "worst_continuation_group_by_class": worst_continuation_group_by_class,
+        "best_reversal_family": best_reversal_family,
+        "worst_continuation_family": worst_continuation_family,
         "negative_distance_explanation": negative_distance_explanation,
     }
 
@@ -906,6 +1227,25 @@ def summarize_final_sweeps(
             counts = df[col].dropna().astype(int).value_counts().to_dict()
             interaction_dist[side] = counts
 
+    forward_outcome_columns = [
+        col
+        for col in FINAL_SWEEPS_RESEARCH_COLUMNS
+        if col.startswith(_OUTCOME_PREFIXES)
+    ]
+    forward_outcomes_in_production_schema = [
+        col
+        for col in FINAL_SWEEPS_PRODUCTION_COLUMNS
+        if col.startswith(_OUTCOME_PREFIXES)
+    ]
+    forward_outcome_prefix_violations = [
+        col
+        for col in FINAL_SWEEPS_RESEARCH_COLUMNS
+        if (
+            "fwd" in col or col.startswith("sweep_first_") or col.startswith("r_sweep_")
+        )
+        and not col.startswith(_OUTCOME_PREFIXES)
+    ]
+
     return {
         "scan_timeframe": scan_timeframe,
         "row_count": int(len(df)),
@@ -933,6 +1273,11 @@ def summarize_final_sweeps(
         "regime_conditional_sweep_counts": regime_conditional,
         "regime_conditional_sweep_labels": regime_conditional_labels,
         "interaction_phase_distribution_l1": interaction_dist,
+        "forward_outcome_columns": forward_outcome_columns,
+        "forward_outcomes_in_production_schema": forward_outcomes_in_production_schema,
+        "forward_outcome_prefix_violations": forward_outcome_prefix_violations,
+        "production_schema_columns": list(FINAL_SWEEPS_PRODUCTION_COLUMNS),
+        "research_schema_columns": list(FINAL_SWEEPS_RESEARCH_COLUMNS),
         "schema_columns": list(FINAL_SWEEPS_COLUMNS),
     }
 

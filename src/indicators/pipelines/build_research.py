@@ -88,15 +88,14 @@ from src.indicators.smc.fvg_fill import add_fvg_fill
 from src.indicators.smc.ifvg import add_ifvg
 from src.indicators.smc.ob import add_ob
 from src.indicators.smc.ob_mitigation import add_ob_mitigation
-from src.indicators.smc.sweeps import add_liquidity_sweep
 from src.indicators.smc.equal_hl import add_equal_hl
 from src.indicators.smc.displacement import add_displacement_candle
 from src.indicators.smc.amd import add_amd_engine
 
 # --- Sweeps v2 (Steps 9-11): unified liquidity sources + final sweeps ---
 from src.indicators.foundation.sr_levels import add_sr_levels
-from src.indicators.sweeps_v2.unified_sources import add_unified_liquidity_sources
-from src.indicators.sweeps_v2.final_sweeps import add_final_sweeps
+from src.indicators.smc.sweeps.unified_sources import add_unified_liquidity_sources
+from src.indicators.smc.sweeps.final_sweeps import add_final_sweeps
 
 RESEARCH_PIPELINE_NAME = "build_research"
 RESEARCH_SCHEMA_VERSION = 1
@@ -479,11 +478,6 @@ def _research_stages(
             ReplayPolicy("ob_mitigation", "B", replay_bars=240, carried_state=True),
         ),
         PipelineStage(
-            "liquidity_sweeps",
-            add_liquidity_sweep,
-            ReplayPolicy("liquidity_sweeps", "B", replay_bars=240, carried_state=True),
-        ),
-        PipelineStage(
             "equal_hl",
             add_equal_hl,
             ReplayPolicy("equal_hl", "B", replay_bars=240, carried_state=True),
@@ -538,12 +532,10 @@ def _research_stages(
         )
     )
 
-    # ── Sweeps v2 (Steps 9-11) ──────────────────────────────────────────
+    # ── Canonical sweep system ──────────────────────────────────────────
     # Run S/R level extraction → unified liquidity sources → final sweeps
     # *after* every source-producing stage so the unified framework sees
-    # the latest live-safe view of every family. The legacy
-    # ``liquidity_sweeps`` stage above is preserved for backward compat;
-    # downstream consumers should migrate to ``final_sweeps``.
+    # the latest live-safe view of every family.
     stages.append(
         PipelineStage(
             "sr_levels",
