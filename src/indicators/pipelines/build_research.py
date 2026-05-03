@@ -106,7 +106,7 @@ RESEARCH_SCHEMA_VERSION = 1
 # cooldown / family-strength gates, and corrected followthrough column
 # linkage. Output ladder + sweeps schemas changed observably, so the bump
 # invalidates pipeline-level caches.
-RESEARCH_FEATURE_CONTRACT_VERSION = 5
+RESEARCH_FEATURE_CONTRACT_VERSION = 6
 
 
 @dataclass(slots=True)

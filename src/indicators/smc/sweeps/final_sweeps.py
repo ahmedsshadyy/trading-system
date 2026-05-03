@@ -445,6 +445,11 @@ FINAL_SWEEPS_CANONICAL_ALIAS_COLUMNS: tuple[str, ...] = (
     "sweep_body_reclaim_ratio",
     "sweep_level_rank",
     "sweep_duplicate_group_id",
+    # Diagnostic flag — set when ``swept_source_idx`` had to be NaN-ed
+    # to satisfy the canonical causality contract. Indicates an upstream
+    # ladder bug worth investigating; non-zero values do not invalidate
+    # the sweep itself.
+    "sweep_origin_idx_upstream_invalid",
 )
 
 #: Canonical threshold-name registry. Maps the contract names listed in
@@ -2389,14 +2394,33 @@ def _attach_canonical_aliases(df: pd.DataFrame, arr: dict[str, np.ndarray]) -> N
     swept_level = arr["swept_level"]
     sweep_side = arr["sweep_side"]
     event_id_arr = arr["sweep_event_id"]
+    breach_idx_arr = arr["sweep_breach_idx"]
 
     for i in range(n):
         if not (math.isfinite(flag[i]) and flag[i] > 0):
             continue
         side = sweep_side[i]
         level = swept_level[i]
-        # swept_source_timestamp from the source bar.
+        # Sanitize swept_source_idx: the upstream ladder occasionally
+        # carries an origin idx that violates ``source_idx ≤ breach_idx``
+        # (cross-timeframe id, late update). The canonical contract
+        # requires causality, so we NaN-out invalid values here. The
+        # ``canonical_sweeps`` validation report tracks the upstream
+        # invalid count separately.
         idx_val = swept_idx[i]
+        breach_val = breach_idx_arr[i]
+        upstream_invalid = False
+        if math.isfinite(idx_val):
+            int_idx = int(idx_val)
+            int_breach = int(breach_val) if math.isfinite(breach_val) else -1
+            in_range = 0 <= int_idx < n
+            causal = int_breach < 0 or int_idx <= int_breach
+            if not (in_range and causal):
+                swept_idx[i] = float("nan")
+                idx_val = float("nan")
+                upstream_invalid = True
+        arr["sweep_origin_idx_upstream_invalid"][i] = 1.0 if upstream_invalid else 0.0
+        # swept_source_timestamp from the (sanitized) source bar.
         if math.isfinite(idx_val) and 0 <= int(idx_val) < n:
             arr["swept_source_timestamp"][i] = timestamps.iat[int(idx_val)]
         # Wick / body / reclaim ratios use the confirm bar OHLC + ATR.
