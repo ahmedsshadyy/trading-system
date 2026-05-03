@@ -419,6 +419,131 @@ FINAL_SWEEPS_INTERACTION_COLUMNS: tuple[str, ...] = tuple(
     for rank in range(1, LIQ_LADDER_DEPTH + 1)
 )
 
+
+# ---------------------------------------------------------------------------
+# Canonical sweep contract (Step-frozen schema)
+# ---------------------------------------------------------------------------
+#: Live-safe canonical alias columns — always written when ``sweep_flag = 1``.
+#: These are additive: they re-expose existing internal quantities under the
+#: contract names. None of these columns alter detection logic or thresholds.
+#: See ``docs/indicator_contracts/sweeps.md`` for definitions.
+FINAL_SWEEPS_CANONICAL_ALIAS_COLUMNS: tuple[str, ...] = (
+    "sweep_direction",
+    "bullish_sweep_flag",
+    "bearish_sweep_flag",
+    "swept_level",
+    "swept_source_family",
+    "swept_source_side",
+    "swept_source_strength",
+    "swept_source_idx",
+    "swept_source_age_bars",
+    "swept_source_timestamp",
+    "sweep_breach_atr",
+    "sweep_distance_at_start_atr",
+    "sweep_close_reclaim_atr",
+    "sweep_wick_rejection_ratio",
+    "sweep_body_reclaim_ratio",
+    "sweep_level_rank",
+    "sweep_duplicate_group_id",
+)
+
+#: Canonical threshold-name registry. Maps the contract names listed in
+#: ``docs/indicator_contracts/sweeps.md`` to the internal constant or
+#: per-family table that supplies their default values today. None of these
+#: are knobs of ``add_final_sweeps`` directly — most are family-keyed
+#: dictionaries — so this dict is read-only metadata for documentation
+#: and validation tooling.
+SWEEPS_CANONICAL_THRESHOLDS: dict[str, dict[str, object]] = {
+    "breach_tolerance_atr": {
+        "value": 0.0,
+        "scope": "global",
+        "description": (
+            "ATR-buffer added to the source level before counting a breach. "
+            "Currently fixed at 0 — sources are tested with exact-touch."
+        ),
+    },
+    "min_breach_atr": {
+        "value_per_family": "DEFAULT_FAMILY_MIN_PENETRATION_ATR",
+        "value_global_floor": "DEFAULT_MIN_PENETRATION_ATR_FOR_SAME_BAR",
+        "scope": "per_family + global same-bar floor",
+        "description": (
+            "Minimum penetration in ATR for a breach to register. "
+            "Per-family table is the dominant gate; the global floor "
+            "prevents tiny same-bar wicks from confirming."
+        ),
+    },
+    "min_close_reclaim_atr": {
+        "value": 0.0,
+        "scope": "global",
+        "description": (
+            "Minimum reclaim in ATR for a sweep to confirm by close. "
+            "Currently encoded as a rejection-component threshold rather "
+            "than an explicit reclaim ATR; exposed for downstream tooling."
+        ),
+    },
+    "max_source_distance_atr": {
+        "value": None,
+        "scope": "global",
+        "description": (
+            "Maximum acceptable distance from price to source at bar start. "
+            "Not currently gated; exposed for downstream tooling."
+        ),
+    },
+    "min_source_age_bars": {
+        "value_per_family": "DEFAULT_FAMILY_MIN_AGE_BARS",
+        "scope": "per_family",
+        "description": (
+            "Minimum bars between source becoming live and the breach. "
+            "Filters levels born too close to price."
+        ),
+    },
+    "micro_breach_atr_threshold": {
+        "value": "DEFAULT_MIN_PENETRATION_ATR_FOR_SAME_BAR",
+        "scope": "global",
+        "description": (
+            "Penetration below which a sweep is classified as "
+            "``micro_interaction_sweep``."
+        ),
+    },
+    "strong_breach_atr_threshold": {
+        "value": "DEFAULT_STANDARD_EXCEPTIONAL_PENETRATION_ATR",
+        "scope": "global",
+        "description": (
+            "Penetration above which a sweep automatically clears the "
+            "standard-liquidity bar even if pre-breach distance is short."
+        ),
+    },
+    "strong_reclaim_atr_threshold": {
+        "value": "DEFAULT_STANDARD_EXCEPTIONAL_REJECTION_COMPONENT",
+        "scope": "global",
+        "description": (
+            "Rejection-component score above which a sweep automatically "
+            "clears the standard-liquidity bar even if pre-breach distance "
+            "is short."
+        ),
+    },
+    "min_wick_rejection_ratio": {
+        "value": "DEFAULT_MIN_WICK_PROMINENCE",
+        "scope": "global",
+        "description": (
+            "Minimum wick-fraction occupied by the breach segment for a "
+            "same-bar sweep to register."
+        ),
+    },
+    "min_quality_score_tradeable": {
+        "value": "DEFAULT_TRADEABLE_MIN_QUALITY_BY_CLASS",
+        "scope": "per_class",
+        "description": (
+            "Minimum quality score required for a sweep to qualify as a "
+            "``tradeable_sweep_candidate``."
+        ),
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Composite output schema (must follow the alias-tuple definition above)
+# ---------------------------------------------------------------------------
 FINAL_SWEEPS_PRODUCTION_COLUMNS: tuple[str, ...] = (
     tuple(
         col
@@ -429,6 +554,7 @@ FINAL_SWEEPS_PRODUCTION_COLUMNS: tuple[str, ...] = (
     + FINAL_SWEEPS_QUALITY_COLUMNS
     + FINAL_SWEEPS_SELECTIVITY_COLUMNS
     + FINAL_SWEEPS_INTERACTION_COLUMNS
+    + FINAL_SWEEPS_CANONICAL_ALIAS_COLUMNS
 )
 
 FINAL_SWEEPS_RESEARCH_COLUMNS: tuple[str, ...] = (
@@ -1227,9 +1353,12 @@ def add_final_sweeps(
             "sweep_selectivity_class",
             "sweep_reversal_speed_bucket",
             "sweep_continuation_speed_bucket",
+            # Canonical aliases (additive Step-frozen schema):
+            "sweep_direction",
+            "swept_source_family",
         ) or col.endswith("_path"):
             arr[col] = np.full(n, "", dtype=object)
-        elif col == "sweep_breach_timestamp":
+        elif col in ("sweep_breach_timestamp", "swept_source_timestamp"):
             arr[col] = np.full(n, pd.NaT, dtype="object")
         else:
             arr[col] = np.full(n, np.nan, dtype=float)
@@ -1632,6 +1761,7 @@ def add_final_sweeps(
         outcome_horizons=research_outcome_horizons,
     )
     _finalize_selectivity_classes(arr)
+    _attach_canonical_aliases(out, arr)
 
     # Single concat to keep the frame de-fragmented.
     addition = pd.DataFrame(arr, index=out.index)
@@ -1756,6 +1886,29 @@ def _emit_confirmed_sweep(
     )
     arr["sweep_history_max_distance_atr"][confirm_idx] = float(
         breach.source_history_max_distance_atr
+    )
+    # Canonical alias columns (Step-frozen schema). These re-expose the
+    # quantities above under the contract names. The post-processing pass
+    # in ``_attach_canonical_aliases`` fills the derived columns
+    # (close-reclaim, wick/body ratios, source timestamp, rank, group id).
+    arr["sweep_direction"][confirm_idx] = (
+        "bullish" if breach.side == -1 else ("bearish" if breach.side == 1 else "")
+    )
+    arr["bullish_sweep_flag"][confirm_idx] = 1.0 if breach.side == -1 else 0.0
+    arr["bearish_sweep_flag"][confirm_idx] = 1.0 if breach.side == 1 else 0.0
+    arr["swept_level"][confirm_idx] = float(breach.source_level)
+    arr["swept_source_family"][confirm_idx] = breach.source_family
+    arr["swept_source_side"][confirm_idx] = float(breach.side)
+    arr["swept_source_strength"][confirm_idx] = float(breach.source_strength)
+    arr["swept_source_idx"][confirm_idx] = (
+        float(breach.source_origin_idx)
+        if breach.source_origin_idx >= 0
+        else float("nan")
+    )
+    arr["swept_source_age_bars"][confirm_idx] = float(breach.source_age_bars)
+    arr["sweep_breach_atr"][confirm_idx] = float(breach.penetration_atr)
+    arr["sweep_distance_at_start_atr"][confirm_idx] = float(
+        breach.source_pre_breach_distance_atr
     )
     is_standard_liquidity = _is_standard_liquidity_sweep(
         breach,
@@ -2182,6 +2335,127 @@ def _attach_research_outcomes(
                 favorable_0p5=favorable_0p5,
                 adverse_0p5=adverse_0p5,
             )
+
+
+def _attach_canonical_aliases(df: pd.DataFrame, arr: dict[str, np.ndarray]) -> None:
+    """Fill the derived canonical-alias columns at confirm bars.
+
+    The straight-rename aliases (``swept_level``, ``swept_source_family``,
+    ``swept_source_idx``, ``swept_source_age_bars``, ``sweep_breach_atr``,
+    etc.) are written by ``_emit_confirmed_sweep`` itself. This pass derives
+    the remaining columns that need confirm-bar OHLC + ATR or per-bar
+    grouping:
+
+    * ``swept_source_timestamp`` — looked up from the source bar.
+    * ``sweep_close_reclaim_atr`` — reclaim distance in ATR units.
+    * ``sweep_wick_rejection_ratio`` — confirm-bar wick fraction on the
+      sweep side.
+    * ``sweep_body_reclaim_ratio`` — confirm-bar body fraction reclaimed
+      back through the swept level.
+    * ``sweep_level_rank`` / ``sweep_duplicate_group_id`` — currently
+      always ``1`` and the event id respectively, since the detector
+      enforces one-event-per-(bar, side). Surfaced for forward
+      compatibility.
+    """
+
+    n = len(df)
+    flag = arr["sweep_flag"]
+    confirm_idx_arr = arr.get("sweep_confirm_idx")
+    if confirm_idx_arr is None:
+        return
+
+    high = pd.to_numeric(
+        df.get("high", pd.Series([np.nan] * n)), errors="coerce"
+    ).to_numpy(dtype=float)
+    low = pd.to_numeric(
+        df.get("low", pd.Series([np.nan] * n)), errors="coerce"
+    ).to_numpy(dtype=float)
+    close = pd.to_numeric(
+        df.get("close", pd.Series([np.nan] * n)), errors="coerce"
+    ).to_numpy(dtype=float)
+    open_ = pd.to_numeric(
+        df.get("open", pd.Series([np.nan] * n)), errors="coerce"
+    ).to_numpy(dtype=float)
+    atr = pd.to_numeric(
+        df.get("atr_14", pd.Series([np.nan] * n)), errors="coerce"
+    ).to_numpy(dtype=float)
+    timestamps = (
+        pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        if "timestamp" in df.columns
+        else pd.Series([pd.NaT] * n)
+    )
+
+    swept_idx = arr["swept_source_idx"]
+    swept_level = arr["swept_level"]
+    sweep_side = arr["sweep_side"]
+    event_id_arr = arr["sweep_event_id"]
+
+    for i in range(n):
+        if not (math.isfinite(flag[i]) and flag[i] > 0):
+            continue
+        side = sweep_side[i]
+        level = swept_level[i]
+        # swept_source_timestamp from the source bar.
+        idx_val = swept_idx[i]
+        if math.isfinite(idx_val) and 0 <= int(idx_val) < n:
+            arr["swept_source_timestamp"][i] = timestamps.iat[int(idx_val)]
+        # Wick / body / reclaim ratios use the confirm bar OHLC + ATR.
+        bar_high = high[i]
+        bar_low = low[i]
+        bar_close = close[i]
+        bar_open = open_[i]
+        bar_atr = atr[i]
+        rng = (
+            bar_high - bar_low
+            if math.isfinite(bar_high) and math.isfinite(bar_low)
+            else float("nan")
+        )
+        if (
+            math.isfinite(side)
+            and math.isfinite(level)
+            and math.isfinite(bar_atr)
+            and bar_atr > 0
+            and math.isfinite(bar_close)
+        ):
+            if int(side) == -1:
+                # Bullish reversal: TP above, swept level below close.
+                arr["sweep_close_reclaim_atr"][i] = float((bar_close - level) / bar_atr)
+            elif int(side) == 1:
+                arr["sweep_close_reclaim_atr"][i] = float((level - bar_close) / bar_atr)
+        if math.isfinite(rng) and rng > 0 and math.isfinite(side):
+            if int(side) == -1:
+                lower_wick = (
+                    min(bar_open, bar_close) - bar_low
+                    if math.isfinite(bar_open) and math.isfinite(bar_close)
+                    else float("nan")
+                )
+                arr["sweep_wick_rejection_ratio"][i] = (
+                    float(lower_wick / rng)
+                    if math.isfinite(lower_wick) and lower_wick >= 0
+                    else float("nan")
+                )
+                if math.isfinite(level):
+                    body_reclaim = max(bar_close - level, 0.0)
+                    arr["sweep_body_reclaim_ratio"][i] = float(body_reclaim / rng)
+            elif int(side) == 1:
+                upper_wick = (
+                    bar_high - max(bar_open, bar_close)
+                    if math.isfinite(bar_open) and math.isfinite(bar_close)
+                    else float("nan")
+                )
+                arr["sweep_wick_rejection_ratio"][i] = (
+                    float(upper_wick / rng)
+                    if math.isfinite(upper_wick) and upper_wick >= 0
+                    else float("nan")
+                )
+                if math.isfinite(level):
+                    body_reclaim = max(level - bar_close, 0.0)
+                    arr["sweep_body_reclaim_ratio"][i] = float(body_reclaim / rng)
+        # Rank + duplicate-group id. The detector currently enforces one
+        # confirmed sweep per (confirm_idx, side); surface stable defaults
+        # so downstream code can rely on the columns existing.
+        arr["sweep_level_rank"][i] = 1.0
+        arr["sweep_duplicate_group_id"][i] = float(event_id_arr[i])
 
 
 def _finalize_selectivity_classes(arr: dict[str, np.ndarray]) -> None:
